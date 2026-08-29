@@ -19,6 +19,9 @@ Connect MeshMonitor to Bluetooth Low Energy (BLE) Meshtastic devices using the B
 ### [Virtual Node Server](/configuration/virtual-node)
 Connect multiple Meshtastic mobile apps simultaneously through MeshMonitor's Virtual Node proxy. Configuration caching, message queuing, and connection stability for 3-5+ concurrent mobile clients. As of 4.11.0, a parallel **MeshCore Virtual Node** lets the MeshCore app connect to a managed MeshCore device over WiFi.
 
+### [MeshCore Node Setup & Configuration](/configuration/meshcore-node)
+Complete setup guide for MeshCore devices (Companions, Repeaters, Room Servers) over USB Serial and TCP, including in-UI identity, radio presets, telemetry, remote admin, and virtual node proxy settings.
+
 ### [Using meshtasticd](/configuration/meshtasticd)
 Learn how to configure MeshMonitor to work with `meshtasticd`, the virtual Meshtastic node daemon, perfect for testing and development without physical hardware.
 

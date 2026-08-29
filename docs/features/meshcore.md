@@ -10,6 +10,10 @@ MeshCore support is still **new and basic**. The core capabilities are stable an
 
 A single MeshMonitor deployment can run multiple MeshCore sources alongside multiple Meshtastic sources and gate access to each one independently. MeshCore sources are added from the UI and support both USB (Companion or Repeater) and TCP (Companion) transports.
 
+::: tip Detailed Setup & Configuration Guide
+Looking for step-by-step hardware connection, serial/TCP transport configuration, Docker Compose device mappings, or Virtual Node proxy setup? See the [MeshCore Node Setup & Configuration Guide](/configuration/meshcore-node).
+:::
+
 When a MeshCore source is connected, you get:
 
 - **Per-source MeshCore page** — Nodes, Channels, Node Details, Configuration, and a Node Info page in a single multi-pane layout
@@ -77,8 +81,8 @@ Common ways to put a MeshCore Companion on TCP:
 - **`ser2net`** — Bridge a serial-attached MeshCore device on another host to a TCP port. Useful when the companion is plugged into a Pi or workstation that isn't running MeshMonitor.
 - **`esp-link`** — ESP8266/ESP32-based serial-to-WiFi adapter wired to the companion's UART. The same binary protocol flows transparently over the link.
 
-::: tip Container networking
-TCP sources connect from inside the MeshMonitor container, so the host must be reachable from there — use the device's LAN IP (or your gateway hostname), not `localhost` or `127.0.0.1`. If the companion is on the same host as MeshMonitor, use `host.docker.internal` (already configured in `docker-compose.dev.yml`) or the host's LAN IP.
+::: tip Container networking on Windows
+TCP sources connect from inside the MeshMonitor container, so the host must be reachable from there — use the device's LAN IP (or your gateway hostname), not `localhost` or `127.0.0.1`. On **Windows Docker Desktop**, use `host.docker.internal` or your host LAN IP. For USB serial devices on Windows Docker, see the [Windows Docker MeshCore Setup Guide](/configuration/meshcore-node#b-usb-serial-connection-on-windows-docker-desktop-wsl2).
 :::
 
 ::: warning Companion only

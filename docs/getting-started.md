@@ -113,7 +113,7 @@ MeshMonitor can monitor Meshtastic, MeshCore, and MQTT all at once — you only 
 - A Bluetooth device with the [BLE Bridge](/configuration/ble-bridge)
 - `meshtasticd` running as a virtual node
 
-**MeshCore** — a MeshCore companion or repeater attached over USB or reachable over TCP. See [MeshCore](/features/meshcore).
+**MeshCore** — a MeshCore companion or repeater attached over USB or reachable over TCP. See [MeshCore Features](/features/meshcore) and [MeshCore Node Setup](/configuration/meshcore-node).
 
 **MQTT** — an MQTT broker (yours or a public one) carrying mesh traffic, or just use MeshMonitor's [embedded broker](/features/mqtt-broker) — no external broker required.
 

@@ -181,6 +181,7 @@ export default defineConfig({
             { text: 'BLE Bridge (Bluetooth)', link: '/configuration/ble-bridge' },
             { text: 'Serial Bridge (USB)', link: '/configuration/serial-bridge' },
             { text: 'Virtual Node Server', link: '/configuration/virtual-node' },
+            { text: 'MeshCore Node Setup', link: '/configuration/meshcore-node' },
             { text: 'Using meshtasticd', link: '/configuration/meshtasticd' },
             { text: '🧪 Tested Hardware', link: '/configuration/tested-hardware' }
           ]
