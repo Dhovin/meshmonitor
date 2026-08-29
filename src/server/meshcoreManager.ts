@@ -52,6 +52,8 @@ import {
 import type { MeshCoreObserverConfig, MeshCoreSourceConfig, NormalizedObserverConfig } from './meshcoreConfig.js';
 import meshcorePacketLogService from './services/meshcorePacketLogService.js';
 import { notificationService } from './services/notificationService.js';
+import { sendMessagePushNotification } from './services/messagePushNotifier.js';
+import { serverEventNotificationService } from './services/serverEventNotificationService.js';
 import { DistanceDeleteScheduler } from './services/distanceDeleteScheduler.js';
 import { HeartbeatScheduler } from './services/heartbeatScheduler.js';
 import type { DbMeshCorePacket } from '../db/repositories/meshcore.js';
@@ -1328,6 +1330,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
         dataEventEmitter.emitMeshCoreLocalNodeUpdated(this.localNode, this.sourceId);
       }
       logger.info(`[MeshCore] Connected to ${this.localNode?.name || 'unknown device'}`);
+      void serverEventNotificationService.notifyNodeConnected(this.sourceId, this.sourceName, 'MeshCore');
 
       // Start heartbeat only when running on the native backend (i.e. Companion).
       // Repeater uses direct serial and isn't covered by the heartbeat probe.
@@ -1648,6 +1651,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
 
     this.emit('disconnected');
     dataEventEmitter.emitMeshCoreStatusUpdated({ connected: false }, this.sourceId);
+    void serverEventNotificationService.notifyNodeDisconnected(this.sourceId, this.sourceName, 'MeshCore');
     logger.info('[MeshCore] Disconnected');
   }
 
@@ -1782,6 +1786,18 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
       this.emit('message', message);
       dataEventEmitter.emitMeshCoreMessage(message, this.sourceId);
       logger.debug(`[MeshCore:${this.sourceId}] Contact message from ${data.pubkey_prefix} (${data.text.length} chars)`);
+      void sendMessagePushNotification({
+        message: {
+          id: message.id,
+          fromPublicKey: senderContact?.publicKey ?? data.pubkey_prefix,
+          senderName: senderContact?.name ?? senderContact?.advName ?? data.pubkey_prefix,
+          channel: 0,
+        },
+        messageText: data.text,
+        isDirectMessage: true,
+        sourceId: this.sourceId,
+        localPublicKey: this.localNode?.publicKey,
+      });
       void this.checkAutoAcknowledge(message, true, undefined, hopCount, ackRoute);
       void this.checkAutoResponder(message, true, undefined, hopCount, ackRoute);
       // A direct message is itself a "we just heard this contact" event —
@@ -1837,6 +1853,18 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
       this.emit('message', message);
       dataEventEmitter.emitMeshCoreMessage(message, this.sourceId);
       logger.debug(`[MeshCore] Channel ${data.channel_idx} message (${data.text.length} chars)`);
+      void sendMessagePushNotification({
+        message: {
+          id: message.id,
+          fromPublicKey: MeshCoreManager.channelPublicKey(data.channel_idx),
+          senderName: fromName,
+          channel: data.channel_idx,
+        },
+        messageText: body,
+        isDirectMessage: false,
+        sourceId: this.sourceId,
+        localPublicKey: this.localNode?.publicKey,
+      });
       void this.checkAutoAcknowledge(message, false, data.channel_idx, hopCount, route);
       void this.checkAutoResponder(message, false, data.channel_idx, hopCount, route);
     } else if (event_type === 'room_message') {
@@ -7020,6 +7048,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
     }
     this.emit('disconnected');
     dataEventEmitter.emitMeshCoreStatusUpdated({ connected: false }, this.sourceId);
+    void serverEventNotificationService.notifyNodeDisconnected(this.sourceId, this.sourceName, 'MeshCore');
   }
 
   /**

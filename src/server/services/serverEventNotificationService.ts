@@ -69,9 +69,9 @@ class ServerEventNotificationService {
 
   /**
    * Call this when a source's node connection is established.
-   * This is called from meshtasticManager's handleConnected.
+   * This is called from meshtasticManager and meshcoreManager.
    */
-  public async notifyNodeConnected(sourceId: string, sourceName: string): Promise<void> {
+  public async notifyNodeConnected(sourceId: string, sourceName: string, serviceLabel = 'Meshtastic'): Promise<void> {
     const state = this.getOrInitState(sourceId);
 
     // Skip the initial boot connection for this source
@@ -93,7 +93,7 @@ class ServerEventNotificationService {
 
         const payload = {
           title: `[${sourceName}] Node Reconnected`,
-          body: `[${sourceName}] Connection to Meshtastic node restored (was offline for ${disconnectDuration})`,
+          body: `[${sourceName}] Connection to ${serviceLabel} node restored (was offline for ${disconnectDuration})`,
           type: 'success' as const,
           sourceId,
           sourceName,
@@ -109,9 +109,9 @@ class ServerEventNotificationService {
 
   /**
    * Call this when a source's node connection is lost.
-   * This is called from meshtasticManager's handleDisconnected.
+   * This is called from meshtasticManager and meshcoreManager.
    */
-  public async notifyNodeDisconnected(sourceId: string, sourceName: string): Promise<void> {
+  public async notifyNodeDisconnected(sourceId: string, sourceName: string, serviceLabel = 'Meshtastic'): Promise<void> {
     const state = this.getOrInitState(sourceId);
 
     // Skip if we haven't had an initial connection yet
@@ -132,7 +132,7 @@ class ServerEventNotificationService {
     try {
       const payload = {
         title: `[${sourceName}] Node Disconnected`,
-        body: `[${sourceName}] Lost connection to Meshtastic node`,
+        body: `[${sourceName}] Lost connection to ${serviceLabel} node`,
         type: 'warning' as const,
         sourceId,
         sourceName,

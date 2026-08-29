@@ -12,6 +12,7 @@ import {
   deselectAllMonitoredNodes,
 } from './monitoredNodes';
 import { UiIcon } from './icons';
+import { normalizeAppriseUrl } from '../utils/appriseUrl';
 
 type StatusTone = 'info' | 'success' | 'warning' | 'error';
 interface StatusFeedback {
@@ -1496,7 +1497,7 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
             {t('notifications.service_urls_description')}
           </p>
           <ul style={{ fontSize: '13px', color: '#9ca3af', marginBottom: '12px', paddingLeft: '20px' }}>
-            <li><code>discord://webhook_id/webhook_token</code> - {t('notifications.example_discord')}</li>
+            <li><code>discord://webhook_id/webhook_token</code> or <code>https://discord.com/api/webhooks/...</code> - {t('notifications.example_discord')}</li>
             <li><code>slack://token_a/token_b/token_c</code> - {t('notifications.example_slack')}</li>
             <li><code>mailto://user:pass@gmail.com</code> - {t('notifications.example_email')}</li>
             <li><code>tgram://bot_token/chat_id</code> - {t('notifications.example_telegram')}</li>
@@ -1514,7 +1515,14 @@ const NotificationsTab: React.FC<NotificationsTabProps> = ({ isAdmin }) => {
           <textarea
             value={appriseUrls}
             onChange={(e) => setAppriseUrls(e.target.value)}
-            placeholder="discord://webhook_id/webhook_token&#10;slack://token_a/token_b/token_c&#10;mailto://user:pass@gmail.com"
+            onBlur={() => {
+              const lines = appriseUrls.split('\n');
+              const normalized = lines.map(normalizeAppriseUrl).join('\n');
+              if (normalized !== appriseUrls) {
+                setAppriseUrls(normalized);
+              }
+            }}
+            placeholder="discord://webhook_id/webhook_token&#10;https://discord.com/api/webhooks/...&#10;slack://token_a/token_b/token_c&#10;mailto://user:pass@gmail.com"
             rows={8}
             style={{
               width: '100%',

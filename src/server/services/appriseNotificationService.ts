@@ -4,6 +4,7 @@ import { getUserNotificationPreferencesAsync, getUsersWithServiceEnabledAsync, s
 import { fallbackManager } from '../meshtasticManager.js';
 import { sourceManagerRegistry } from '../sourceManagerRegistry.js';
 import { getPrimaryMeshtasticManager } from '../sourceManagerTypes.js';
+import { normalizeAppriseUrls } from '../../utils/appriseUrl.js';
 
 export interface AppriseNotificationPayload {
   title: string;
@@ -241,7 +242,8 @@ class AppriseNotificationService {
       return false;
     }
 
-    if (!urls || urls.length === 0) {
+    const normalizedUrls = normalizeAppriseUrls(urls);
+    if (!normalizedUrls || normalizedUrls.length === 0) {
       logger.debug('⚠️  No Apprise URLs provided, skipping notification');
       return false;
     }
@@ -261,7 +263,7 @@ class AppriseNotificationService {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          urls: urls,
+          urls: normalizedUrls,
           title: payload.title,
           body: payload.body,
           type: payload.type || 'info'

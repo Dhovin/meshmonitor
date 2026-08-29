@@ -12,6 +12,7 @@ import {
   saveUserNotificationPreferencesAsync,
   applyNodeNamePrefixAsync,
 } from '../utils/notificationFiltering.js';
+import { normalizeAppriseUrl, normalizeAppriseUrls } from '../../utils/appriseUrl.js';
 
 /**
  * Web Push notification endpoints + unified notification preferences.
@@ -358,7 +359,7 @@ pushRouter.post(
       monitoredNodes: monitoredNodes ?? [],
       whitelist,
       blacklist,
-      appriseUrls: appriseUrls ?? [],
+      appriseUrls: normalizeAppriseUrls(appriseUrls ?? []),
       mutedChannels: mutedChannels ?? [],
       mutedDMs: mutedDMs ?? [],
     };
@@ -702,7 +703,8 @@ appriseRouter.post('/configure', requireAdmin(), async (req: Request, res: Respo
     ];
 
     const invalidUrls: string[] = [];
-    const validUrls = urls.filter((url: string) => {
+    const normalizedInputUrls = Array.isArray(urls) ? urls.map((u: any) => typeof u === 'string' ? normalizeAppriseUrl(u) : u) : [];
+    const validUrls = normalizedInputUrls.filter((url: string) => {
       if (typeof url !== 'string' || !url.trim()) {
         invalidUrls.push(url);
         return false;

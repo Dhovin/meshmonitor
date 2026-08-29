@@ -21,12 +21,15 @@ import { logger } from '../../utils/logger.js';
 
 /**
  * The subset of a message row this notifier reads. Structurally satisfied by
- * both `DbMessage` (MQTT ingestion) and `TextMessage` (meshtasticManager).
+ * `DbMessage` (MQTT ingestion), `TextMessage` (meshtasticManager), and
+ * `MeshCoreMessage` (meshcoreManager).
  */
 export interface NotifiableMessage {
   id: string;
-  fromNodeNum: number;
+  fromNodeNum?: number | null;
   fromNodeId?: string | null;
+  fromPublicKey?: string | null;
+  senderName?: string | null;
   channel: number;
   portnum?: number | null;
   viaMqtt?: boolean | null;
@@ -46,6 +49,11 @@ export interface MessagePushInput {
    * `isOwnNodeNum` check below.
    */
   localNodeNum?: number | null;
+  /**
+   * The source's own local public key for MeshCore sources. Messages from it are
+   * skipped (we don't notify a user about their own outgoing message).
+   */
+  localPublicKey?: string | null;
 }
 
 /** Resolve a display name for the message's channel, including virtual (channel_database) ids. */
@@ -88,7 +96,7 @@ async function resolveChannelName(channelId: number, sourceId: string): Promise<
  * Never throws — notification failures must not break message processing.
  */
 export async function sendMessagePushNotification(input: MessagePushInput): Promise<void> {
-  const { message, messageText, isDirectMessage, sourceId, localNodeNum } = input;
+  const { message, messageText, isDirectMessage, sourceId, localNodeNum, localPublicKey } = input;
   try {
     // Skip if no notification services are available
     const serviceStatus = notificationService.getServiceStatus();
@@ -100,7 +108,8 @@ export async function sendMessagePushNotification(input: MessagePushInput): Prom
     // (PortNum.ATAK_PLUGIN, and its V2 form on PortNum.ATAK_PLUGIN_V2) is a
     // real chat message too — see processTakPacket / processTakV2Packet —
     // and gets a push notification the same as a text message (spec §7.3).
-    if (message.portnum !== PortNum.TEXT_MESSAGE_APP && message.portnum !== PortNum.ATAK_PLUGIN && message.portnum !== PortNum.ATAK_PLUGIN_V2) {
+    // MeshCore chat messages do not carry a portnum.
+    if (message.portnum != null && message.portnum !== PortNum.TEXT_MESSAGE_APP && message.portnum !== PortNum.ATAK_PLUGIN && message.portnum !== PortNum.ATAK_PLUGIN_V2) {
       return;
     }
 
@@ -108,18 +117,41 @@ export async function sendMessagePushNotification(input: MessagePushInput): Prom
     // owns the node; `isOwnNodeNum` additionally covers our own traffic seen
     // through a source with no local identity — an MQTT bridge re-delivering
     // a message we sent on a different source (#4593).
-    if (localNodeNum != null && Number(localNodeNum) === Number(message.fromNodeNum)) {
+    if (localNodeNum != null && message.fromNodeNum != null && Number(localNodeNum) === Number(message.fromNodeNum)) {
       logger.debug('⏭️  Skipping push notification for message from local node');
       return;
     }
-    if (isOwnNodeNum(message.fromNodeNum)) {
+    if (message.fromNodeNum != null && isOwnNodeNum(message.fromNodeNum)) {
       logger.debug('⏭️  Skipping push notification for message from one of our own nodes');
+      return;
+    }
+    if (localPublicKey && message.fromPublicKey && localPublicKey.toLowerCase() === message.fromPublicKey.toLowerCase()) {
+      logger.debug('⏭️  Skipping push notification for message from local MeshCore node');
       return;
     }
 
     // Get sender info
-    const fromNode = await databaseService.nodes.getNode(message.fromNodeNum);
-    const senderName = fromNode?.longName || fromNode?.shortName || `Node ${message.fromNodeNum}`;
+    let senderName = message.senderName;
+    let senderNodeId = message.fromNodeId;
+    if (!senderName) {
+      if (message.fromNodeNum != null) {
+        const fromNode = await databaseService.nodes.getNode(message.fromNodeNum);
+        senderName = fromNode?.longName || fromNode?.shortName || `Node ${message.fromNodeNum}`;
+        senderNodeId = senderNodeId || fromNode?.nodeId;
+      } else if (message.fromPublicKey) {
+        try {
+          const mcNode = await databaseService.meshcore.getNodeByPublicKeyAndSource(message.fromPublicKey, sourceId);
+          senderName = mcNode?.name || message.fromPublicKey.substring(0, 12);
+        } catch {
+          senderName = message.fromPublicKey.substring(0, 12);
+        }
+        senderNodeId = senderNodeId || message.fromPublicKey;
+      } else {
+        senderName = 'Unknown';
+      }
+    } else if (!senderNodeId) {
+      senderNodeId = message.fromPublicKey || (message.fromNodeNum != null ? String(message.fromNodeNum) : undefined);
+    }
 
     // Resolve the source (name + service type) so the notification can say
     // which service, channel, and instance the message came from (#4845).
@@ -149,7 +181,7 @@ export async function sendMessagePushNotification(input: MessagePushInput): Prom
           type: 'dm' as const,
           sourceId,
           messageId: message.id,
-          senderNodeId: fromNode?.nodeId || message.fromNodeId || undefined,
+          senderNodeId: senderNodeId || undefined,
         }
       : {
           type: 'channel' as const,

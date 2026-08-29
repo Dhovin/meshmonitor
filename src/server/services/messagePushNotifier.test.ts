@@ -23,7 +23,18 @@ vi.mock('../../services/database.js', () => ({
     nodes: { getNode: vi.fn(async () => ({ nodeNum: 0x0a0b0c0d, nodeId: '!0a0b0c0d', longName: 'Far Node', shortName: 'FAR' })) },
     channels: { getChannelById: vi.fn(async () => null) },
     channelDatabase: { getByIdAsync: vi.fn(async () => ({ id: 3, name: 'LongFast' })) },
-    sources: { getSource: vi.fn(async () => ({ id: 'bridge-1', name: 'Public Bridge', type: 'meshtastic_tcp' })) },
+    sources: { getSource: vi.fn(async (id?: string) => ({
+      id: id || 'bridge-1',
+      name: id === 'mc-1' ? 'MeshCore Gateway' : 'Public Bridge',
+      type: id === 'mc-1' ? 'meshcore' : 'meshtastic_tcp',
+    })) },
+    meshcore: {
+      getNodeByPublicKeyAndSource: vi.fn(async (publicKey: string, sourceId: string) => ({
+        publicKey,
+        name: 'Repeater-Echo',
+        sourceId,
+      })),
+    },
   },
 }));
 
@@ -147,5 +158,69 @@ describe('sendMessagePushNotification', () => {
     await expect(
       sendMessagePushNotification({ message: msg(), messageText: 'x', isDirectMessage: false, sourceId: 'bridge-1' }),
     ).resolves.toBeUndefined();
+  });
+
+  it('broadcasts a MeshCore channel message alert with senderName and service label', async () => {
+    await sendMessagePushNotification({
+      message: {
+        id: 'mc-msg-1',
+        fromPublicKey: 'channel-0',
+        senderName: 'Alice',
+        channel: 0,
+      },
+      messageText: 'Hello from MeshCore channel!',
+      isDirectMessage: false,
+      sourceId: 'mc-1',
+    });
+
+    expect(broadcast).toHaveBeenCalledTimes(1);
+    const [payload, filterCtx] = (broadcast as any).mock.calls[0];
+    expect(payload.title).toBe('New MeshCore Message');
+    expect(payload.body).toContain('MeshCore Gateway');
+    expect(payload.body).toContain('Alice: Hello from MeshCore channel!');
+    expect(payload.data).toMatchObject({ type: 'channel', sourceId: 'mc-1', channelId: 0, messageId: 'mc-msg-1' });
+    expect(filterCtx).toMatchObject({ channelId: 0, isDirectMessage: false, sourceId: 'mc-1' });
+  });
+
+  it('broadcasts a MeshCore DM alert resolving sender name from database if not supplied', async () => {
+    await sendMessagePushNotification({
+      message: {
+        id: 'mc-dm-1',
+        fromPublicKey: '0123456789abcdef0123456789abcdef',
+        channel: 0,
+      },
+      messageText: 'Private MeshCore text',
+      isDirectMessage: true,
+      sourceId: 'mc-1',
+    });
+
+    expect(broadcast).toHaveBeenCalledTimes(1);
+    const [payload, filterCtx] = (broadcast as any).mock.calls[0];
+    expect(payload.title).toBe('New MeshCore Direct Message');
+    expect(payload.body).toContain('MeshCore Gateway');
+    expect(payload.body).toContain('Repeater-Echo: Private MeshCore text');
+    expect(payload.data).toMatchObject({
+      type: 'dm',
+      sourceId: 'mc-1',
+      senderNodeId: '0123456789abcdef0123456789abcdef',
+      messageId: 'mc-dm-1',
+    });
+    expect(filterCtx).toMatchObject({ isDirectMessage: true, sourceId: 'mc-1' });
+  });
+
+  it('skips a MeshCore message from our own local public key', async () => {
+    await sendMessagePushNotification({
+      message: {
+        id: 'mc-dm-own',
+        fromPublicKey: 'AABBCCDDEEFF',
+        channel: 0,
+      },
+      messageText: 'Echo of my own send',
+      isDirectMessage: false,
+      sourceId: 'mc-1',
+      localPublicKey: 'aabbccddeeff',
+    });
+
+    expect(broadcast).not.toHaveBeenCalled();
   });
 });

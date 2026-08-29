@@ -1,4 +1,12 @@
-import RE2 from 're2';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
+let RE2Constructor: any;
+try {
+  RE2Constructor = require('re2');
+} catch {
+  RE2Constructor = RegExp;
+}
 
 /**
  * Compile a user- or admin-supplied regular expression with RE2 — a
@@ -23,5 +31,5 @@ import RE2 from 're2';
  * Resolves CodeQL js/regex-injection on user-controlled regex sources.
  */
 export function compileUserRegex(pattern: string, flags?: string): RegExp {
-  return new RE2(pattern, flags) as unknown as RegExp;
+  return new RE2Constructor(pattern, flags) as unknown as RegExp;
 }

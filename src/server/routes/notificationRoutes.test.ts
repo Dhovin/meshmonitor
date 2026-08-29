@@ -339,6 +339,17 @@ describe('notificationRoutes - apprise', () => {
     expect(mockApprise.configureUrls).toHaveBeenCalledWith(['ntfy://topic', 'discord://id/token']);
   });
 
+  it('POST /apprise/configure converts Discord HTTPS webhook URLs to discord:// format', async () => {
+    mockApprise.configureUrls.mockResolvedValue({ success: true });
+
+    const res = await request(app)
+      .post('/apprise/configure')
+      .send({ urls: ['https://discord.com/api/webhooks/12345/token678'] });
+
+    expect(res.status).toBe(200);
+    expect(mockApprise.configureUrls).toHaveBeenCalledWith(['discord://12345/token678']);
+  });
+
   it('PUT /apprise/enabled rejects non-boolean', async () => {
     const res = await request(app).put('/apprise/enabled').send({ enabled: 'yes' });
     expect(res.status).toBe(400);

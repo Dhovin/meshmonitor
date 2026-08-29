@@ -37,7 +37,7 @@ COPY package*.json ./
 # kept building while this one broke (v4.14.2-rc1).
 RUN --mount=type=cache,target=/root/.npm \
     PUPPETEER_SKIP_DOWNLOAD=true \
-    npm install --legacy-peer-deps
+    npm install --legacy-peer-deps --allow-git=all
 
 # Verify protobufs are present (fail fast if git submodule wasn't initialized)
 # Copy protobufs first as they rarely change
