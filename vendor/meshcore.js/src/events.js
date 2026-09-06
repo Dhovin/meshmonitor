@@ -35,7 +35,7 @@ class EventEmitter {
             this.off(event, internalCallback);
 
             // fire the original callback provided by the user
-            setTimeout(() => callback(...data), 0);
+            callback(...data);
 
         };
 

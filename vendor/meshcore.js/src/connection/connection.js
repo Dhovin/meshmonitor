@@ -434,6 +434,8 @@ class Connection extends EventEmitter {
             this.onNewAdvertPush(bufferReader);
         } else if(responseCode === Constants.PushCodes.BinaryResponse){
             this.onBinaryResponsePush(bufferReader);
+        } else if(responseCode === Constants.PushCodes.PathDiscoveryResponse){
+            this.onPathDiscoveryResponsePush(bufferReader);
         } else {
             console.log(`unhandled frame: code=${responseCode}`, frame);
         }
@@ -535,6 +537,14 @@ class Connection extends EventEmitter {
             reserved: bufferReader.readByte(), // reserved
             tag: bufferReader.readUInt32LE(), // 4 bytes tag
             responseData: bufferReader.readRemainingBytes(),
+        });
+    }
+
+    onPathDiscoveryResponsePush(bufferReader) {
+        this.emit(Constants.PushCodes.PathDiscoveryResponse, {
+            reserved: bufferReader.readByte(),
+            pubKeyPrefix: bufferReader.readBytes(6),
+            rawPayload: bufferReader.readRemainingBytes(),
         });
     }
 
@@ -1699,55 +1709,53 @@ class Connection extends EventEmitter {
                 // get public key prefix we expect in the login response
                 const publicKeyPrefix = contactPublicKey.subarray(0, 6);
 
-                // listen for sent response so we can get estimated timeout
                 var timeoutHandler = null;
-                const onSent = (response) => {
 
-                    // remove error listener since we received sent response
+                const cleanup = () => {
+                    if(timeoutHandler) clearTimeout(timeoutHandler);
                     this.off(Constants.ResponseCodes.Err, onErr);
+                    this.off(Constants.ResponseCodes.Sent, onSent);
+                    this.off(Constants.PushCodes.LoginSuccess, onLoginSuccess);
+                    this.off(Constants.PushCodes.LoginFail, onLoginFail);
+                };
 
-                    // reject login request as timed out after estimated delay, plus a bit extra
+                const onSent = (response) => {
+                    this.off(Constants.ResponseCodes.Err, onErr);
                     const estTimeout = response.estTimeout + extraTimeoutMillis;
                     timeoutHandler = setTimeout(() => {
-                        this.off(Constants.ResponseCodes.Err, onErr);
-                        this.off(Constants.ResponseCodes.Sent, onSent);
-                        this.off(Constants.PushCodes.LoginSuccess, onLoginSuccess);
+                        cleanup();
                         reject("timeout");
                     }, estTimeout);
-
-                }
+                };
 
                 // resolve promise when we receive login success push code
                 const onLoginSuccess = (response) => {
-
-                    // make sure login success response is for this login request
                     if(!BufferUtils.areBuffersEqual(publicKeyPrefix, response.pubKeyPrefix)){
-                        console.log("onLoginSuccess is not for this login request, ignoring...");
                         return;
                     }
-
-                    // login successful
-                    clearTimeout(timeoutHandler);
-                    this.off(Constants.ResponseCodes.Err, onErr);
-                    this.off(Constants.ResponseCodes.Sent, onSent);
-                    this.off(Constants.PushCodes.LoginSuccess, onLoginSuccess);
+                    cleanup();
                     resolve(response);
+                };
 
-                }
+                const onLoginFail = (response) => {
+                    if(!BufferUtils.areBuffersEqual(publicKeyPrefix, response.pubKeyPrefix)){
+                        return;
+                    }
+                    cleanup();
+                    reject(new Error("Login failed: bad password or unauthorized"));
+                };
 
                 // reject promise when we receive err
                 const onErr = () => {
-                    clearTimeout(timeoutHandler);
-                    this.off(Constants.ResponseCodes.Err, onErr);
-                    this.off(Constants.ResponseCodes.Sent, onSent);
-                    this.off(Constants.PushCodes.LoginSuccess, onLoginSuccess);
-                    reject();
-                }
+                    cleanup();
+                    reject(new Error("Device returned Err"));
+                };
 
                 // listen for events
                 this.once(Constants.ResponseCodes.Err, onErr);
                 this.once(Constants.ResponseCodes.Sent, onSent);
-                this.once(Constants.PushCodes.LoginSuccess, onLoginSuccess);
+                this.on(Constants.PushCodes.LoginSuccess, onLoginSuccess);
+                this.on(Constants.PushCodes.LoginFail, onLoginFail);
 
                 // login
                 await this.sendCommandSendLogin(contactPublicKey, password);
@@ -1767,36 +1775,31 @@ class Connection extends EventEmitter {
 
                 // listen for sent response so we can get estimated timeout
                 var timeoutHandler = null;
-                const onSent = (response) => {
 
-                    // remove error listener since we received sent response
+                const cleanup = () => {
+                    if(timeoutHandler) clearTimeout(timeoutHandler);
                     this.off(Constants.ResponseCodes.Err, onErr);
+                    this.off(Constants.ResponseCodes.Sent, onSent);
+                    this.off(Constants.PushCodes.StatusResponse, onStatusResponsePush);
+                };
 
-                    // reject login request as timed out after estimated delay, plus a bit extra
+                const onSent = (response) => {
+                    this.off(Constants.ResponseCodes.Err, onErr);
                     const estTimeout = response.estTimeout + extraTimeoutMillis;
                     timeoutHandler = setTimeout(() => {
-                        this.off(Constants.ResponseCodes.Err, onErr);
-                        this.off(Constants.ResponseCodes.Sent, onSent);
-                        this.off(Constants.PushCodes.StatusResponse, onStatusResponsePush);
+                        cleanup();
                         reject("timeout");
                     }, estTimeout);
-
-                }
+                };
 
                 // resolve promise when we receive status response push code
                 const onStatusResponsePush = (response) => {
-
-                    // make sure login success response is for this login request
                     if(!BufferUtils.areBuffersEqual(publicKeyPrefix, response.pubKeyPrefix)){
-                        console.log("onStatusResponsePush is not for this status request, ignoring...");
                         return;
                     }
 
                     // status request successful
-                    clearTimeout(timeoutHandler);
-                    this.off(Constants.ResponseCodes.Err, onErr);
-                    this.off(Constants.ResponseCodes.Sent, onSent);
-                    this.off(Constants.PushCodes.StatusResponse, onStatusResponsePush);
+                    cleanup();
 
                     // parse repeater stats from status data
                     const bufferReader = new BufferReader(response.statusData);
@@ -1822,22 +1825,18 @@ class Connection extends EventEmitter {
                     }
 
                     resolve(repeaterStats);
-
-                }
+                };
 
                 // reject promise when we receive err
                 const onErr = () => {
-                    clearTimeout(timeoutHandler);
-                    this.off(Constants.ResponseCodes.Err, onErr);
-                    this.off(Constants.ResponseCodes.Sent, onSent);
-                    this.off(Constants.PushCodes.StatusResponse, onStatusResponsePush);
+                    cleanup();
                     reject();
-                }
+                };
 
                 // listen for events
                 this.once(Constants.ResponseCodes.Err, onErr);
                 this.once(Constants.ResponseCodes.Sent, onSent);
-                this.once(Constants.PushCodes.StatusResponse, onStatusResponsePush);
+                this.on(Constants.PushCodes.StatusResponse, onStatusResponsePush);
 
                 // request status
                 await this.sendCommandSendStatusReq(contactPublicKey);
@@ -1857,54 +1856,44 @@ class Connection extends EventEmitter {
 
                 // listen for sent response so we can get estimated timeout
                 var timeoutHandler = null;
-                const onSent = (response) => {
 
-                    // remove error listener since we received sent response
+                const cleanup = () => {
+                    if(timeoutHandler) clearTimeout(timeoutHandler);
                     this.off(Constants.ResponseCodes.Err, onErr);
+                    this.off(Constants.ResponseCodes.Sent, onSent);
+                    this.off(Constants.PushCodes.TelemetryResponse, onTelemetryResponsePush);
+                };
 
-                    // reject as timed out after estimated delay, plus a bit extra
+                const onSent = (response) => {
+                    this.off(Constants.ResponseCodes.Err, onErr);
                     const estTimeout = response.estTimeout + extraTimeoutMillis;
                     timeoutHandler = setTimeout(() => {
-                        this.off(Constants.ResponseCodes.Err, onErr);
-                        this.off(Constants.ResponseCodes.Sent, onSent);
-                        this.off(Constants.PushCodes.TelemetryResponse, onTelemetryResponsePush);
+                        cleanup();
                         reject("timeout");
                     }, estTimeout);
-
-                }
+                };
 
                 // resolve promise when we receive telemetry response push code
                 const onTelemetryResponsePush = (response) => {
-
-                    // make sure telemetry response is for this telemetry request
                     if(!BufferUtils.areBuffersEqual(publicKeyPrefix, response.pubKeyPrefix)){
-                        console.log("onTelemetryResponsePush is not for this telemetry request, ignoring...");
                         return;
                     }
 
                     // telemetry request successful
-                    clearTimeout(timeoutHandler);
-                    this.off(Constants.ResponseCodes.Err, onErr);
-                    this.off(Constants.ResponseCodes.Sent, onSent);
-                    this.off(Constants.PushCodes.TelemetryResponse, onTelemetryResponsePush);
-
+                    cleanup();
                     resolve(response);
-
-                }
+                };
 
                 // reject promise when we receive err
                 const onErr = () => {
-                    clearTimeout(timeoutHandler);
-                    this.off(Constants.ResponseCodes.Err, onErr);
-                    this.off(Constants.ResponseCodes.Sent, onSent);
-                    this.off(Constants.PushCodes.TelemetryResponse, onTelemetryResponsePush);
+                    cleanup();
                     reject();
-                }
+                };
 
                 // listen for events
                 this.once(Constants.ResponseCodes.Err, onErr);
                 this.once(Constants.ResponseCodes.Sent, onSent);
-                this.once(Constants.PushCodes.TelemetryResponse, onTelemetryResponsePush);
+                this.on(Constants.PushCodes.TelemetryResponse, onTelemetryResponsePush);
 
                 // request telemetry
                 await this.sendCommandSendTelemetryReq(contactPublicKey);
@@ -1956,56 +1945,46 @@ class Connection extends EventEmitter {
 
                 // listen for sent response so we can get estimated timeout
                 var timeoutHandler = null;
-                const onSent = (response) => {
 
-                    tag = response.expectedAckCrc;
-
-                    // remove error listener since we received sent response
+                const cleanup = () => {
+                    if(timeoutHandler) clearTimeout(timeoutHandler);
                     this.off(Constants.ResponseCodes.Err, onErr);
+                    this.off(Constants.ResponseCodes.Sent, onSent);
+                    this.off(Constants.PushCodes.BinaryResponse, onBinaryResponsePush);
+                };
 
-                    // reject as timed out after estimated delay, plus a bit extra
+                const onSent = (response) => {
+                    tag = response.expectedAckCrc;
+                    this.off(Constants.ResponseCodes.Err, onErr);
                     const estTimeout = response.estTimeout + extraTimeoutMillis;
                     timeoutHandler = setTimeout(() => {
-                        this.off(Constants.ResponseCodes.Err, onErr);
-                        this.off(Constants.ResponseCodes.Sent, onSent);
-                        this.off(Constants.PushCodes.BinaryResponse, onBinaryResponsePush);
+                        cleanup();
                         reject("timeout");
                     }, estTimeout);
-
-                }
+                };
 
                 // resolve promise when we receive binary response push code
                 const onBinaryResponsePush = (response) => {
-
                     // make sure tag matches
                     if(tag !== response.tag){
-                        console.log("onBinaryResponse is not for this request tag, ignoring...");
                         return;
                     }
 
                     // binary request successful
-                    clearTimeout(timeoutHandler);
-                    this.off(Constants.ResponseCodes.Err, onErr);
-                    this.off(Constants.ResponseCodes.Sent, onSent);
-                    this.off(Constants.PushCodes.BinaryResponse, onBinaryResponsePush);
-
+                    cleanup();
                     resolve(response.responseData);
-
-                }
+                };
 
                 // reject promise when we receive err
                 const onErr = () => {
-                    clearTimeout(timeoutHandler);
-                    this.off(Constants.ResponseCodes.Err, onErr);
-                    this.off(Constants.ResponseCodes.Sent, onSent);
-                    this.off(Constants.PushCodes.BinaryResponse, onBinaryResponsePush);
+                    cleanup();
                     reject();
-                }
+                };
 
                 // listen for events
                 this.once(Constants.ResponseCodes.Err, onErr);
                 this.once(Constants.ResponseCodes.Sent, onSent);
-                this.once(Constants.PushCodes.BinaryResponse, onBinaryResponsePush);
+                this.on(Constants.PushCodes.BinaryResponse, onBinaryResponsePush);
 
                 // send binary request
                 await this.sendCommandSendBinaryReq(contactPublicKey, requestCodeAndParams);

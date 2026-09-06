@@ -43,6 +43,9 @@ describe('Vendored meshcore.js Bug Fixes & Protocol Enhancements', () => {
 
       expect(Constants.PushCodes.LoginFail).toBe(0x86);
       expect(PushCodes.LoginFail).toBe(0x86);
+
+      expect(Constants.PushCodes.PathDiscoveryResponse).toBe(0x8D);
+      expect(PushCodes.PathDiscoveryResponse).toBe(0x8D);
     });
   });
 
@@ -508,6 +511,120 @@ describe('Vendored meshcore.js Bug Fixes & Protocol Enhancements', () => {
       expect(decoded.total_up_time_secs).toBe(86400);
       expect(decoded.total_rx_air_time_secs).toBe(750);
       expect(decoded.n_recv_errors).toBe(12);
+    });
+  });
+
+  describe('PathDiscoveryResponse & Robust Push Listeners', () => {
+    it('dispatches PathDiscoveryResponse (0x8D / 141) frame without unhandled warning', async () => {
+      const conn = new MockConnection();
+      const discoveryPromise = new Promise<any>((resolve) => {
+        conn.once(Constants.PushCodes.PathDiscoveryResponse, (data) => resolve(data));
+      });
+
+      // Frame: [141, 0, 11, 22, 33, 44, 55, 66, ...]
+      const writer = new BufferWriter();
+      writer.writeByte(0x8D); // 141
+      writer.writeByte(0); // reserved
+      writer.writeBytes([11, 22, 33, 44, 55, 66]); // prefix
+      writer.writeByte(1); // outPathLen
+      writer.writeByte(0xAA); // outPath
+      writer.writeByte(1); // inPathLen
+      writer.writeByte(0xBB); // inPath
+
+      conn.onFrameReceived(writer.toBytes());
+
+      const data = await discoveryPromise;
+      expect(data.reserved).toBe(0);
+      expect(Array.from(data.pubKeyPrefix)).toEqual([11, 22, 33, 44, 55, 66]);
+      expect(data.rawPayload).toBeDefined();
+    });
+
+    it('getStatus survives interleaved non-matching push frames without dropping listener', async () => {
+      const conn = new MockConnection();
+      const pubKey = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+      const statusPromise = conn.getStatus(pubKey, 5000);
+
+      // Sent frame
+      const sentWriter = new BufferWriter();
+      sentWriter.writeByte(Constants.ResponseCodes.Sent);
+      sentWriter.writeByte(0);
+      sentWriter.writeUInt32LE(0x1111);
+      sentWriter.writeUInt32LE(5000);
+      conn.onFrameReceived(sentWriter.toBytes());
+
+      // Interleaved status push for a completely DIFFERENT node prefix [99, 99, 99, 99, 99, 99]
+      const bogusPush = Buffer.alloc(1 + 1 + 6 + 48);
+      bogusPush[0] = Constants.PushCodes.StatusResponse;
+      bogusPush[1] = 0;
+      bogusPush.set([99, 99, 99, 99, 99, 99], 2);
+      conn.onFrameReceived(bogusPush);
+
+      // Now the REAL status push arrives
+      const realPush = Buffer.alloc(1 + 1 + 6 + 48);
+      realPush[0] = Constants.PushCodes.StatusResponse;
+      realPush[1] = 0;
+      realPush.set([1, 2, 3, 4, 5, 6], 2);
+      realPush.writeUInt16LE(4150, 8); // batt_milli_volts
+      conn.onFrameReceived(realPush);
+
+      const result = await statusPromise;
+      expect(result.batt_milli_volts).toBe(4150);
+    });
+
+    it('sendBinaryRequest survives interleaved non-matching tags without dropping listener', async () => {
+      const conn = new MockConnection();
+      const pubKey = new Uint8Array([1, 2, 3, 4]);
+      const binaryPromise = conn.sendBinaryRequest(pubKey, [0x03], 5000);
+
+      // Sent frame with expected tag 0x4321
+      const sentWriter = new BufferWriter();
+      sentWriter.writeByte(Constants.ResponseCodes.Sent);
+      sentWriter.writeByte(0);
+      sentWriter.writeUInt32LE(0x4321); // expected tag
+      sentWriter.writeUInt32LE(5000);
+      conn.onFrameReceived(sentWriter.toBytes());
+
+      // Interleaved push with wrong tag 0x9999
+      const wrongTagWriter = new BufferWriter();
+      wrongTagWriter.writeByte(Constants.PushCodes.BinaryResponse);
+      wrongTagWriter.writeByte(0);
+      wrongTagWriter.writeUInt32LE(0x9999);
+      wrongTagWriter.writeBytes([1, 2, 3]);
+      conn.onFrameReceived(wrongTagWriter.toBytes());
+
+      // Matching push with tag 0x4321
+      const rightTagWriter = new BufferWriter();
+      rightTagWriter.writeByte(Constants.PushCodes.BinaryResponse);
+      rightTagWriter.writeByte(0);
+      rightTagWriter.writeUInt32LE(0x4321);
+      rightTagWriter.writeBytes([42, 43, 44]);
+      conn.onFrameReceived(rightTagWriter.toBytes());
+
+      const result = await binaryPromise;
+      expect(Array.from(result)).toEqual([42, 43, 44]);
+    });
+
+    it('login rejects immediately when receiving matching LoginFail push', async () => {
+      const conn = new MockConnection();
+      const pubKey = new Uint8Array([9, 8, 7, 6, 5, 4, 3, 2]);
+      const loginPromise = conn.login(pubKey, 'secret', 5000);
+
+      // Sent frame
+      const sentWriter = new BufferWriter();
+      sentWriter.writeByte(Constants.ResponseCodes.Sent);
+      sentWriter.writeByte(0);
+      sentWriter.writeUInt32LE(0x1234);
+      sentWriter.writeUInt32LE(5000);
+      conn.onFrameReceived(sentWriter.toBytes());
+
+      // LoginFail push with matching prefix [9, 8, 7, 6, 5, 4]
+      const failWriter = new BufferWriter();
+      failWriter.writeByte(Constants.PushCodes.LoginFail);
+      failWriter.writeByte(0);
+      failWriter.writeBytes([9, 8, 7, 6, 5, 4]);
+      conn.onFrameReceived(failWriter.toBytes());
+
+      await expect(loginPromise).rejects.toThrow('Login failed');
     });
   });
 });
