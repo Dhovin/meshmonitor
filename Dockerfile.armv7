@@ -11,8 +11,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy package files
+# Copy package files and local vendored dependencies
 COPY package*.json ./
+COPY vendor ./vendor
 
 # Install dependencies
 # Use npm install instead of npm ci to avoid optional dependency bug
@@ -71,8 +72,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && python3 -m venv /opt/apprise-venv \
     && /opt/apprise-venv/bin/pip install --no-cache-dir apprise "paho-mqtt<2.0"
 
-# Copy package files
+# Copy package files and local vendored dependencies
 COPY package*.json ./
+COPY vendor ./vendor
 
 # Copy node_modules from builder (includes compiled native modules)
 COPY --from=builder /app/node_modules ./node_modules

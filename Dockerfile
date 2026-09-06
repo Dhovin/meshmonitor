@@ -12,8 +12,9 @@ WORKDIR /app
 # dep missing a prebuilt for the target arch.
 RUN apk add --no-cache build-base python3
 
-# Copy package files
+# Copy package files and local vendored dependencies
 COPY package*.json ./
+COPY vendor ./vendor
 
 # Install dependencies
 # Use npm install instead of npm ci to avoid optional dependency bug
@@ -95,8 +96,9 @@ RUN apk add --no-cache \
     && ln -sf /opt/apprise-venv/bin/meshcli /usr/local/bin/meshcli \
     && ln -sf /usr/bin/python3 /usr/local/bin/python3
 
-# Copy package files
+# Copy package files and local vendored dependencies
 COPY package*.json ./
+COPY vendor ./vendor
 
 # Copy node_modules from builder (includes compiled native modules)
 COPY --from=builder /app/node_modules ./node_modules
