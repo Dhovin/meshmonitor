@@ -408,11 +408,13 @@ export interface MeshCoreRemoteStatus {
   packetsRecv?: number;
   packetsSent?: number;
   airTimeSecs?: number;
+  rxAirTimeSecs?: number;
   sentFlood?: number;
   sentDirect?: number;
   recvFlood?: number;
   recvDirect?: number;
   errors?: number;
+  recvErrors?: number;
   directDups?: number;
   floodDups?: number;
   txPower?: number;

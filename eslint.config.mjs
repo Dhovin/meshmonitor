@@ -22,6 +22,7 @@ export default [
       'examples/**',
       'protobufs/**', // git submodule — vendored
       'takpacket-sdk/**', // git submodule — vendored (ATAK V2 zstd dictionaries, #4317)
+      'vendor/**', // vendored libraries (e.g. meshcore.js)
       'public/**',
     ],
   },

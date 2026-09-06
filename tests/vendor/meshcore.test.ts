@@ -8,6 +8,10 @@ import {
 } from '@liamcottle/meshcore.js';
 import BufferReader from '../../vendor/meshcore.js/src/buffer_reader.js';
 import BufferWriter from '../../vendor/meshcore.js/src/buffer_writer.js';
+import {
+  encodeRepeaterStatusData,
+  encodeStatusResponsePush,
+} from '../../src/server/meshcoreCompanionCodec';
 
 class MockConnection extends Connection {
   public sentFrames: Uint8Array[] = [];
@@ -404,6 +408,106 @@ describe('Vendored meshcore.js Bug Fixes & Protocol Enhancements', () => {
       conn.onFrameReceived(okWriter.toBytes());
 
       await expect(setPromise).resolves.toBeUndefined();
+    });
+  });
+
+  describe('Companion Codec Repeater Status & meshcore.js getStatus roundtrip', () => {
+    it('encodes 48-byte legacy repeater status when rxAirTime and recvErrors are not set', () => {
+      const buffer = encodeRepeaterStatusData({
+        batteryMv: 4120,
+        queueLen: 3,
+        noiseFloor: -110,
+        lastRssi: -72,
+        packetsRecv: 120,
+        packetsSent: 90,
+        airTimeSecs: 3600,
+        uptimeSecs: 7200,
+        sentFlood: 60,
+        sentDirect: 30,
+        recvFlood: 80,
+        recvDirect: 40,
+        errors: 1,
+        lastSnr: 32,
+        directDups: 4,
+        floodDups: 10,
+      });
+
+      expect(buffer.length).toBe(48);
+    });
+
+    it('encodes 56-byte extended repeater status when totalRxAirTimeSecs and recvErrors are set', () => {
+      const buffer = encodeRepeaterStatusData({
+        batteryMv: 4120,
+        queueLen: 3,
+        noiseFloor: -110,
+        lastRssi: -72,
+        packetsRecv: 120,
+        packetsSent: 90,
+        airTimeSecs: 3600,
+        uptimeSecs: 7200,
+        sentFlood: 60,
+        sentDirect: 30,
+        recvFlood: 80,
+        recvDirect: 40,
+        errors: 1,
+        lastSnr: 32,
+        directDups: 4,
+        floodDups: 10,
+        totalRxAirTimeSecs: 500,
+        recvErrors: 8,
+      });
+
+      expect(buffer.length).toBe(56);
+      expect(buffer.readUInt32LE(48)).toBe(500); // total_rx_air_time_secs
+      expect(buffer.readUInt32LE(52)).toBe(8); // n_recv_errors
+    });
+
+    it('successfully roundtrips encodeStatusResponsePush (56 bytes) to meshcore.js getStatus', async () => {
+      const conn = new MockConnection();
+      const pubKey = new Uint8Array([10, 20, 30, 40, 50, 60, 70, 80]);
+      const statusPromise = conn.getStatus(pubKey);
+
+      // Sent frame
+      const sentWriter = new BufferWriter();
+      sentWriter.writeByte(Constants.ResponseCodes.Sent);
+      sentWriter.writeByte(0);
+      sentWriter.writeUInt32LE(0x5678);
+      sentWriter.writeUInt32LE(1000);
+      conn.onFrameReceived(sentWriter.toBytes());
+
+      // Push frame generated via encodeStatusResponsePush
+      const pushBuffer = encodeStatusResponsePush(pubKey.subarray(0, 6), {
+        batteryMv: 4200,
+        queueLen: 1,
+        noiseFloor: -105,
+        lastRssi: -65,
+        packetsRecv: 250,
+        packetsSent: 180,
+        airTimeSecs: 4500,
+        uptimeSecs: 86400,
+        sentFlood: 100,
+        sentDirect: 80,
+        recvFlood: 150,
+        recvDirect: 100,
+        errors: 2,
+        lastSnr: 40,
+        directDups: 7,
+        floodDups: 15,
+        rxAirTimeSecs: 750,
+        recvErrors: 12,
+      });
+
+      conn.onFrameReceived(new Uint8Array(pushBuffer));
+
+      const decoded = await statusPromise;
+      expect(decoded.batt_milli_volts).toBe(4200);
+      expect(decoded.curr_tx_queue_len).toBe(1);
+      expect(decoded.n_packets_recv).toBe(250);
+      expect(decoded.n_packets_sent).toBe(180);
+      expect(decoded.total_air_time_secs).toBe(4500);
+      expect(decoded.total_up_time_secs).toBe(86400);
+      expect(decoded.total_rx_air_time_secs).toBe(750);
+      expect(decoded.n_recv_errors).toBe(12);
     });
   });
 });

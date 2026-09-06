@@ -22,10 +22,11 @@ const UPDATE = process.argv.includes('--update');
 export function runEslint(cwd = ROOT) {
   let out;
   try {
+    const binName = process.platform === 'win32' ? 'eslint.cmd' : 'eslint';
     out = execFileSync(
-      path.join(cwd, 'node_modules', '.bin', 'eslint'),
+      path.join(cwd, 'node_modules', '.bin', binName),
       ['.', '--format', 'json'],
-      { cwd, maxBuffer: 256 * 1024 * 1024, encoding: 'utf8' },
+      { cwd, maxBuffer: 256 * 1024 * 1024, encoding: 'utf8', shell: process.platform === 'win32' },
     );
   } catch (e) {
     out = e.stdout; // eslint exits non-zero when violations exist; JSON is still on stdout
@@ -42,7 +43,7 @@ export function tally(results, root = ROOT) {
   const lines = {};  // relPath -> { ruleId: [lineNumbers] }
   for (const f of results) {
     if (!f.messages.length) continue;
-    const rel = path.relative(root, f.filePath);
+    const rel = path.relative(root, f.filePath).replace(/\\/g, '/');
     for (const m of f.messages) {
       const rule = m.ruleId || '(parse)';
       counts[rel] = counts[rel] || {};

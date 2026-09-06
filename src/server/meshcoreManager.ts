@@ -698,11 +698,13 @@ export interface MeshCoreStatus {
   packetsRecv?: number;
   packetsSent?: number;
   airTimeSecs?: number;
+  rxAirTimeSecs?: number;
   sentFlood?: number;
   sentDirect?: number;
   recvFlood?: number;
   recvDirect?: number;
   errors?: number;
+  recvErrors?: number;
   directDups?: number;
   floodDups?: number;
 
@@ -5391,11 +5393,13 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
           packetsRecv: d.packets_recv,
           packetsSent: d.packets_sent,
           airTimeSecs: d.air_time_secs,
+          rxAirTimeSecs: d.rx_air_time_secs,
           sentFlood: d.sent_flood,
           sentDirect: d.sent_direct,
           recvFlood: d.recv_flood,
           recvDirect: d.recv_direct,
           errors: d.errors,
+          recvErrors: d.recv_errors,
           directDups: d.direct_dups,
           floodDups: d.flood_dups,
           txPower: d.tx_power,

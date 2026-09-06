@@ -599,7 +599,7 @@ export function encodeContact(c: ContactWire): Buffer {
   head[o++] = c.type & 0xff;
   head[o++] = c.flags & 0xff;
   head.writeInt8(clampInt8(c.outPathLen), o); o += 1;
-  outPath.copy(head, o); o += 64;
+  outPath.copy(head, o);
 
   const tail = Buffer.alloc(4 + 4 + 4 + 4); // lastAdvert + advLat + advLon + lastMod
   let t = 0;
@@ -609,7 +609,7 @@ export function encodeContact(c: ContactWire): Buffer {
   tail.writeUInt32LE(c.lastAdvert >>> 0, t); t += 4;
   tail.writeInt32LE(c.advLat | 0, t); t += 4;
   tail.writeInt32LE(c.advLon | 0, t); t += 4;
-  tail.writeUInt32LE(c.lastMod >>> 0, t); t += 4;
+  tail.writeUInt32LE(c.lastMod >>> 0, t);
 
   return Buffer.concat([head, advName, tail]);
 }
@@ -654,7 +654,7 @@ export function encodeContactMsgRecv(m: ContactMsgRecvWire): Buffer {
   prefix.copy(head, o); o += 6;
   head[o++] = m.pathLen & 0xff;
   head[o++] = m.txtType & 0xff;
-  head.writeUInt32LE(m.senderTimestamp >>> 0, o); o += 4;
+  head.writeUInt32LE(m.senderTimestamp >>> 0, o);
   return Buffer.concat([head, Buffer.from(m.text ?? '', 'utf8')]);
 }
 
@@ -674,7 +674,7 @@ export function encodeChannelMsgRecv(m: ChannelMsgRecvWire): Buffer {
   head.writeInt8(clampInt8(m.channelIdx), o); o += 1;
   head[o++] = m.pathLen & 0xff;
   head[o++] = m.txtType & 0xff;
-  head.writeUInt32LE(m.senderTimestamp >>> 0, o); o += 4;
+  head.writeUInt32LE(m.senderTimestamp >>> 0, o);
   return Buffer.concat([head, Buffer.from(m.text ?? '', 'utf8')]);
 }
 
@@ -838,11 +838,16 @@ export interface RepeaterStatusData {
   lastSnr?: number;
   directDups?: number;
   floodDups?: number;
+  rxAirTimeSecs?: number;
+  totalRxAirTimeSecs?: number;
+  recvErrors?: number;
 }
 
-/** Serialize the 48-byte repeater status blob (inverse of meshcore.js `getStatus`). */
+/** Serialize the 48-byte (legacy) or 56-byte (v1.14+) repeater status blob (inverse of meshcore.js `getStatus`). */
 export function encodeRepeaterStatusData(s: RepeaterStatusData): Buffer {
-  const b = Buffer.alloc(48);
+  const rxAirTime = s.totalRxAirTimeSecs ?? s.rxAirTimeSecs;
+  const hasExtended = rxAirTime !== undefined || s.recvErrors !== undefined;
+  const b = Buffer.alloc(hasExtended ? 56 : 48);
   let o = 0;
   b.writeUInt16LE((s.batteryMv ?? 0) & 0xffff, o); o += 2; // batt_milli_volts
   b.writeUInt16LE((s.queueLen ?? 0) & 0xffff, o); o += 2; // curr_tx_queue_len
@@ -859,7 +864,11 @@ export function encodeRepeaterStatusData(s: RepeaterStatusData): Buffer {
   b.writeUInt16LE((s.errors ?? 0) & 0xffff, o); o += 2; // err_events
   b.writeInt16LE(clampInt16(s.lastSnr ?? 0), o); o += 2; // last_snr
   b.writeUInt16LE((s.directDups ?? 0) & 0xffff, o); o += 2; // n_direct_dups
-  b.writeUInt16LE((s.floodDups ?? 0) & 0xffff, o); // n_flood_dups (last field)
+  b.writeUInt16LE((s.floodDups ?? 0) & 0xffff, o); o += 2; // n_flood_dups
+  if (hasExtended) {
+    b.writeUInt32LE((rxAirTime ?? 0) >>> 0, o); o += 4; // total_rx_air_time_secs
+    b.writeUInt32LE((s.recvErrors ?? 0) >>> 0, o); // n_recv_errors
+  }
   return b;
 }
 

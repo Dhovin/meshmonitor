@@ -122,12 +122,18 @@ export const MeshCoreRemoteStatsPanel: React.FC<Props> = ({
               <StatField label={t('meshcore.remoteStats.last_snr', 'Last SNR')} value={formatSnr(status.lastSnr)} />
               <StatField label={t('meshcore.remoteStats.noise_floor', 'Noise floor')} value={formatRssi(status.noiseFloor)} />
               <StatField label={t('meshcore.remoteStats.air_time', 'Air time')} value={formatAirTime(status.airTimeSecs)} />
+              {status.rxAirTimeSecs !== undefined && (
+                <StatField label={t('meshcore.remoteStats.rx_air_time', 'RX Air time')} value={formatAirTime(status.rxAirTimeSecs)} />
+              )}
               <StatField label={t('meshcore.remoteStats.errors', 'Error Events')} value={formatNumber(status.errors)} />
 
               <div className="mrs-section">
                 <h5>{t('meshcore.remoteStats.rx', 'Received')}</h5>
                 <div className="mrs-subgrid">
                   <StatField compact label={t('meshcore.remoteStats.total', 'Total')} value={formatNumber(status.packetsRecv)} />
+                  {status.recvErrors !== undefined && (
+                    <StatField compact label={t('meshcore.remoteStats.recv_errors', 'CRC / RX errors')} value={formatNumber(status.recvErrors)} />
+                  )}
                   <StatField compact label={t('meshcore.remoteStats.flood', 'Flood')} value={formatNumber(status.recvFlood)} />
                   <StatField compact label={t('meshcore.remoteStats.direct', 'Direct')} value={formatNumber(status.recvDirect)} />
                   <StatField compact label={t('meshcore.remoteStats.flood_dups', 'Flood dups')} value={formatNumber(status.floodDups)} />
