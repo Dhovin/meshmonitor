@@ -626,5 +626,46 @@ describe('Vendored meshcore.js Bug Fixes & Protocol Enhancements', () => {
 
       await expect(loginPromise).rejects.toThrow('Login failed');
     });
+
+    it('sendBinaryRequest accepts response when response.tag is 0 (repeater did not echo tag)', async () => {
+      const conn = new MockConnection();
+      const pubKey = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+      const binaryPromise = conn.sendBinaryRequest(pubKey, [0x06], 5000);
+
+      // Sent frame with expectedAckCrc
+      const sentWriter = new BufferWriter();
+      sentWriter.writeByte(Constants.ResponseCodes.Sent);
+      sentWriter.writeByte(0);
+      sentWriter.writeUInt32LE(0x9999);
+      sentWriter.writeUInt32LE(5000);
+      conn.onFrameReceived(sentWriter.toBytes());
+
+      // BinaryResponse push with tag 0
+      const respWriter = new BufferWriter();
+      respWriter.writeByte(Constants.PushCodes.BinaryResponse);
+      respWriter.writeByte(0);
+      respWriter.writeUInt32LE(0);
+      respWriter.writeBytes([99, 100]);
+      conn.onFrameReceived(respWriter.toBytes());
+
+      const result = await binaryPromise;
+      expect(Array.from(result)).toEqual([99, 100]);
+    });
+
+    it('getNeighbours passes extraTimeoutMillis through to sendBinaryRequest', async () => {
+      const conn = new MockConnection();
+      const spy = vi.spyOn(conn, 'sendBinaryRequest').mockResolvedValue(new Uint8Array([
+        0, 0, // totalNeighboursCount = 0
+        0, 0, // resultsCount = 0
+      ]));
+
+      await conn.getNeighbours(new Uint8Array([1, 2, 3, 4]), 5, 0, 0, 8, 25000);
+      expect(spy).toHaveBeenCalledWith(
+        expect.any(Uint8Array),
+        expect.any(Uint8Array),
+        25000,
+      );
+    });
   });
 });
+

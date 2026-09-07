@@ -5098,7 +5098,19 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
     // the CLI `neighbors` path) otherwise fails with no session. Never
     // anonymous-logs-in (see ensureSavedLogin).
     this.requireTransmit();
-    await this.ensureSavedLogin(publicKey);
+    const loginOk = await this.ensureSavedLogin(publicKey);
+    let hasSaved = false;
+    try {
+      const { getMeshCoreCredentialStore } = await import('./services/meshcoreCredentialStore.js');
+      const cred = await getMeshCoreCredentialStore().load(this.sourceId, publicKey);
+      hasSaved = cred.kind === 'ok';
+    } catch {
+      // ignore
+    }
+    if (hasSaved && !loginOk) {
+      logger.warn(`[MeshCore:${this.sourceId}] get_neighbours aborted for ${publicKey.substring(0, 8)}…: saved login failed`);
+      return null;
+    }
     try {
       const response = await this.sendBridgeCommand('get_neighbours', {
         public_key: publicKey,
@@ -5108,6 +5120,9 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
       }, 30000);
       if (!response.success) {
         logger.warn(`[MeshCore] get_neighbours failed for ${publicKey}: ${response.error}`);
+        if (response.error === 'timeout' || String(response.error).includes('timeout')) {
+          await this.resetContactPath(publicKey).catch(() => {});
+        }
         return null;
       }
       const d = response.data ?? {};
@@ -5409,6 +5424,9 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
           radioCr: d.radio_cr,
         };
       }
+      if (!response.success && (response.error === 'timeout' || String(response.error).includes('timeout'))) {
+        await this.resetContactPath(publicKey).catch(() => {});
+      }
       return null;
     } catch (error) {
       logger.error('[MeshCore] Status request failed:', error);
@@ -5493,11 +5511,13 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       if (await this.loginToNode(publicKey, cred.password)) return true;
       if (attempt < maxAttempts) {
-        logger.debug(`[MeshCore:${this.sourceId}] saved-credential login attempt ${attempt}/${maxAttempts} got no reply for ${publicKey.substring(0, 8)}…, retrying`);
+        logger.debug(`[MeshCore:${this.sourceId}] saved-credential login attempt ${attempt}/${maxAttempts} got no reply for ${publicKey.substring(0, 8)}…, resetting path and retrying`);
+        await this.resetContactPath(publicKey).catch(() => {});
         await new Promise((r) => setTimeout(r, 1500));
       }
     }
     logger.warn(`[MeshCore:${this.sourceId}] saved-credential login failed after ${maxAttempts} attempts for ${publicKey.substring(0, 8)}…`);
+    await this.resetContactPath(publicKey).catch(() => {});
     return false;
   }
 
@@ -5536,6 +5556,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
       }
       if (attempt < maxAttempts) {
         logger.warn(`[MeshCore] Room login attempt ${attempt}/${maxAttempts} got no reply for ${publicKey.substring(0, 8)}…, retrying`);
+        await this.resetContactPath(publicKey).catch(() => {});
         await new Promise(r => setTimeout(r, 2000));
       }
     }
@@ -6282,6 +6303,9 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
         logger.warn(
           `[MeshCore:${this.sourceId}] requestRemoteTelemetry (LPP) (${publicKey.substring(0, 16)}…) failed: ${response.error}`,
         );
+        if (response.error === 'timeout' || String(response.error).includes('timeout')) {
+          await this.resetContactPath(publicKey).catch(() => {});
+        }
         return null;
       }
       this.recordMeshTx();

@@ -131,4 +131,45 @@ describe('MeshCoreManager.getNeighbours — saved-password login (binary path)',
 
     expect(loginCalls).toEqual([]); // no empty-password login
   });
+
+  it('aborts get_neighbours without issuing bridge command if saved login failed', async () => {
+    mockLoad.mockResolvedValue({ kind: 'ok', password: 's3cret' });
+    const { m, loginCalls } = makeManager(() => false); // login fails
+    const bridgeCalls: string[] = [];
+    m.sendBridgeCommand = vi.fn(async (cmd: string) => {
+      bridgeCalls.push(cmd);
+      return { id: '1', success: true, data: { total: 0, neighbours: [] } };
+    });
+
+    const result = await m.getNeighbours(KEY, { count: 20 });
+
+    expect(result).toBeNull();
+    expect(loginCalls.length).toBe(3); // 3 attempts made
+    expect(bridgeCalls).not.toContain('get_neighbours'); // bridge command was aborted!
+  });
+
+  it('resets contact path when get_neighbours times out', async () => {
+    mockLoad.mockResolvedValue({ kind: 'none' });
+    const { m } = makeManager();
+    m.sendBridgeCommand = vi.fn(async () => ({ id: '1', success: false, error: 'timeout' }));
+    const resetSpy = vi.spyOn(m, 'resetContactPath').mockResolvedValue(true);
+
+    const result = await m.getNeighbours(KEY);
+
+    expect(result).toBeNull();
+    expect(resetSpy).toHaveBeenCalledWith(KEY);
+  });
+
+  it('resets contact path on failed saved-credential login attempts to enable flood retry', async () => {
+    mockLoad.mockResolvedValue({ kind: 'ok', password: 's3cret' });
+    const { m } = makeManager(() => false); // all attempts fail
+    const resetSpy = vi.spyOn(m, 'resetContactPath').mockResolvedValue(true);
+
+    await m.ensureSavedLogin(KEY);
+
+    // resetContactPath called after attempt 1, attempt 2, and final failure
+    expect(resetSpy).toHaveBeenCalledTimes(3);
+    expect(resetSpy).toHaveBeenCalledWith(KEY);
+  });
 });
+

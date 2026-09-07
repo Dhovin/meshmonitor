@@ -1170,7 +1170,7 @@ export class MeshCoreNativeBackend extends EventEmitter {
   private statusOpChain: Promise<unknown> = Promise.resolve();
   private inFlightStatus = new Map<string, Promise<any>>();
 
-  private getStatusSerialized(connection: AnyConnection, publicKey: Uint8Array): Promise<any> {
+  private getStatusSerialized(connection: AnyConnection, publicKey: Uint8Array, extraTimeoutMillis: number = 15000): Promise<any> {
     const keyHex = bytesToHex(publicKey);
 
     // In-flight dedupe: a concurrent request for the same contact shares the
@@ -1182,7 +1182,7 @@ export class MeshCoreNativeBackend extends EventEmitter {
     // at a time. Chain after whatever is queued, regardless of how it settled
     // (using the same fn for both handlers means a prior rejection still
     // releases the queue).
-    const issue = () => connection.getStatus(publicKey);
+    const issue = () => connection.getStatus(publicKey, extraTimeoutMillis);
     const tracked = this.statusOpChain.then(issue, issue).finally(() => {
       this.inFlightStatus.delete(keyHex);
     });
@@ -1940,7 +1940,7 @@ export class MeshCoreNativeBackend extends EventEmitter {
         const rejected = this.awaitLoginRejection(publicKey);
         try {
           const login = await Promise.race([
-            c.login(publicKey, String(params.password ?? '')) as Promise<{
+            c.login(publicKey, String(params.password ?? ''), 15000) as Promise<{
               isAdmin?: number;
               serverTimestamp?: number;
               aclPermissions?: number;
@@ -1967,7 +1967,7 @@ export class MeshCoreNativeBackend extends EventEmitter {
         // on the shared, tag-less StatusResponse event with a `.once` handler, so
         // overlapping requests cannibalize each other's response and spam the
         // "ignoring..." log until they time out (#3815).
-        const stats = await this.getStatusSerialized(c, publicKey);
+        const stats = await this.getStatusSerialized(c, publicKey, 15000);
         return {
           bat_mv: stats?.batt_milli_volts,
           up_secs: stats?.total_up_time_secs,
@@ -2148,7 +2148,7 @@ export class MeshCoreNativeBackend extends EventEmitter {
         // sendBinaryRequest tag-matches its reply, but our raw-frame regions
         // request can't, so the two must not overlap.
         const responseData: Uint8Array = await this.runExclusiveRadioOp(
-          () => c.sendBinaryRequest(publicKey, [reqType]),
+          () => c.sendBinaryRequest(publicKey, [reqType], 15000),
         );
         const mod = await loadMeshCoreJs();
         const records = mod.CayenneLpp.parse(responseData);
@@ -2257,7 +2257,9 @@ export class MeshCoreNativeBackend extends EventEmitter {
         const count = typeof params.count === 'number' ? params.count : 10;
         const offset = typeof params.offset === 'number' ? params.offset : 0;
         const orderBy = typeof params.order_by === 'number' ? params.order_by : 0;
-        const result = await c.getNeighbours(publicKey, count, offset, orderBy, 8);
+        const result: any = await this.runExclusiveRadioOp(
+          () => c.getNeighbours(publicKey, count, offset, orderBy, 8, 15000),
+        );
         return {
           total: result.totalNeighboursCount,
           neighbours: (result.neighbours ?? []).map((n: any) => ({

@@ -1702,7 +1702,7 @@ class Connection extends EventEmitter {
         });
     }
 
-    login(contactPublicKey, password, extraTimeoutMillis = 1000) {
+    login(contactPublicKey, password, extraTimeoutMillis = 15000) {
         return new Promise(async (resolve, reject) => {
             try {
 
@@ -1766,7 +1766,7 @@ class Connection extends EventEmitter {
         });
     }
 
-    getStatus(contactPublicKey, extraTimeoutMillis = 1000) {
+    getStatus(contactPublicKey, extraTimeoutMillis = 15000) {
         return new Promise(async (resolve, reject) => {
             try {
 
@@ -1936,7 +1936,7 @@ class Connection extends EventEmitter {
 
     }
 
-    sendBinaryRequest(contactPublicKey, requestCodeAndParams, extraTimeoutMillis = 1000) {
+    sendBinaryRequest(contactPublicKey, requestCodeAndParams, extraTimeoutMillis = 15000) {
         return new Promise(async (resolve, reject) => {
             try {
 
@@ -1965,8 +1965,8 @@ class Connection extends EventEmitter {
 
                 // resolve promise when we receive binary response push code
                 const onBinaryResponsePush = (response) => {
-                    // make sure tag matches
-                    if(tag !== response.tag){
+                    // make sure tag matches if both our tag and response tag are available
+                    if(tag && response.tag && tag !== response.tag){
                         return;
                     }
 
@@ -2594,6 +2594,7 @@ class Connection extends EventEmitter {
         offset = 0,
         orderBy = 0, // 0=newest_to_oldest, 1=oldest_to_newest, 2=strongest_to_weakest, 3=weakest_to_strongest
         pubKeyPrefixLength = 8,
+        extraTimeoutMillis = 15000,
     ) {
 
         // get neighbours:
@@ -2614,7 +2615,7 @@ class Connection extends EventEmitter {
         bufferWriter.writeUInt32LE(RandomUtils.getRandomInt(0, 4294967295)); // 4 bytes random blob
 
         // send binary request
-        const responseData = await this.sendBinaryRequest(publicKey, bufferWriter.toBytes());
+        const responseData = await this.sendBinaryRequest(publicKey, bufferWriter.toBytes(), extraTimeoutMillis);
 
         // parse response
         const bufferReader = new BufferReader(responseData);
