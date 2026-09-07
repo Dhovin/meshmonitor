@@ -1497,23 +1497,34 @@ class Connection extends EventEmitter {
         });
     }
 
-    resetPath(pubKey) {
+    resetPath(pubKey, timeoutMillis = 5000) {
         return new Promise(async (resolve, reject) => {
             try {
 
-                // resolve promise when we receive ok
-                const onOk = () => {
+                var timeoutHandler = null;
+
+                const cleanup = () => {
+                    if(timeoutHandler) clearTimeout(timeoutHandler);
                     this.off(Constants.ResponseCodes.Ok, onOk);
                     this.off(Constants.ResponseCodes.Err, onErr);
+                };
+
+                // resolve promise when we receive ok
+                const onOk = () => {
+                    cleanup();
                     resolve();
-                }
+                };
 
                 // reject promise when we receive err
                 const onErr = () => {
-                    this.off(Constants.ResponseCodes.Ok, onOk);
-                    this.off(Constants.ResponseCodes.Err, onErr);
-                    reject();
-                }
+                    cleanup();
+                    reject(new Error("Device returned Err"));
+                };
+
+                timeoutHandler = setTimeout(() => {
+                    cleanup();
+                    reject(new Error("timeout"));
+                }, timeoutMillis);
 
                 // listen for events
                 this.once(Constants.ResponseCodes.Ok, onOk);
@@ -1523,6 +1534,7 @@ class Connection extends EventEmitter {
                 await this.sendCommandResetPath(pubKey);
 
             } catch(e) {
+                if(typeof cleanup === 'function') cleanup();
                 reject(e);
             }
         });

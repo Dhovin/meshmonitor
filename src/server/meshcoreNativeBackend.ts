@@ -1245,7 +1245,46 @@ export class MeshCoreNativeBackend extends EventEmitter {
       case 'reset_path': {
         const publicKey = await this.resolvePublicKey(params.public_key as string);
         if (!publicKey) throw new Error('Reset-path target not found');
-        await c.resetPath(publicKey);
+        await this.runExclusiveRadioOp(async () => {
+          try {
+            await c.resetPath(publicKey, 5000);
+          } catch (resetErr) {
+            logger.debug(
+              `[MeshCore:native] resetPath command error for ${bytesToHex(publicKey).substring(0, 12)}…: ${(resetErr as Error)?.message || resetErr}`,
+            );
+          }
+
+          // Authoritative check & fallback: ensure the contact record on the
+          // device actually has outPathLen reset. If the contact is known and
+          // still has a stored route (outPathLen not 0xFF / -1 / 0), explicitly
+          // overwrite outPathLen = 0xFF with an empty outPath buffer via
+          // addOrUpdateContact so the companion radio hardware is guaranteed to
+          // flood rather than continuing to direct-route down a broken path.
+          try {
+            const contacts = (await c.getContacts()) as RawDeviceContact[];
+            const contact = contacts?.find((ct) => bytesToHex(ct.publicKey) === bytesToHex(publicKey));
+            if (contact && contact.outPathLen !== 0xff && contact.outPathLen !== -1 && contact.outPathLen !== 0) {
+              logger.debug(
+                `[MeshCore:native] Contact ${bytesToHex(publicKey).substring(0, 12)}… still had outPathLen=${contact.outPathLen} after resetPath; forcing outPathLen=0xFF via addOrUpdateContact`,
+              );
+              await c.addOrUpdateContact(
+                contact.publicKey,
+                contact.type,
+                contact.flags,
+                0xff,
+                new Uint8Array(64),
+                contact.advName,
+                contact.lastAdvert,
+                contact.advLat,
+                contact.advLon,
+              );
+            }
+          } catch (ctErr) {
+            logger.debug(
+              `[MeshCore:native] Contact fallback reset check failed: ${(ctErr as Error)?.message || ctErr}`,
+            );
+          }
+        });
         return { ok: true };
       }
 

@@ -5347,11 +5347,13 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
 
     try {
       // A login request floods when the path to the node is unknown, so it
-      // carries the default scope (#3667).
+      // carries the default scope (#3667). Allow up to 45s so the bridge
+      // command does not abort prematurely while a multi-hop flood round-trip
+      // is underway.
       const response = await this.sendWithDefaultScope(() => this.sendBridgeCommand('login', {
         public_key: publicKey,
         password: password,
-      }));
+      }, 45_000));
 
       if (response.success) {
         logger.debug(`[MeshCore] Logged into node ${publicKey.substring(0, 8)}...`);
@@ -5467,6 +5469,8 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
     const ok = (await this.loginToNode(publicKey, '')) !== null;
     if (ok) {
       this.guestLoggedInNodes.add(publicKey);
+    } else {
+      await this.resetContactPath(publicKey).catch(() => {});
     }
     return ok;
   }
@@ -5513,7 +5517,7 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
       if (attempt < maxAttempts) {
         logger.debug(`[MeshCore:${this.sourceId}] saved-credential login attempt ${attempt}/${maxAttempts} got no reply for ${publicKey.substring(0, 8)}…, resetting path and retrying`);
         await this.resetContactPath(publicKey).catch(() => {});
-        await new Promise((r) => setTimeout(r, 1500));
+        await new Promise((r) => setTimeout(r, 2000));
       }
     }
     logger.warn(`[MeshCore:${this.sourceId}] saved-credential login failed after ${maxAttempts} attempts for ${publicKey.substring(0, 8)}…`);

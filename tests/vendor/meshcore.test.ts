@@ -666,6 +666,39 @@ describe('Vendored meshcore.js Bug Fixes & Protocol Enhancements', () => {
         25000,
       );
     });
+
+    it('resetPath resolves when ResponseCodes.Ok is received', async () => {
+      const conn = new MockConnection();
+      const pubKey = new Uint8Array(32).fill(1);
+      const resetPromise = conn.resetPath(pubKey, 1000);
+
+      const okWriter = new BufferWriter();
+      okWriter.writeByte(Constants.ResponseCodes.Ok);
+      conn.onFrameReceived(okWriter.toBytes());
+
+      await expect(resetPromise).resolves.toBeUndefined();
+    });
+
+    it('resetPath rejects with Error when ResponseCodes.Err is received', async () => {
+      const conn = new MockConnection();
+      const pubKey = new Uint8Array(32).fill(1);
+      const resetPromise = conn.resetPath(pubKey, 1000);
+
+      const errWriter = new BufferWriter();
+      errWriter.writeByte(Constants.ResponseCodes.Err);
+      conn.onFrameReceived(errWriter.toBytes());
+
+      await expect(resetPromise).rejects.toThrow('Device returned Err');
+    });
+
+    it('resetPath rejects with timeout Error when no response is received within timeoutMillis', async () => {
+      const conn = new MockConnection();
+      const pubKey = new Uint8Array(32).fill(1);
+      const resetPromise = conn.resetPath(pubKey, 50);
+
+      await expect(resetPromise).rejects.toThrow('timeout');
+    });
   });
 });
+
 

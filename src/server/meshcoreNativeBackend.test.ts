@@ -1285,6 +1285,31 @@ describe('MeshCoreNativeBackend', () => {
     expect(resp.error).toMatch(/Reset-path target not found/);
   });
 
+  it('reset_path forces outPathLen 0xFF via addOrUpdateContact if contact still has non-empty path', async () => {
+    const backend = new MeshCoreNativeBackend('src-1', {
+      connectionType: 'serial',
+      serialPort: '/dev/ttyUSB0',
+    });
+    await backend.connect();
+    const conn = lastInstanceRef.current as MockConnection;
+    const targetBytes = new Uint8Array(32);
+    targetBytes[0] = 0xde; targetBytes[1] = 0xad; targetBytes[2] = 0xbe; targetBytes[3] = 0xef;
+    conn.contactsResponse = [{
+      publicKey: targetBytes,
+      type: AdvType.Chat,
+      advName: 'Bob',
+      outPathLen: 3,
+      outPath: new Uint8Array([0x87, 0x0e, 0x5d, 0x05, 0x13, 0x37]),
+    }];
+
+    const resp = await backend.sendCommand('reset_path', { public_key: 'deadbeef' });
+    expect(resp.success).toBe(true);
+    expect(conn.resetPathCalls).toHaveLength(1);
+    expect(conn.addOrUpdateContactCalls).toHaveLength(1);
+    const [, , , outPathLen] = conn.addOrUpdateContactCalls[0];
+    expect(outPathLen).toBe(0xff);
+  });
+
   it('share_contact forwards the resolved pubkey to the connection', async () => {
     const backend = new MeshCoreNativeBackend('src-1', {
       connectionType: 'serial',
