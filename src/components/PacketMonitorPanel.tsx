@@ -70,6 +70,11 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
     safeJsonParse(localStorage.getItem('packetMonitor.autoScroll'), true)
   );
   const [selectedPacket, setSelectedPacket] = useState<PacketLog | null>(null);
+  const [selectedPacketIds, setSelectedPacketIds] = useState<Set<number>>(new Set());
+  const [lastSelectedPacketIdx, setLastSelectedPacketIdx] = useState<number | null>(null);
+  const selectAllCheckboxRef = useRef<HTMLInputElement>(null);
+  const [showExportMenu, setShowExportMenu] = useState(false);
+  const exportMenuRef = useRef<HTMLDivElement>(null);
   const [filters, setFilters] = useState<PacketFilters>(() =>
     safeJsonParse<PacketFilters>(localStorage.getItem('packetMonitor.filters'), {})
   );
@@ -434,6 +439,63 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
     return `0x${relayNode.toString(16).padStart(2, '0').toUpperCase()}`;
   };
 
+  const allLoadedSelected = packets.length > 0 && packets.every(p => selectedPacketIds.has(p.id));
+  const someLoadedSelected = packets.length > 0 && packets.some(p => selectedPacketIds.has(p.id)) && !allLoadedSelected;
+
+  useEffect(() => {
+    if (selectAllCheckboxRef.current) {
+      selectAllCheckboxRef.current.indeterminate = someLoadedSelected;
+    }
+  }, [someLoadedSelected]);
+
+  useEffect(() => {
+    if (!showExportMenu) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (exportMenuRef.current && !exportMenuRef.current.contains(e.target as Node)) {
+        setShowExportMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [showExportMenu]);
+
+  const handleToggleSelectAll = () => {
+    if (allLoadedSelected) {
+      setSelectedPacketIds(prev => {
+        const next = new Set(prev);
+        packets.forEach(p => next.delete(p.id));
+        return next;
+      });
+    } else {
+      setSelectedPacketIds(prev => {
+        const next = new Set(prev);
+        packets.forEach(p => next.add(p.id));
+        return next;
+      });
+    }
+  };
+
+  const handleRowSelect = (packetId: number, index: number, shiftKey: boolean) => {
+    setSelectedPacketIds(prev => {
+      const next = new Set(prev);
+      if (shiftKey && lastSelectedPacketIdx !== null && lastSelectedPacketIdx !== index && lastSelectedPacketIdx < packets.length) {
+        const start = Math.min(lastSelectedPacketIdx, index);
+        const end = Math.max(lastSelectedPacketIdx, index);
+        for (let i = start; i <= end; i++) {
+          next.add(packets[i].id);
+        }
+      } else {
+        if (next.has(packetId)) {
+          next.delete(packetId);
+        } else {
+          next.add(packetId);
+        }
+      }
+      return next;
+    });
+    setLastSelectedPacketIdx(index);
+  };
+
   // Export packets to JSONL (server-side)
   const handleExport = () => {
     try {
@@ -444,6 +506,142 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
       console.error('Failed to export packets:', error);
       alert(t('packet_monitor.export_failed'));
     }
+  };
+
+  const handleExportSelected = (format: 'jsonl' | 'csv') => {
+    const selectedList = packets.filter(p => selectedPacketIds.has(p.id));
+    if (selectedList.length === 0) return;
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+
+    if (format === 'jsonl') {
+      const lines = selectedList.map(p => JSON.stringify(p));
+      const blob = new Blob([lines.join('\n') + '\n'], { type: 'application/x-ndjson' });
+      const blobUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = `packets-selected-${timestamp}.jsonl`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(blobUrl);
+    } else {
+      const headers = [
+        'ID',
+        'Timestamp',
+        'ISO Time',
+        'Direction',
+        'Transport',
+        'From ID',
+        'From Name',
+        'To ID',
+        'To Name',
+        'Portnum',
+        'Portnum Name',
+        'Channel',
+        'SNR',
+        'RSSI',
+        'Hops',
+        'Payload Size',
+        'Content',
+      ];
+      const escapeCsv = (val: unknown): string => {
+        if (val === null || val === undefined) return '';
+        const str = String(val);
+        if (/[",\n\r]/.test(str)) return `"${str.replace(/"/g, '""')}"`;
+        return str;
+      };
+      const rows = selectedList.map(p => [
+        p.id,
+        p.timestamp,
+        new Date(toMs(p.timestamp)).toISOString(),
+        p.direction ?? '',
+        p.transport_mechanism !== undefined ? getTransportMechanismName(p.transport_mechanism).short : '',
+        p.from_node_id ?? '',
+        p.from_node_longName ?? '',
+        p.to_node_id ?? '',
+        p.to_node_longName ?? '',
+        p.portnum,
+        p.portnum_name ?? '',
+        p.channel ?? '',
+        typeof p.snr === 'number' ? p.snr : '',
+        typeof p.rssi === 'number' ? p.rssi : '',
+        calculateHops(p),
+        typeof p.payload_size === 'number' ? p.payload_size : '',
+        p.payload_preview ?? '',
+      ].map(escapeCsv).join(','));
+
+      const csvContent = '\uFEFF' + [headers.join(','), ...rows].join('\r\n');
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const blobUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = `packets-selected-${timestamp}.csv`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(blobUrl);
+    }
+    setShowExportMenu(false);
+  };
+
+  const handleExportAllCsv = () => {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+    const headers = [
+      'ID',
+      'Timestamp',
+      'ISO Time',
+      'Direction',
+      'Transport',
+      'From ID',
+      'From Name',
+      'To ID',
+      'To Name',
+      'Portnum',
+      'Portnum Name',
+      'Channel',
+      'SNR',
+      'RSSI',
+      'Hops',
+      'Payload Size',
+      'Content',
+    ];
+    const escapeCsv = (val: unknown): string => {
+      if (val === null || val === undefined) return '';
+      const str = String(val);
+      if (/[",\n\r]/.test(str)) return `"${str.replace(/"/g, '""')}"`;
+      return str;
+    };
+    const rows = packets.map(p => [
+      p.id,
+      p.timestamp,
+      new Date(toMs(p.timestamp)).toISOString(),
+      p.direction ?? '',
+      p.transport_mechanism !== undefined ? getTransportMechanismName(p.transport_mechanism).short : '',
+      p.from_node_id ?? '',
+      p.from_node_longName ?? '',
+      p.to_node_id ?? '',
+      p.to_node_longName ?? '',
+      p.portnum,
+      p.portnum_name ?? '',
+      p.channel ?? '',
+      typeof p.snr === 'number' ? p.snr : '',
+      typeof p.rssi === 'number' ? p.rssi : '',
+      calculateHops(p),
+      typeof p.payload_size === 'number' ? p.payload_size : '',
+      p.payload_preview ?? '',
+    ].map(escapeCsv).join(','));
+
+    const csvContent = '\uFEFF' + [headers.join(','), ...rows].join('\r\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const blobUrl = window.URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = blobUrl;
+    link.download = `packets-${timestamp}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.URL.revokeObjectURL(blobUrl);
+    setShowExportMenu(false);
   };
 
   // Pop-out to new window
@@ -513,15 +711,67 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
             <button className="control-btn" onClick={() => setShowFilters(!showFilters)} title={t('packet_monitor.toggle_filters')} aria-label={t('packet_monitor.toggle_filters')}>
               <Filter size={14} />
             </button>
-            <button
-              className="control-btn"
-              onClick={handleExport}
-              title={t('packet_monitor.export_title')}
-              aria-label={t('packet_monitor.export_title')}
-              disabled={total === 0}
-            >
-              <Download size={14} />
-            </button>
+            <div className="packet-export-wrapper" ref={exportMenuRef}>
+              <button
+                className={`control-btn${showExportMenu ? ' active' : ''}`}
+                onClick={() => setShowExportMenu(s => !s)}
+                title={t('packet_monitor.export_title')}
+                aria-label={t('packet_monitor.export_title')}
+                disabled={total === 0}
+              >
+                <Download size={14} />
+              </button>
+              {showExportMenu && (
+                <div className="packet-dropdown-menu">
+                  {selectedPacketIds.size > 0 && (
+                    <>
+                      <div className="packet-dropdown-header">
+                        {t('packet_monitor.export_selected_header', 'Selected ({{count}})', { count: selectedPacketIds.size })}
+                      </div>
+                      <button
+                        type="button"
+                        className="packet-dropdown-item"
+                        onClick={() => handleExportSelected('jsonl')}
+                      >
+                        <Download size={13} />
+                        {t('packet_monitor.export_selected_jsonl', 'Export Selected (JSONL)')}
+                      </button>
+                      <button
+                        type="button"
+                        className="packet-dropdown-item"
+                        onClick={() => handleExportSelected('csv')}
+                      >
+                        <Download size={13} />
+                        {t('packet_monitor.export_selected_csv', 'Export Selected (CSV)')}
+                      </button>
+                      <div className="packet-dropdown-divider" />
+                    </>
+                  )}
+                  <div className="packet-dropdown-header">
+                    {t('packet_monitor.export_all_header', 'All')}
+                  </div>
+                  <button
+                    type="button"
+                    className="packet-dropdown-item"
+                    onClick={() => {
+                      setShowExportMenu(false);
+                      handleExport();
+                    }}
+                  >
+                    <Download size={13} />
+                    {t('packet_monitor.export_all_jsonl', 'Export All (JSONL)')}
+                  </button>
+                  <button
+                    type="button"
+                    className="packet-dropdown-item"
+                    onClick={() => void handleExportAllCsv()}
+                  >
+                    <Download size={13} />
+                    {t('packet_monitor.export_all_csv', 'Export Loaded (CSV)')}
+                  </button>
+                </div>
+              )}
+            </div>
             {authStatus?.user?.isAdmin && (
               <button className="control-btn" onClick={handleClear} title={t('packet_monitor.clear_all')} aria-label={t('packet_monitor.clear_all')}>
                 <Trash2 size={14} />
@@ -663,8 +913,52 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
             <div className="no-packets">{t('packet_monitor.no_packets')}</div>
           ) : (
             <div style={{ width: '100%' }}>
+              {selectedPacketIds.size > 0 && (
+                <div className="packet-selection-bar">
+                  <div className="packet-selection-info">
+                    <span>{t('packet_monitor.selected_count', '{{count}} packet(s) selected', { count: selectedPacketIds.size })}</span>
+                    {selectedPacketIds.size < packets.length && (
+                      <button
+                        type="button"
+                        className="packet-btn-link"
+                        onClick={() => setSelectedPacketIds(new Set(packets.map(p => p.id)))}
+                      >
+                        {t('packet_monitor.select_all_loaded', 'Select all loaded ({{count}})', { count: packets.length })}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="packet-btn-link"
+                      onClick={() => setSelectedPacketIds(new Set())}
+                    >
+                      {t('common.clearSelection', 'Clear selection')}
+                    </button>
+                  </div>
+                  <div className="packet-selection-actions">
+                    <button
+                      type="button"
+                      className="control-btn"
+                      onClick={() => handleExportSelected('jsonl')}
+                      title={t('packet_monitor.export_selected_jsonl', 'Export selected packets as JSONL')}
+                    >
+                      <Download size={13} />
+                      <span>JSONL</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="control-btn"
+                      onClick={() => handleExportSelected('csv')}
+                      title={t('packet_monitor.export_selected_csv', 'Export selected packets as CSV')}
+                    >
+                      <Download size={13} />
+                      <span>CSV</span>
+                    </button>
+                  </div>
+                </div>
+              )}
               <table className="packet-table packet-table-fixed">
                 <colgroup>
+                  <col style={{ width: '36px' }} />   {/* Checkbox */}
                   <col style={{ width: '60px' }} />   {/* # */}
                   <col style={{ width: '35px' }} />   {/* Dir */}
                   <col style={{ width: '45px' }} />   {/* Via */}
@@ -683,6 +977,16 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
                 </colgroup>
                 <thead>
                   <tr>
+                    <th style={{ width: '36px', textAlign: 'center' }}>
+                      <input
+                        type="checkbox"
+                        ref={selectAllCheckboxRef}
+                        checked={allLoadedSelected}
+                        onChange={handleToggleSelectAll}
+                        title={t('packet_monitor.select_all', 'Select all loaded packets')}
+                        aria-label={t('packet_monitor.select_all', 'Select all loaded packets')}
+                      />
+                    </th>
                     <th style={{ width: '60px' }}>#</th>
                     <th style={{ width: '35px' }}>{t('packet_monitor.column.dir')}</th>
                     <th style={{ width: '45px' }}>{t('packet_monitor.column.via')}</th>
@@ -710,6 +1014,7 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
               >
                 <table className="packet-table packet-table-fixed">
                   <colgroup>
+                    <col style={{ width: '36px' }} />   {/* Checkbox */}
                     <col style={{ width: '60px' }} />
                     <col style={{ width: '35px' }} />
                     <col style={{ width: '45px' }} />
@@ -751,7 +1056,7 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
                               cursor: 'pointer',
                             }}
                           >
-                            <td colSpan={14} style={{ textAlign: 'center', color: 'var(--color-accent)' }}>
+                            <td colSpan={16} style={{ textAlign: 'center', color: 'var(--color-accent)' }}>
                               {loadingMore ? t('packet_monitor.loading_more') : t('packet_monitor.load_more_click', 'Click to load more packets...')}
                             </td>
                           </tr>
@@ -763,7 +1068,7 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
                         <tr
                           key={packet.id}
                           onClick={() => setSelectedPacket(packet)}
-                          className={`${selectedPacket?.id === packet.id ? 'selected' : ''}${packet.spoof_suspected ? ' spoofed-row' : ''}`}
+                          className={`${selectedPacket?.id === packet.id ? 'selected' : ''}${selectedPacketIds.has(packet.id) ? ' packet-row-checked' : ''}${packet.spoof_suspected ? ' spoofed-row' : ''}`}
                           style={{
                             position: 'absolute',
                             top: 0,
@@ -775,6 +1080,25 @@ const PacketMonitorPanel: React.FC<PacketMonitorPanelProps> = ({ onClose, onNode
                             tableLayout: 'fixed',
                           }}
                         >
+                          <td
+                            className="checkbox-col"
+                            style={{ width: '36px', textAlign: 'center' }}
+                            onClick={e => {
+                              e.stopPropagation();
+                              handleRowSelect(packet.id, virtualRow.index, e.shiftKey);
+                            }}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={selectedPacketIds.has(packet.id)}
+                              onChange={e => e.stopPropagation()}
+                              onClick={e => {
+                                e.stopPropagation();
+                                handleRowSelect(packet.id, virtualRow.index, (e.nativeEvent as MouseEvent).shiftKey);
+                              }}
+                              aria-label={`Select packet ${packet.id}`}
+                            />
+                          </td>
                           <td className="packet-number" style={{ width: '60px', textAlign: 'right' }}>
                             {virtualRow.index + 1}
                           </td>

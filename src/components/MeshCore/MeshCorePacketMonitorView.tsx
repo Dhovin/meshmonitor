@@ -15,7 +15,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useTranslation } from 'react-i18next';
-import { Filter, Trash2, Pause, Play, RefreshCw, Download, Circle, Square } from 'lucide-react';
+import { Filter, Trash2, Pause, Play, RefreshCw, Download, Circle, Square, CheckSquare } from 'lucide-react';
 import { useCsrfFetch } from '../../hooks/useCsrfFetch';
 import { useWebSocketContext } from '../../contexts/WebSocketContext';
 import { useAuth } from '../../contexts/AuthContext';
@@ -23,6 +23,7 @@ import type { MeshCoreOtaPacketEvent } from '../../hooks/useWebSocket';
 import {
   MESHCORE_PAYLOAD_TYPES as PAYLOAD_TYPES,
   MESHCORE_ROUTE_TYPES as ROUTE_TYPES,
+  decodeMeshCorePacket,
 } from '../../utils/meshcorePacketDecode';
 import MeshCorePacketDetailModal from './MeshCorePacketDetailModal';
 import './MeshCorePacketMonitor.css';
@@ -80,6 +81,47 @@ function formatTime(ts: number): string {
   return d.toLocaleTimeString([], { hour12: false }) + '.' + String(d.getMilliseconds()).padStart(3, '0');
 }
 
+function getPacketKey(p: Packet, idx: number): string {
+  if (p.id !== undefined && p.id !== null) return String(p.id);
+  if (p.rawHex && p.timestamp) return `${p.timestamp}-${p.rawHex}`;
+  return `${p.timestamp}-${idx}`;
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const blobUrl = window.URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = blobUrl;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.URL.revokeObjectURL(blobUrl);
+}
+
+function getDecodedSummary(p: Packet): string {
+  const dec = decodeMeshCorePacket(p.rawHex);
+  if (!dec) return '';
+  if (dec.payload.advert?.name) {
+    const adv = dec.payload.advert;
+    const parts = [`Name: ${adv.name}`];
+    if (adv.latitude !== undefined && adv.longitude !== undefined) {
+      parts.push(`Pos: ${adv.latitude.toFixed(5)}, ${adv.longitude.toFixed(5)}`);
+    }
+    if (adv.advTypeName) parts.push(`Type: ${adv.advTypeName}`);
+    return parts.join(' | ');
+  }
+  if (dec.payload.ack?.ackCodeHex) {
+    return `ACK code: 0x${dec.payload.ack.ackCodeHex}`;
+  }
+  if (dec.payload.groupText) {
+    return `Channel Hash: ${dec.payload.groupText.channelHash}`;
+  }
+  if (dec.payload.message) {
+    return `Dest: ${dec.payload.message.destHash}, Src: ${dec.payload.message.srcHash}`;
+  }
+  return '';
+}
+
 export const MeshCorePacketMonitorView: React.FC<MeshCorePacketMonitorViewProps> = ({ baseUrl, sourceId }) => {
   const { t } = useTranslation();
   const csrfFetch = useCsrfFetch();
@@ -120,11 +162,28 @@ export const MeshCorePacketMonitorView: React.FC<MeshCorePacketMonitorViewProps>
   const [routeFilter, setRouteFilter] = useState<number | ''>('');
   const [selectedPacket, setSelectedPacket] = useState<Packet | null>(null);
 
+  const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
+  const [lastSelectedIdx, setLastSelectedIdx] = useState<number | null>(null);
+  const headerCheckboxRef = useRef<HTMLInputElement>(null);
+  const [showExportMenu, setShowExportMenu] = useState(false);
+  const exportMenuRef = useRef<HTMLDivElement>(null);
+
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
   const groupedRef = useRef(grouped);
   groupedRef.current = grouped;
   const reloadRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    if (!showExportMenu) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (exportMenuRef.current && !exportMenuRef.current.contains(e.target as Node)) {
+        setShowExportMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [showExportMenu]);
 
   const mcPrefix = `${baseUrl}/api/sources/${encodeURIComponent(sourceId)}/meshcore`;
 
@@ -242,6 +301,123 @@ export const MeshCorePacketMonitorView: React.FC<MeshCorePacketMonitorViewProps>
     }
   }, [csrfFetch, mcPrefix, t]);
 
+  // Selection computations
+  const selectedVisiblePackets = useMemo(() => {
+    return visiblePackets.filter((p, idx) => selectedKeys.has(getPacketKey(p, idx)));
+  }, [visiblePackets, selectedKeys]);
+
+  const allVisibleSelected = visiblePackets.length > 0 && selectedVisiblePackets.length === visiblePackets.length;
+  const someVisibleSelected = selectedVisiblePackets.length > 0 && !allVisibleSelected;
+
+  useEffect(() => {
+    if (headerCheckboxRef.current) {
+      headerCheckboxRef.current.indeterminate = someVisibleSelected;
+    }
+  }, [someVisibleSelected]);
+
+  const handleToggleSelectAll = useCallback(() => {
+    if (allVisibleSelected) {
+      setSelectedKeys(prev => {
+        const next = new Set(prev);
+        visiblePackets.forEach((p, idx) => next.delete(getPacketKey(p, idx)));
+        return next;
+      });
+    } else {
+      setSelectedKeys(prev => {
+        const next = new Set(prev);
+        visiblePackets.forEach((p, idx) => next.add(getPacketKey(p, idx)));
+        return next;
+      });
+    }
+  }, [allVisibleSelected, visiblePackets]);
+
+  const handleRowSelect = useCallback((key: string, index: number, shiftKey: boolean) => {
+    setSelectedKeys(prev => {
+      const next = new Set(prev);
+      if (shiftKey && lastSelectedIdx !== null && lastSelectedIdx !== index && lastSelectedIdx < visiblePackets.length) {
+        const start = Math.min(lastSelectedIdx, index);
+        const end = Math.max(lastSelectedIdx, index);
+        for (let i = start; i <= end; i++) {
+          next.add(getPacketKey(visiblePackets[i], i));
+        }
+      } else {
+        if (next.has(key)) {
+          next.delete(key);
+        } else {
+          next.add(key);
+        }
+      }
+      return next;
+    });
+    setLastSelectedIdx(index);
+  }, [lastSelectedIdx, visiblePackets]);
+
+  const handleClearSelection = useCallback(() => {
+    setSelectedKeys(new Set());
+    setLastSelectedIdx(null);
+  }, []);
+
+  const exportCsv = useCallback((packetsToExport: Packet[], prefixName: string) => {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+    const headers = [
+      'Timestamp',
+      'ISO Time',
+      'Payload Type',
+      'Route Type',
+      'Hop Count',
+      'SNR',
+      'RSSI',
+      'Payload Size',
+      'Path',
+      'Observers',
+      'Raw Hex',
+      'Decoded Summary',
+    ];
+
+    const escapeCsv = (val: unknown): string => {
+      if (val === null || val === undefined) return '';
+      const str = String(val);
+      if (/[",\n\r]/.test(str)) {
+        return `"${str.replace(/"/g, '""')}"`;
+      }
+      return str;
+    };
+
+    const rows = packetsToExport.map(p => {
+      const obsCount = (p as GroupedPacket).observerCount !== undefined
+        ? (p as GroupedPacket).observerCount
+        : '';
+      return [
+        p.timestamp,
+        new Date(p.timestamp).toISOString(),
+        payloadLabel(p),
+        routeLabel(p),
+        typeof p.hopCount === 'number' ? p.hopCount : '',
+        typeof p.snr === 'number' ? p.snr.toFixed(2) : '',
+        typeof p.rssi === 'number' ? p.rssi : '',
+        typeof p.payloadSize === 'number' ? p.payloadSize : '',
+        p.pathHops || (p.pathLenRaw === 255 ? 'direct' : ''),
+        obsCount,
+        p.rawHex ?? '',
+        getDecodedSummary(p),
+      ].map(escapeCsv).join(',');
+    });
+
+    const csvContent = '\uFEFF' + [headers.join(','), ...rows].join('\r\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    downloadBlob(blob, `${prefixName}-${timestamp}.csv`);
+  }, []);
+
+  const exportJsonl = useCallback((packetsToExport: Packet[], prefixName: string) => {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
+    const lines = packetsToExport.map(p => {
+      const decoded = decodeMeshCorePacket(p.rawHex);
+      return JSON.stringify({ ...p, decoded });
+    });
+    const blob = new Blob([lines.join('\n') + '\n'], { type: 'application/x-ndjson' });
+    downloadBlob(blob, `${prefixName}-${timestamp}.jsonl`);
+  }, []);
+
   // Download the captured packet log as JSONL (honors the active filters),
   // mirroring the Meshtastic packet-monitor export.
   const handleExport = useCallback(async () => {
@@ -271,6 +447,25 @@ export const MeshCorePacketMonitorView: React.FC<MeshCorePacketMonitorViewProps>
       setError(err instanceof Error ? err.message : 'Failed to export packets');
     }
   }, [csrfFetch, mcPrefix, payloadFilter, routeFilter]);
+
+  const handleExportSelected = useCallback((format: 'jsonl' | 'csv') => {
+    if (selectedVisiblePackets.length === 0) return;
+    if (format === 'jsonl') {
+      exportJsonl(selectedVisiblePackets, 'meshcore-packets-selected');
+    } else {
+      exportCsv(selectedVisiblePackets, 'meshcore-packets-selected');
+    }
+    setShowExportMenu(false);
+  }, [selectedVisiblePackets, exportJsonl, exportCsv]);
+
+  const handleExportAll = useCallback(async (format: 'jsonl' | 'csv') => {
+    setShowExportMenu(false);
+    if (format === 'csv') {
+      exportCsv(visiblePackets, 'meshcore-packets');
+      return;
+    }
+    await handleExport();
+  }, [exportCsv, visiblePackets, handleExport]);
 
   return (
     <div className="meshcore-packet-monitor">
@@ -318,9 +513,63 @@ export const MeshCorePacketMonitorView: React.FC<MeshCorePacketMonitorViewProps>
           <button className="mcpm-btn" onClick={() => void load()} title={t('common.refresh', 'Refresh')}>
             <RefreshCw size={14} />
           </button>
-          <button className="mcpm-btn" onClick={() => void handleExport()} title={t('common.export', 'Export')}>
-            <Download size={14} />
-          </button>
+          <div className="mcpm-export-wrapper" ref={exportMenuRef}>
+            <button
+              className={`mcpm-btn ${showExportMenu ? 'active' : ''}`}
+              onClick={() => setShowExportMenu(s => !s)}
+              title={t('common.export', 'Export')}
+              aria-label={t('common.export', 'Export')}
+            >
+              <Download size={14} />
+            </button>
+            {showExportMenu && (
+              <div className="mcpm-dropdown-menu">
+                {selectedVisiblePackets.length > 0 && (
+                  <>
+                    <div className="mcpm-dropdown-header">
+                      {t('meshcore.packets.exportSelectedHeader', 'Selected ({{count}})', { count: selectedVisiblePackets.length })}
+                    </div>
+                    <button
+                      type="button"
+                      className="mcpm-dropdown-item"
+                      onClick={() => handleExportSelected('jsonl')}
+                    >
+                      <Download size={13} />
+                      {t('meshcore.packets.exportSelectedJsonl', 'Export Selected (JSONL)')}
+                    </button>
+                    <button
+                      type="button"
+                      className="mcpm-dropdown-item"
+                      onClick={() => handleExportSelected('csv')}
+                    >
+                      <Download size={13} />
+                      {t('meshcore.packets.exportSelectedCsv', 'Export Selected (CSV)')}
+                    </button>
+                    <div className="mcpm-dropdown-divider" />
+                  </>
+                )}
+                <div className="mcpm-dropdown-header">
+                  {t('meshcore.packets.exportAllHeader', 'All ({{count}})', { count: visiblePackets.length })}
+                </div>
+                <button
+                  type="button"
+                  className="mcpm-dropdown-item"
+                  onClick={() => void handleExportAll('jsonl')}
+                >
+                  <Download size={13} />
+                  {t('meshcore.packets.exportAllJsonl', 'Export All (JSONL)')}
+                </button>
+                <button
+                  type="button"
+                  className="mcpm-dropdown-item"
+                  onClick={() => void handleExportAll('csv')}
+                >
+                  <Download size={13} />
+                  {t('meshcore.packets.exportAllCsv', 'Export All (CSV)')}
+                </button>
+              </div>
+            )}
+          </div>
           {canClear && (
             <button className="mcpm-btn mcpm-btn-danger" onClick={() => void handleClear()} title={t('common.clear', 'Clear')}>
               <Trash2 size={14} />
@@ -414,6 +663,55 @@ export const MeshCorePacketMonitorView: React.FC<MeshCorePacketMonitorViewProps>
 
       {error && <div className="mcpm-error">{error}</div>}
 
+      {selectedVisiblePackets.length > 0 && (
+        <div className="mcpm-selection-bar">
+          <div className="mcpm-selection-info">
+            <CheckSquare size={15} />
+            <span>
+              {t('meshcore.packets.selectedCount', '{{count}} packet(s) selected', { count: selectedVisiblePackets.length })}
+            </span>
+            {selectedVisiblePackets.length < visiblePackets.length && (
+              <button
+                type="button"
+                className="mcpm-btn-link"
+                onClick={() => {
+                  setSelectedKeys(new Set(visiblePackets.map((p, i) => getPacketKey(p, i))));
+                }}
+              >
+                {t('meshcore.packets.selectAllVisible', 'Select all visible ({{count}})', { count: visiblePackets.length })}
+              </button>
+            )}
+            <button
+              type="button"
+              className="mcpm-btn-link"
+              onClick={handleClearSelection}
+            >
+              {t('common.clearSelection', 'Clear selection')}
+            </button>
+          </div>
+          <div className="mcpm-selection-actions">
+            <button
+              type="button"
+              className="mcpm-btn mcpm-btn-sm"
+              onClick={() => handleExportSelected('jsonl')}
+              title={t('meshcore.packets.exportSelectedJsonl', 'Export selected packets as JSONL')}
+            >
+              <Download size={13} />
+              <span>JSONL</span>
+            </button>
+            <button
+              type="button"
+              className="mcpm-btn mcpm-btn-sm"
+              onClick={() => handleExportSelected('csv')}
+              title={t('meshcore.packets.exportSelectedCsv', 'Export selected packets as CSV')}
+            >
+              <Download size={13} />
+              <span>CSV</span>
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="mcpm-table-container">
         {loading ? (
           <div className="mcpm-empty">{t('common.loading', 'Loading…')}</div>
@@ -427,6 +725,17 @@ export const MeshCorePacketMonitorView: React.FC<MeshCorePacketMonitorViewProps>
           <table className="mcpm-table">
             <thead>
               <tr>
+                <th className="mcpm-th-checkbox">
+                  <input
+                    type="checkbox"
+                    className="mcpm-checkbox"
+                    ref={headerCheckboxRef}
+                    checked={allVisibleSelected}
+                    onChange={handleToggleSelectAll}
+                    title={t('meshcore.packets.selectAll', 'Select all visible packets')}
+                    aria-label={t('meshcore.packets.selectAll', 'Select all visible packets')}
+                  />
+                </th>
                 <th>{t('meshcore.packets.time', 'Time')}</th>
                 <th>{t('meshcore.packets.payloadType', 'Payload')}</th>
                 <th>{t('meshcore.packets.routeType', 'Route')}</th>
@@ -444,14 +753,36 @@ export const MeshCorePacketMonitorView: React.FC<MeshCorePacketMonitorViewProps>
             </thead>
             <tbody>
               {visiblePackets.map((p, idx) => {
-                const key = p.id ?? `${p.timestamp}-${idx}`;
+                const key = getPacketKey(p, idx);
+                const isSelected = selectedKeys.has(key);
                 return (
                   <tr
                     key={key}
-                    className="mcpm-row"
+                    className={`mcpm-row ${isSelected ? 'mcpm-row-selected' : ''}`}
                     onClick={() => setSelectedPacket(p)}
                     title={t('meshcore.packets.clickToDecode', 'Click to decode this packet')}
                   >
+                    <td
+                      className="mcpm-td-checkbox"
+                      onClick={e => {
+                        e.stopPropagation();
+                        handleRowSelect(key, idx, e.shiftKey);
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        className="mcpm-checkbox"
+                        checked={isSelected}
+                        onChange={e => {
+                          e.stopPropagation();
+                        }}
+                        onClick={e => {
+                          e.stopPropagation();
+                          handleRowSelect(key, idx, (e.nativeEvent as MouseEvent).shiftKey);
+                        }}
+                        aria-label={`Select packet ${key}`}
+                      />
+                    </td>
                     <td className="mcpm-mono">{formatTime(p.timestamp)}</td>
                     <td><span className="mcpm-badge">{payloadLabel(p)}</span></td>
                     <td className="mcpm-route">{routeLabel(p)}</td>
