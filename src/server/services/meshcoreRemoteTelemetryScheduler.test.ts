@@ -708,11 +708,13 @@ describe('statusToTelemetryRows', () => {
       packetsRecv: 5000,
       packetsSent: 4200,
       airTimeSecs: 350,
+      rxAirTimeSecs: 420,
       sentFlood: 100,
       sentDirect: 4100,
       recvFlood: 800,
       recvDirect: 4200,
       errors: 2,
+      recvErrors: 15,
       directDups: 7,
       floodDups: 11,
     };
@@ -727,7 +729,12 @@ describe('statusToTelemetryRows', () => {
     expect(byType.get('mc_status_last_rssi')?.unit).toBe('dBm');
     expect(byType.get('mc_status_last_snr')?.unit).toBe('dB');
     expect(byType.get('mc_status_packets_recv')?.value).toBe(5000);
+    expect(byType.get('mc_status_air_time_secs')?.value).toBe(350);
+    expect(byType.get('mc_status_air_time_secs')?.unit).toBe('s');
+    expect(byType.get('mc_status_rx_air_time_secs')?.value).toBe(420);
+    expect(byType.get('mc_status_rx_air_time_secs')?.unit).toBe('s');
     expect(byType.get('mc_status_errors')?.value).toBe(2);
+    expect(byType.get('mc_status_recv_errors')?.value).toBe(15);
     expect(byType.get('mc_status_flood_dups')?.value).toBe(11);
     expect(rows.every((r) => r.nodeId === 'pk' && r.nodeNum === 99 && r.timestamp === 1_700_000_000)).toBe(true);
   });

@@ -255,11 +255,13 @@ export const STATUS_FIELD_MAP: readonly StatusFieldDef[] = [
   { source: 'packetsRecv', telemetryType: 'packets_recv' },
   { source: 'packetsSent', telemetryType: 'packets_sent' },
   { source: 'airTimeSecs', telemetryType: 'air_time_secs', unit: 's' },
+  { source: 'rxAirTimeSecs', telemetryType: 'rx_air_time_secs', unit: 's' },
   { source: 'sentFlood', telemetryType: 'sent_flood' },
   { source: 'sentDirect', telemetryType: 'sent_direct' },
   { source: 'recvFlood', telemetryType: 'recv_flood' },
   { source: 'recvDirect', telemetryType: 'recv_direct' },
   { source: 'errors', telemetryType: 'errors' },
+  { source: 'recvErrors', telemetryType: 'recv_errors' },
   { source: 'directDups', telemetryType: 'direct_dups' },
   { source: 'floodDups', telemetryType: 'flood_dups' },
 ];
