@@ -17,4 +17,25 @@ export interface ITransport extends EventEmitter {
   send(data: Uint8Array): Promise<void>;
   getConnectionState(): boolean;
   getReconnectAttempts(): number;
+  /**
+   * Tell the transport whether the initial config sync is in progress (#5122).
+   *
+   * During that window a peer can go silent indefinitely while the link stays
+   * open, and the ordinary idle watchdog is far too slow to notice. Optional so
+   * non-TCP transports (and test doubles) need not implement it.
+   */
+  setConfigSyncActive?(active: boolean): void;
+  /**
+   * Tell the transport the link dropped *while* the initial config sync was
+   * running (#5122), so it can retry sooner than the ordinary backoff.
+   *
+   * Separate from `setConfigSyncActive(false)`, which also fires on a sync that
+   * succeeded. Optional for the same reason as the hook above.
+   */
+  noteConfigSyncLoss?(): void;
+  /**
+   * Tell the transport a config sync ran to completion (#5122), so any
+   * fast-retry ramp armed by `noteConfigSyncLoss` resets. Optional.
+   */
+  resetConfigSyncLossRetries?(): void;
 }

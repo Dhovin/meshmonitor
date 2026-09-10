@@ -266,20 +266,15 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ nodes, channels = [
   const [statusMessageNodeStatus, setStatusMessageNodeStatus] = useState('');
 
   // Traffic Management Config State
-  const [trafficManagementEnabled, setTrafficManagementEnabled] = useState(false);
-  const [trafficManagementPositionDedupEnabled, setTrafficManagementPositionDedupEnabled] = useState(false);
-  const [trafficManagementPositionPrecisionBits, setTrafficManagementPositionPrecisionBits] = useState(0);
+  // Traffic Management — v2.8 "non-zero implies enabled" schema. The nine bool
+  // toggles and position_precision_bits were removed upstream and their tags
+  // reserved; a non-zero value on each remaining uint32 is what enables the
+  // feature on the device (#5123).
   const [trafficManagementPositionMinIntervalSecs, setTrafficManagementPositionMinIntervalSecs] = useState(0);
-  const [trafficManagementNodeinfoDirectResponse, setTrafficManagementNodeinfoDirectResponse] = useState(false);
   const [trafficManagementNodeinfoDirectResponseMaxHops, setTrafficManagementNodeinfoDirectResponseMaxHops] = useState(0);
-  const [trafficManagementRateLimitEnabled, setTrafficManagementRateLimitEnabled] = useState(false);
   const [trafficManagementRateLimitWindowSecs, setTrafficManagementRateLimitWindowSecs] = useState(0);
   const [trafficManagementRateLimitMaxPackets, setTrafficManagementRateLimitMaxPackets] = useState(0);
-  const [trafficManagementDropUnknownEnabled, setTrafficManagementDropUnknownEnabled] = useState(false);
   const [trafficManagementUnknownPacketThreshold, setTrafficManagementUnknownPacketThreshold] = useState(0);
-  const [trafficManagementExhaustHopTelemetry, setTrafficManagementExhaustHopTelemetry] = useState(false);
-  const [trafficManagementExhaustHopPosition, setTrafficManagementExhaustHopPosition] = useState(false);
-  const [trafficManagementRouterPreserveHops, setTrafficManagementRouterPreserveHops] = useState(false);
 
   // MeshBeacon Config State (firmware 2.8+, #3854). The wire `flags` bitfield is
   // split into three booleans here and repacked on save.
@@ -697,20 +692,11 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ nodes, channels = [
         // Populate Traffic Management config
         if (config.moduleConfig?.trafficManagement) {
           const tm = config.moduleConfig.trafficManagement;
-          setTrafficManagementEnabled(tm.enabled || false);
-          setTrafficManagementPositionDedupEnabled(tm.positionDedupEnabled || false);
-          setTrafficManagementPositionPrecisionBits(tm.positionPrecisionBits ?? 0);
           setTrafficManagementPositionMinIntervalSecs(tm.positionMinIntervalSecs ?? 0);
-          setTrafficManagementNodeinfoDirectResponse(tm.nodeinfoDirectResponse || false);
           setTrafficManagementNodeinfoDirectResponseMaxHops(tm.nodeinfoDirectResponseMaxHops ?? 0);
-          setTrafficManagementRateLimitEnabled(tm.rateLimitEnabled || false);
           setTrafficManagementRateLimitWindowSecs(tm.rateLimitWindowSecs ?? 0);
           setTrafficManagementRateLimitMaxPackets(tm.rateLimitMaxPackets ?? 0);
-          setTrafficManagementDropUnknownEnabled(tm.dropUnknownEnabled || false);
           setTrafficManagementUnknownPacketThreshold(tm.unknownPacketThreshold ?? 0);
-          setTrafficManagementExhaustHopTelemetry(tm.exhaustHopTelemetry || false);
-          setTrafficManagementExhaustHopPosition(tm.exhaustHopPosition || false);
-          setTrafficManagementRouterPreserveHops(tm.routerPreserveHops || false);
         }
 
         // Populate MeshBeacon config (firmware 2.8+, #3854)
@@ -1437,20 +1423,11 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ nodes, channels = [
     setStatusMessage('');
     try {
       await apiService.setModuleConfig('trafficmanagement', {
-        enabled: trafficManagementEnabled,
-        positionDedupEnabled: trafficManagementPositionDedupEnabled,
-        positionPrecisionBits: trafficManagementPositionPrecisionBits,
         positionMinIntervalSecs: trafficManagementPositionMinIntervalSecs,
-        nodeinfoDirectResponse: trafficManagementNodeinfoDirectResponse,
         nodeinfoDirectResponseMaxHops: trafficManagementNodeinfoDirectResponseMaxHops,
-        rateLimitEnabled: trafficManagementRateLimitEnabled,
         rateLimitWindowSecs: trafficManagementRateLimitWindowSecs,
         rateLimitMaxPackets: trafficManagementRateLimitMaxPackets,
-        dropUnknownEnabled: trafficManagementDropUnknownEnabled,
-        unknownPacketThreshold: trafficManagementUnknownPacketThreshold,
-        exhaustHopTelemetry: trafficManagementExhaustHopTelemetry,
-        exhaustHopPosition: trafficManagementExhaustHopPosition,
-        routerPreserveHops: trafficManagementRouterPreserveHops
+        unknownPacketThreshold: trafficManagementUnknownPacketThreshold
       }, sourceId);
       setStatusMessage(t('config.trafficmanagement_saved', 'Traffic Management config saved'));
       showToast(t('config.trafficmanagement_saved_toast', 'Traffic Management config saved successfully'), 'success');
@@ -2647,34 +2624,16 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ nodes, channels = [
 
         <div id="config-trafficmanagement">
           <TrafficManagementConfigSection
-            enabled={trafficManagementEnabled}
-            setEnabled={setTrafficManagementEnabled}
-            positionDedupEnabled={trafficManagementPositionDedupEnabled}
-            setPositionDedupEnabled={setTrafficManagementPositionDedupEnabled}
-            positionPrecisionBits={trafficManagementPositionPrecisionBits}
-            setPositionPrecisionBits={setTrafficManagementPositionPrecisionBits}
             positionMinIntervalSecs={trafficManagementPositionMinIntervalSecs}
             setPositionMinIntervalSecs={setTrafficManagementPositionMinIntervalSecs}
-            nodeinfoDirectResponse={trafficManagementNodeinfoDirectResponse}
-            setNodeinfoDirectResponse={setTrafficManagementNodeinfoDirectResponse}
             nodeinfoDirectResponseMaxHops={trafficManagementNodeinfoDirectResponseMaxHops}
             setNodeinfoDirectResponseMaxHops={setTrafficManagementNodeinfoDirectResponseMaxHops}
-            rateLimitEnabled={trafficManagementRateLimitEnabled}
-            setRateLimitEnabled={setTrafficManagementRateLimitEnabled}
             rateLimitWindowSecs={trafficManagementRateLimitWindowSecs}
             setRateLimitWindowSecs={setTrafficManagementRateLimitWindowSecs}
             rateLimitMaxPackets={trafficManagementRateLimitMaxPackets}
             setRateLimitMaxPackets={setTrafficManagementRateLimitMaxPackets}
-            dropUnknownEnabled={trafficManagementDropUnknownEnabled}
-            setDropUnknownEnabled={setTrafficManagementDropUnknownEnabled}
             unknownPacketThreshold={trafficManagementUnknownPacketThreshold}
             setUnknownPacketThreshold={setTrafficManagementUnknownPacketThreshold}
-            exhaustHopTelemetry={trafficManagementExhaustHopTelemetry}
-            setExhaustHopTelemetry={setTrafficManagementExhaustHopTelemetry}
-            exhaustHopPosition={trafficManagementExhaustHopPosition}
-            setExhaustHopPosition={setTrafficManagementExhaustHopPosition}
-            routerPreserveHops={trafficManagementRouterPreserveHops}
-            setRouterPreserveHops={setTrafficManagementRouterPreserveHops}
             isDisabled={!supportedModules?.trafficManagement}
             isSaving={isSaving}
             onSave={handleSaveTrafficManagementConfig}
@@ -2791,7 +2750,32 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ nodes, channels = [
           flexShrink: 0,
           alignSelf: 'flex-start',
           position: 'sticky',
-          top: '1rem',
+          /*
+           * Park below BOTH sticky things above it, not under them (#5100).
+           *
+           * `.app-header` is `position: fixed` and `.section-nav` is itself
+           * sticky at `top: var(--app-header-height)` with `z-index: 10`, so
+           * together they own the band from 0 to header+nav. A bare `top: 1rem`
+           * parked this panel at 16px — inside that band — and the chip rows
+           * drew straight over its heading. Measured at 1500x800: bar 0-60px,
+           * nav 60-192px, panel stuck at 76px. Same trap the config rail hit in
+           * #5070; see the banner on `--app-header-height` in App.css.
+           *
+           * The nav's height is published by `useSectionNavHeightVar` because
+           * it wraps: 29 chips are three rows here and fewer as the window
+           * widens. The `0px` fallback keeps the offset sane before the first
+           * measurement lands.
+           */
+          top: 'calc(var(--app-header-height) + var(--section-nav-height, 0px) + 1rem)',
+          /*
+           * The same question asked downward. With no cap, a panel taller than
+           * the space left below those two cannot fit in the viewport at all,
+           * so scrolling drags its bottom half off the screen with no way to
+           * reach it — the reported bug. Cap it and let it scroll its own
+           * content.
+           */
+          maxHeight: 'calc(100dvh - var(--app-header-height) - var(--section-nav-height, 0px) - 2rem)',
+          overflowY: 'auto',
           display: 'none' // Hidden by default, shown via media query
         }}>
           <GpioPinSummary

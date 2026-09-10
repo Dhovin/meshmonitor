@@ -93,6 +93,7 @@ import { ConnState, dispatch, type SmContext } from './meshtastic/connectionStat
 import fs from 'fs';
 import path from 'path';
 import * as net from 'net';
+import { safeJson } from './utils/redactSecrets.js';
 
 const POST_RESET_COOLDOWN_MS = 5000;
 const TCP_READY_TIMEOUT_MS = 15000;
@@ -110,6 +111,8 @@ const SCRIPT_AUTO_RESPONDER_TIMEOUT_MS = 30_000;
 // Minimum gap between local "re-ignore" admin pushes for the same node (#2601),
 // so a device that can't durably hold the ignore doesn't trigger a command storm.
 const IGNORE_REAPPLY_COOLDOWN_MS = 60_000;
+/** Same coalescing window as the ignore re-sync, for the favorite re-sync (#5122). */
+const FAVORITE_REAPPLY_COOLDOWN_MS = 60_000;
 // Window for the {NODECOUNT}/{DIRECTCOUNT} template tokens, matching the
 // Sources panel's per-source "active" badge (issue #3388). The badge counts
 // nodes heard in the last 2h (getActiveNodeCount default, issue #2883); the
@@ -680,17 +683,53 @@ class MeshtasticManager implements ISourceManager {
   // Buffer resets (`initConfigCache`, `preConfigChannelSnapshot`) stay as
   // separate, explicit statements at each call site — pre-refactor code
   // never bundled them into these two booleans either.
+  // Config-sync progress, for diagnosing a link that drops part-way through
+  // the initial NodeDB stream (#5122). A large NodeDB takes minutes and arrives
+  // in bursts, so "we disconnected" and "we disconnected after 120 of ~190
+  // NodeInfos, 74s in" are very different reports — and the second one is the
+  // only one that can be correlated against a packet capture.
+  private configSyncStartedAt: number | null = null;
+  private configSyncNodeInfoCount = 0;
+
+  /**
+   * Mirror the capture flags onto the transport's sync-stall watchdog (#5122).
+   *
+   * These three helpers are the only writers of the capture flags, so this is
+   * the one seam where "a sync is running" is authoritative. Optional on
+   * ITransport, so non-TCP transports and test doubles simply opt out.
+   */
+  private setTransportConfigSyncActive(active: boolean): void {
+    try {
+      this.transport?.setConfigSyncActive?.(active);
+    } catch (err) {
+      // Never let a watchdog hint break the capture state machine.
+      logger.debug(`Ignoring setConfigSyncActive(${active}) failure: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   private startConfigCapture(): void {
+    this.configSyncStartedAt = Date.now();
+    this.configSyncNodeInfoCount = 0;
     this.isCapturingInitConfig = true;
     this.configCaptureComplete = false;
+    this.setTransportConfigSyncActive(true);
   }
   private completeConfigCapture(): void {
     this.isCapturingInitConfig = false;
     this.configCaptureComplete = true;
+    this.setTransportConfigSyncActive(false);
+    // A sync that finished spends the #5122 fast-retry ladder back to the top,
+    // so it counts consecutive failures rather than lifetime ones.
+    try {
+      this.transport?.resetConfigSyncLossRetries?.();
+    } catch (err) {
+      logger.debug(`Ignoring resetConfigSyncLossRetries failure: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
   private clearConfigCapture(): void {
     this.isCapturingInitConfig = false;
     this.configCaptureComplete = false;
+    this.setTransportConfigSyncActive(false);
   }
   private preserveConfigCapture(): void {
     // no-op on both flags — #3122 passive/no-VN disconnect keeps the cached
@@ -710,6 +749,78 @@ class MeshtasticManager implements ISourceManager {
         logger.debug(`Ignoring error tearing down previous transport: ${msg}`);
       }
       this.transport = null;
+    }
+  }
+
+  /**
+   * Converge the device's favorite flag to ours for a `favoriteLocked` node.
+   *
+   * This used to fire inline, fire-and-forget, from `processNodeInfoProtobuf` —
+   * so on a large mesh every locked node whose device state disagreed injected
+   * an admin write INTO the initial NodeDB sync, while NodeInfo was still
+   * streaming. A reporter packet-captured the consequence (#5122): the node
+   * stops ACKing that exact segment, the OS retransmits it 8 times over
+   * ~10-15s with the same sequence number, and the node then RSTs the
+   * connection. The sync restarts from scratch and, on a ~190-node mesh, never
+   * finishes. The same capture shows this packet flowing fine outside the sync
+   * window, so the fix is when we send it, not what we send.
+   *
+   * So: during config capture, record the intent and send nothing. The DB has
+   * already been made authoritative by the caller, so nothing is lost by
+   * waiting; `flushPendingFavoriteResyncs()` drains the queue once
+   * `configComplete` lands.
+   *
+   * The cooldown mirrors the ignore re-sync directly below the call site — a
+   * device that cannot durably hold the flag would otherwise trigger an admin
+   * command on every single NodeInfo for that node.
+   */
+  private queueFavoriteResync(nodeNum: number, nodeId: string, desiredFavorite: boolean): void {
+    if (this.isCapturingInitConfig && !this.configCaptureComplete) {
+      // Map, not push: a node that flaps mid-sync collapses to its final value.
+      this.pendingFavoriteResync.set(nodeNum, desiredFavorite);
+      logger.debug(`⏸️ Deferring favorite write-back for ${nodeId} until the config sync completes (#5122)`);
+      return;
+    }
+    void this.sendFavoriteResyncNow(nodeNum, nodeId, desiredFavorite);
+  }
+
+  /** The actual admin write, cooldown-guarded. Local command — no mesh airtime. */
+  private async sendFavoriteResyncNow(nodeNum: number, nodeId: string, desiredFavorite: boolean): Promise<void> {
+    const now = Date.now();
+    const lastPush = this.favoriteReapplyCooldown.get(nodeNum) ?? 0;
+    if (now - lastPush < FAVORITE_REAPPLY_COOLDOWN_MS) {
+      logger.debug(`⏳ Favorite write-back for ${nodeId} still in cooldown — skipping`);
+      return;
+    }
+    this.favoriteReapplyCooldown.set(nodeNum, now);
+    try {
+      if (desiredFavorite) {
+        await this.sendFavoriteNode(nodeNum);
+      } else {
+        await this.sendRemoveFavoriteNode(nodeNum);
+      }
+    } catch (err) {
+      logger.warn(`⚠️ Failed to re-sync locked favorite for node ${nodeId}:`, err);
+    }
+  }
+
+  /**
+   * Drain the favorite write-backs deferred during config capture (#5122).
+   *
+   * Sends are serialised rather than fired in parallel: the whole point is to
+   * stop handing the node a burst of admin packets it may not keep up with, and
+   * firing the queue at once right after `configComplete` would recreate that in
+   * a different place. These are local admin commands to the connected node, so
+   * they cost no mesh airtime.
+   */
+  private async flushPendingFavoriteResyncs(): Promise<void> {
+    if (this.pendingFavoriteResync.size === 0) return;
+    const pending = [...this.pendingFavoriteResync.entries()];
+    this.pendingFavoriteResync.clear();
+    logger.debug(`▶️ Config sync complete — applying ${pending.length} deferred favorite write-back(s) (#5122)`);
+    for (const [nodeNum, desiredFavorite] of pending) {
+      const nodeId = `!${nodeNum.toString(16).padStart(8, '0')}`;
+      await this.sendFavoriteResyncNow(nodeNum, nodeId, desiredFavorite);
     }
   }
 
@@ -849,6 +960,15 @@ class MeshtasticManager implements ISourceManager {
   private remoteLocalStatsLastSentAt: Map<number, number> = new Map();
   private nodeLinkQuality: Map<number, { quality: number; lastHops: number }> = new Map(); // Track link quality per node
   private ignoreReapplyCooldown: Map<number, number> = new Map(); // nodeNum -> last local re-ignore push timestamp (#2601), coalesces bursts
+  private favoriteReapplyCooldown: Map<number, number> = new Map(); // nodeNum -> last favorite write-back timestamp (#5122), coalesces bursts
+  /**
+   * Favorite write-backs deferred until the initial config sync finishes (#5122).
+   *
+   * nodeNum -> the favorite state we want the device to converge to. A Map, so a
+   * node that flaps several times during one sync collapses to its final value
+   * and produces a single admin command on flush.
+   */
+  private pendingFavoriteResync: Map<number, boolean> = new Map();
   private remoteAdminScannerInterval: NodeJS.Timeout | null = null;
   private remoteAdminScannerIntervalMinutes: number = 0; // 0 = disabled
   private pendingRemoteAdminScans: Set<number> = new Set(); // Track nodes being scanned
@@ -2099,8 +2219,37 @@ class MeshtasticManager implements ISourceManager {
     }
   }
 
+  /** Seconds since the current config sync started, or 'unknown' if none is. */
+  private describeConfigSyncElapsed(): string {
+    if (this.configSyncStartedAt === null) return 'unknown elapsed time';
+    return `${Math.round((Date.now() - this.configSyncStartedAt) / 1000)}s`;
+  }
+
   private async handleDisconnected(): Promise<void> {
     logger.debug('TCP connection lost');
+
+    // Losing the link mid-sync means the whole NodeDB stream restarts from
+    // scratch on reconnect, so on a large mesh it can loop forever without ever
+    // completing. That is worth a warning with the numbers attached, not a
+    // debug line indistinguishable from an idle disconnect (#5122).
+    if (this.isCapturingInitConfig && !this.configCaptureComplete) {
+      logger.warn(
+        `⚠️ Connection lost during the initial config sync — ${this.configSyncNodeInfoCount} NodeInfo message(s) received over ${this.describeConfigSyncElapsed()}. ` +
+        'The sync restarts from the beginning on reconnect; on a large NodeDB it may never finish if this repeats. ' +
+        'Consider enabling Passive Mode for this source.'
+      );
+      // Retry sooner than the 60s default backoff (#5122). The reporter's
+      // captures show the retry after one of these completes the whole
+      // ~190-node sync in about 2s, so a minute of waiting is almost all of
+      // the user-visible outage. The transport ramps its own delay if this
+      // keeps happening, so a node that genuinely cannot finish is not
+      // hammered — see SYNC_LOSS_RETRY_LADDER_MS.
+      try {
+        this.transport?.noteConfigSyncLoss?.();
+      } catch (err) {
+        logger.debug(`Ignoring noteConfigSyncLoss failure: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
 
     // #3962 Phase 4.2b C2: TRANSPORT_DISCONNECTED. A transport-level
     // disconnect that fires after an operator-initiated userDisconnect()
@@ -2144,6 +2293,10 @@ class MeshtasticManager implements ISourceManager {
           this.localNodeInfo = null;
           this.actualDeviceConfig = null;
           this.actualModuleConfig = null;
+          // A sync that died mid-flight must not carry its deferred favorite
+          // write-backs into the next session — the device re-reports its own
+          // state on reconnect and the reconciliation runs again from there (#5122).
+          this.pendingFavoriteResync.clear();
           logger.debug('📸 Cleared device and module config cache on disconnect');
           break;
         case 'clearConfigCapture':
@@ -3906,7 +4059,7 @@ class MeshtasticManager implements ISourceManager {
           trigger.scriptArgs, trigger, nodeNum, lat, lng, eventType
         );
         scriptArgsList = this.parseScriptArgs(expandedArgs);
-        logger.debug(`📍 Geofence script args expanded: ${trigger.scriptArgs} -> ${JSON.stringify(scriptArgsList)}`);
+        logger.debug(`📍 Geofence script args expanded: ${trigger.scriptArgs} -> ${safeJson(scriptArgsList)}`);
       }
 
       const { stdout, stderr } = await execFileAsync(interpreter, [resolvedPath, ...scriptArgsList], {
@@ -4157,7 +4310,7 @@ class MeshtasticManager implements ISourceManager {
       if (scriptArgs) {
         const expandedArgs = await this.replaceAnnouncementTokens(scriptArgs);
         scriptArgsList = this.parseScriptArgs(expandedArgs);
-        logger.debug(`⏱️ Timer script args expanded: ${scriptArgs} -> ${JSON.stringify(scriptArgsList)}`);
+        logger.debug(`⏱️ Timer script args expanded: ${scriptArgs} -> ${safeJson(scriptArgsList)}`);
       }
 
       // Execute script with 30-second timeout (longer than auto-responder for scheduled tasks)
@@ -4444,6 +4597,13 @@ class MeshtasticManager implements ISourceManager {
           await this.processMyNodeInfo(parsed.data);
           break;
         case 'nodeInfo':
+          if (this.isCapturingInitConfig && !this.configCaptureComplete) {
+            this.configSyncNodeInfoCount++;
+            // Every 25th, so a 200-node sync leaves ~8 lines rather than 200.
+            if (this.configSyncNodeInfoCount % 25 === 0) {
+              logger.debug(`📇 Config sync: ${this.configSyncNodeInfoCount} NodeInfo messages in ${this.describeConfigSyncElapsed()}`);
+            }
+          }
           await this.processNodeInfoProtobuf(parsed.data);
           break;
         case 'metadata':
@@ -4451,12 +4611,12 @@ class MeshtasticManager implements ISourceManager {
           break;
         case 'config':
           logger.debug('⚙️ Received Config with keys:', Object.keys(parsed.data));
-          logger.debug('⚙️ Received Config:', JSON.stringify(parsed.data, null, 2));
+          logger.debug('⚙️ Received Config:', safeJson(parsed.data, 2));
 
           // Proto3 omits fields with default values (false for bool, 0 for numeric)
           // We need to ensure these fields exist with proper defaults
           if (parsed.data.lora) {
-            logger.debug(`📊 Raw LoRa config from device:`, JSON.stringify(parsed.data.lora, null, 2));
+            logger.debug(`📊 Raw LoRa config from device:`, safeJson(parsed.data.lora, 2));
 
             // Ensure boolean fields have explicit values (Proto3 omits false)
             if (parsed.data.lora.usePreset === undefined) {
@@ -4508,7 +4668,7 @@ class MeshtasticManager implements ISourceManager {
 
           // Apply Proto3 defaults to device config
           if (parsed.data.device) {
-            logger.debug(`📊 Raw Device config from device:`, JSON.stringify(parsed.data.device, null, 2));
+            logger.debug(`📊 Raw Device config from device:`, safeJson(parsed.data.device, 2));
 
             // Ensure numeric fields have explicit values (Proto3 omits 0)
             if (parsed.data.device.nodeInfoBroadcastSecs === undefined) {
@@ -4519,7 +4679,7 @@ class MeshtasticManager implements ISourceManager {
 
           // Apply Proto3 defaults to position config
           if (parsed.data.position) {
-            logger.debug(`📊 Raw Position config from device:`, JSON.stringify(parsed.data.position, null, 2));
+            logger.debug(`📊 Raw Position config from device:`, safeJson(parsed.data.position, 2));
 
             // Ensure boolean fields have explicit values (Proto3 omits false)
             if (parsed.data.position.positionBroadcastSmartEnabled === undefined) {
@@ -4540,7 +4700,7 @@ class MeshtasticManager implements ISourceManager {
 
           // Apply Proto3 defaults to position config
           if (parsed.data.position) {
-            logger.debug(`📊 Raw Position config from device:`, JSON.stringify(parsed.data.position, null, 2));
+            logger.debug(`📊 Raw Position config from device:`, safeJson(parsed.data.position, 2));
 
             // Ensure boolean fields have explicit values (Proto3 omits false)
             if (parsed.data.position.positionBroadcastSmartEnabled === undefined) {
@@ -4639,11 +4799,11 @@ class MeshtasticManager implements ISourceManager {
           break;
         case 'moduleConfig':
           logger.debug('⚙️ Received Module Config with keys:', Object.keys(parsed.data));
-          logger.debug('⚙️ Received Module Config:', JSON.stringify(parsed.data, null, 2));
+          logger.debug('⚙️ Received Module Config:', safeJson(parsed.data, 2));
 
           // Apply Proto3 defaults to MQTT config
           if (parsed.data.mqtt) {
-            logger.debug(`📊 Raw MQTT config from device:`, JSON.stringify(parsed.data.mqtt, null, 2));
+            logger.debug(`📊 Raw MQTT config from device:`, safeJson(parsed.data.mqtt, 2));
 
             // Ensure boolean fields have explicit values (Proto3 omits false)
             if (parsed.data.mqtt.enabled === undefined) {
@@ -4662,7 +4822,7 @@ class MeshtasticManager implements ISourceManager {
 
           // Apply Proto3 defaults to NeighborInfo config
           if (parsed.data.neighborInfo) {
-            logger.debug(`📊 Raw NeighborInfo config from device:`, JSON.stringify(parsed.data.neighborInfo, null, 2));
+            logger.debug(`📊 Raw NeighborInfo config from device:`, safeJson(parsed.data.neighborInfo, 2));
 
             // Ensure boolean fields have explicit values (Proto3 omits false)
             if (parsed.data.neighborInfo.enabled === undefined) {
@@ -4686,7 +4846,7 @@ class MeshtasticManager implements ISourceManager {
           // field omitted entirely — without this the UI would render every
           // toggle as indeterminate rather than off.
           if (parsed.data.meshBeacon) {
-            logger.debug(`📊 Raw MeshBeacon config from device:`, JSON.stringify(parsed.data.meshBeacon, null, 2));
+            logger.debug(`📊 Raw MeshBeacon config from device:`, safeJson(parsed.data.meshBeacon, 2));
 
             if (parsed.data.meshBeacon.flags === undefined) {
               parsed.data.meshBeacon.flags = 0;
@@ -4753,6 +4913,8 @@ class MeshtasticManager implements ISourceManager {
             const { next, actions } = dispatch(this.#state, 'CONFIG_COMPLETE', this.buildSmContext());
             this.#state = next;
             logger.debug(`📸 Init config capture complete! Captured ${this.initConfigCache.length} messages for virtual node replay`);
+            logger.info(`✅ Config sync complete: ${this.configSyncNodeInfoCount} NodeInfo message(s) in ${this.describeConfigSyncElapsed()}`);
+            this.configSyncStartedAt = null;
 
             for (const action of actions) {
               switch (action.kind) {
@@ -4783,6 +4945,9 @@ class MeshtasticManager implements ISourceManager {
                   break;
               }
             }
+            // After the action loop, so the capture flags are already flipped
+            // before any deferred admin write goes out (#5122).
+            void this.flushPendingFavoriteResyncs();
             this.assertStateConsistent();
           }
           break;
@@ -4903,7 +5068,7 @@ class MeshtasticManager implements ISourceManager {
 
   private async processMyNodeInfoImpl(myNodeInfo: any): Promise<void> {
     logger.debug('📱 Processing MyNodeInfo for local device');
-    logger.debug('📱 MyNodeInfo contents:', JSON.stringify(myNodeInfo, null, 2));
+    logger.debug('📱 MyNodeInfo contents:', safeJson(myNodeInfo, 2));
 
     // Log minAppVersion for debugging but don't use it as firmware version
     if (myNodeInfo.minAppVersion) {
@@ -5588,25 +5753,20 @@ class MeshtasticManager implements ISourceManager {
       logger.debug(`[CONFIG] Returning StatusMessage config with nodeStatus="${statusMessageConfigWithDefaults.nodeStatus}"`);
     }
 
-    // Apply Proto3 defaults to TrafficManagement module config (v2.7.22 schema)
+    // Apply Proto3 defaults to TrafficManagement module config (v2.8
+    // "non-zero implies enabled" schema). Protobufs commit d4f7ddb1 removed
+    // the nine bool toggles and position_precision_bits and reserved their
+    // tags; the module-level on/off switch is `moduleConfig.has_traffic_management`
+    // and each remaining uint32 is enabled by a non-zero value (#5123).
     if (moduleConfig.trafficManagement) {
       const tm = moduleConfig.trafficManagement;
       const trafficManagementConfigWithDefaults = {
         ...tm,
-        enabled: tm.enabled !== undefined ? tm.enabled : false,
-        positionDedupEnabled: tm.positionDedupEnabled !== undefined ? tm.positionDedupEnabled : false,
-        positionPrecisionBits: tm.positionPrecisionBits !== undefined ? tm.positionPrecisionBits : 0,
         positionMinIntervalSecs: tm.positionMinIntervalSecs !== undefined ? tm.positionMinIntervalSecs : 0,
-        nodeinfoDirectResponse: tm.nodeinfoDirectResponse !== undefined ? tm.nodeinfoDirectResponse : false,
         nodeinfoDirectResponseMaxHops: tm.nodeinfoDirectResponseMaxHops !== undefined ? tm.nodeinfoDirectResponseMaxHops : 0,
-        rateLimitEnabled: tm.rateLimitEnabled !== undefined ? tm.rateLimitEnabled : false,
         rateLimitWindowSecs: tm.rateLimitWindowSecs !== undefined ? tm.rateLimitWindowSecs : 0,
         rateLimitMaxPackets: tm.rateLimitMaxPackets !== undefined ? tm.rateLimitMaxPackets : 0,
-        dropUnknownEnabled: tm.dropUnknownEnabled !== undefined ? tm.dropUnknownEnabled : false,
-        unknownPacketThreshold: tm.unknownPacketThreshold !== undefined ? tm.unknownPacketThreshold : 0,
-        exhaustHopTelemetry: tm.exhaustHopTelemetry !== undefined ? tm.exhaustHopTelemetry : false,
-        exhaustHopPosition: tm.exhaustHopPosition !== undefined ? tm.exhaustHopPosition : false,
-        routerPreserveHops: tm.routerPreserveHops !== undefined ? tm.routerPreserveHops : false
+        unknownPacketThreshold: tm.unknownPacketThreshold !== undefined ? tm.unknownPacketThreshold : 0
       };
 
       moduleConfig = {
@@ -5614,7 +5774,7 @@ class MeshtasticManager implements ISourceManager {
         trafficManagement: trafficManagementConfigWithDefaults
       };
 
-      logger.debug(`[CONFIG] Returning TrafficManagement config with enabled=${trafficManagementConfigWithDefaults.enabled}`);
+      logger.debug(`[CONFIG] Returning TrafficManagement config with positionMinIntervalSecs=${trafficManagementConfigWithDefaults.positionMinIntervalSecs}`);
     }
 
     return {
@@ -5638,7 +5798,7 @@ class MeshtasticManager implements ISourceManager {
    * Process DeviceMetadata protobuf message
    */
   private async processDeviceMetadata(metadata: any): Promise<void> {
-    logger.debug('📱 Processing DeviceMetadata:', JSON.stringify(metadata, null, 2));
+    logger.debug('📱 Processing DeviceMetadata:', safeJson(metadata, 2));
     logger.debug('📱 Firmware version:', metadata.firmwareVersion);
 
     // MyNodeInfo establishes local identity and DeviceMetadata follows it in the
@@ -8106,7 +8266,7 @@ class MeshtasticManager implements ISourceManager {
         logger.debug(`🗺️ Outgoing traceroute response from local node ${fromNodeId} — will record without segments`);
       }
 
-      logger.debug(`🗺️ Traceroute response from ${fromNodeId}:`, JSON.stringify(routeDiscovery, null, 2));
+      logger.debug(`🗺️ Traceroute response from ${fromNodeId}:`, safeJson(routeDiscovery, 2));
 
       // Ensure from node exists in database (don't overwrite existing names)
       const existingFromNode = await databaseService.nodes.getNode(fromNum);
@@ -8206,8 +8366,8 @@ class MeshtasticManager implements ISourceManager {
       // Log if we filtered any invalid nodes
       if (route.length !== rawRoute.length || routeBack.length !== rawRouteBack.length) {
         logger.warn(`🗺️ Filtered invalid node numbers from traceroute: route ${rawRoute.length}→${route.length}, routeBack ${rawRouteBack.length}→${routeBack.length}`);
-        logger.debug(`🗺️ Raw route: ${JSON.stringify(rawRoute)}, Filtered: ${JSON.stringify(route)}`);
-        logger.debug(`🗺️ Raw routeBack: ${JSON.stringify(rawRouteBack)}, Filtered: ${JSON.stringify(routeBack)}`);
+        logger.debug(`🗺️ Raw route: ${safeJson(rawRoute)}, Filtered: ${safeJson(route)}`);
+        logger.debug(`🗺️ Raw routeBack: ${safeJson(rawRouteBack)}, Filtered: ${safeJson(routeBack)}`);
       }
 
       // Traceroute intermediate hops are nodes that relayed traffic on our
@@ -8524,6 +8684,14 @@ class MeshtasticManager implements ISourceManager {
         routePositions: JSON.stringify(routePositions),
         channel: channelIndex >= 0 ? channelIndex : null,
         packetId: meshPacket.id != null ? Number(meshPacket.id) : null,
+        // #5097 — which transport carried this traceroute, so the map's
+        // Show RF / UDP / MQTT toggles can filter its route segments. This is
+        // per-RECORD, and it has to be: the traceroute protobuf carries no
+        // per-hop transport field, and the only per-hop signal (the unknown-SNR
+        // sentinel) says nothing about UDP. Same resolver the node rows use, so
+        // a bridge packet with no explicit mechanism still classifies MQTT via
+        // the legacy `viaMqtt` flag.
+        transportMechanism: resolveRadioPacketTransport(meshPacket),
         timestamp: timestamp,
         createdAt: Date.now()
       };
@@ -9244,19 +9412,12 @@ class MeshtasticManager implements ISourceManager {
         if (existingNode?.favoriteLocked) {
           if (existingNode.isFavorite !== nodeInfo.isFavorite) {
             logger.debug(`🔒 Node ${nodeId} favoriteLocked — preserving DB isFavorite=${existingNode.isFavorite}, re-syncing to device (device reported ${nodeInfo.isFavorite})`);
+            // The DB always wins immediately — that part is local and free.
             nodeData.isFavorite = existingNode.isFavorite;
-            // Re-push the locked favorite state to the connected device
-            void (async () => {
-              try {
-                if (existingNode.isFavorite) {
-                  await this.sendFavoriteNode(nodeNum);
-                } else {
-                  await this.sendRemoveFavoriteNode(nodeNum);
-                }
-              } catch (err) {
-                logger.warn(`⚠️ Failed to re-sync locked favorite for node ${nodeId}:`, err);
-              }
-            })();
+            // The write-back to the device is what must wait (#5122). See
+            // queueFavoriteResync: sending it mid-sync has been packet-captured
+            // wedging the node's TCP stack until it RSTs the connection.
+            this.queueFavoriteResync(nodeNum, nodeId, existingNode.isFavorite === true);
           }
         } else {
           nodeData.isFavorite = nodeInfo.isFavorite;
@@ -9755,7 +9916,7 @@ class MeshtasticManager implements ISourceManager {
     logger.debug('🔍 getDeviceConfig called - actualModuleConfig present:', !!this.actualModuleConfig);
 
     if (this.actualDeviceConfig?.lora || this.actualModuleConfig) {
-      logger.debug('Using actualDeviceConfig:', JSON.stringify(this.actualDeviceConfig, null, 2));
+      logger.debug('Using actualDeviceConfig:', safeJson(this.actualDeviceConfig, 2));
       logger.debug('✅ Returning device config from actualDeviceConfig');
       return await this.deviceAdminService.buildDeviceConfigFromActual();
     }
@@ -11761,7 +11922,7 @@ class MeshtasticManager implements ISourceManager {
                   message.rxSnr, message.rxRssi, message.viaMqtt, false, message.relayNode
                 );
                 scriptArgsList = this.parseScriptArgs(expandedArgs);
-                logger.debug(`🤖 Script args expanded: ${trigger.scriptArgs} -> ${JSON.stringify(scriptArgsList)}`);
+                logger.debug(`🤖 Script args expanded: ${trigger.scriptArgs} -> ${safeJson(scriptArgsList)}`);
               }
 
               // Execute script with the script-side auto-responder timeout (30s)

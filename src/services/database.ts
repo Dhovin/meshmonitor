@@ -69,6 +69,7 @@ import {
   AutomationVariablesRepository,
   AutomationHomeAnchorsRepository,
   SavedRegionsRepository,
+  PrivacyDocumentsRepository,
   SolarEstimatesRepository,
   NewsCacheRepository,
   BackupHistoryRepository,
@@ -261,6 +262,13 @@ export interface DbTraceroute {
   routePositions?: string;
   /** Originating Meshtastic packet id (null/undefined = not captured). Enables cross-source correlation (#3623). */
   packetId?: number | null;
+  /**
+   * `MeshPacket.TransportMechanism` of the packet that carried the route
+   * (#5097, migration 160). Null/undefined on pre-migration rows and resolves
+   * to `'rf'` through `classifyNodeTransport`, so historical traceroutes stay
+   * visible under the map's default Show RF / UDP / MQTT toggles.
+   */
+  transportMechanism?: number | null;
   timestamp: number;
   createdAt: number;
 }
@@ -558,6 +566,7 @@ class DatabaseService {
   public automationVariablesRepo: AutomationVariablesRepository | null = null;
   public automationHomeAnchorsRepo: AutomationHomeAnchorsRepository | null = null;
   public savedRegionsRepo: SavedRegionsRepository | null = null;
+  public privacyDocumentsRepo: PrivacyDocumentsRepository | null = null;
   public solarEstimatesRepo: SolarEstimatesRepository | null = null;
   public newsCacheRepo: NewsCacheRepository | null = null;
   public backupHistoryRepo: BackupHistoryRepository | null = null;
@@ -665,6 +674,11 @@ class DatabaseService {
   get savedRegions(): SavedRegionsRepository {
     if (!this.savedRegionsRepo) throw new Error('Database not initialized');
     return this.savedRegionsRepo;
+  }
+
+  get privacyDocuments(): PrivacyDocumentsRepository {
+    if (!this.privacyDocumentsRepo) throw new Error('Database not initialized');
+    return this.privacyDocumentsRepo;
   }
 
   get solarEstimates(): SolarEstimatesRepository {
@@ -1062,6 +1076,7 @@ class DatabaseService {
       this.automationVariablesRepo = new AutomationVariablesRepository(drizzleDb, this.drizzleDbType);
       this.automationHomeAnchorsRepo = new AutomationHomeAnchorsRepository(drizzleDb, this.drizzleDbType);
       this.savedRegionsRepo = new SavedRegionsRepository(drizzleDb, this.drizzleDbType);
+      this.privacyDocumentsRepo = new PrivacyDocumentsRepository(drizzleDb, this.drizzleDbType);
       this.solarEstimatesRepo = new SolarEstimatesRepository(drizzleDb, this.drizzleDbType);
       this.newsCacheRepo = new NewsCacheRepository(drizzleDb, this.drizzleDbType);
       this.backupHistoryRepo = new BackupHistoryRepository(drizzleDb, this.drizzleDbType);
@@ -2213,7 +2228,8 @@ class DatabaseService {
               tracerouteData.snrTowards || null,
               tracerouteData.snrBack || null,
               tracerouteData.timestamp,
-              tracerouteData.packetId ?? null
+              tracerouteData.packetId ?? null,
+              tracerouteData.transportMechanism ?? null
             );
           } else {
             // Insert new traceroute
@@ -5284,6 +5300,7 @@ class DatabaseService {
     positionHistoryHours?: number | null;
     mapMaxAgeHours?: number | null;
     positionHistoryPointsOnly?: boolean;
+      unreadIndicatorEnabled?: boolean;
   }): Promise<void> {
     return this.mapPreferences!.saveMapPreferences(userId, preferences);
   }

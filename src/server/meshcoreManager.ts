@@ -63,6 +63,7 @@ import { MESHCORE_SECRET_BYTES } from '../utils/meshcoreHelpers.js';
 import { parsePathHops, pathHashBytesOf, resolveRouteNames } from '../utils/meshcorePath.js';
 import { tryDecodeGroupTextPayload } from './utils/meshcoreGroupEcho.js';
 import { meshcoreAgeCutoffMs, isWithinMeshcoreAge } from '../utils/meshcoreAge.js';
+import { safeJson } from './utils/redactSecrets.js';
 
 // Dynamic imports for optional serialport dependency
 // These are loaded only when MeshCore is enabled to avoid requiring native build tools
@@ -698,15 +699,17 @@ export interface MeshCoreStatus {
   packetsRecv?: number;
   packetsSent?: number;
   airTimeSecs?: number;
-  rxAirTimeSecs?: number;
   sentFlood?: number;
   sentDirect?: number;
   recvFlood?: number;
   recvDirect?: number;
   errors?: number;
-  recvErrors?: number;
   directDups?: number;
   floodDups?: number;
+  /** Total receive air time in seconds. Repeater firmware >= v1.8 only. */
+  rxAirTimeSecs?: number;
+  /** RadioLib CRC/receive error count. Repeater firmware >= v1.12 only. */
+  recvErrors?: number;
 
   // Companion-only fields (radio config etc.). Kept on the interface for
   // backwards compatibility with callers that ask Companion targets for status.
@@ -3072,8 +3075,8 @@ class MeshCoreManager extends EventEmitter implements ISourceManager {
         const nameResponse = await this.sendRepeaterCommand('get name');
         const radioResponse = await this.sendRepeaterCommand('get radio');
 
-        logger.debug(`[MeshCore] Name response: ${JSON.stringify(nameResponse)}`);
-        logger.debug(`[MeshCore] Radio response: ${JSON.stringify(radioResponse)}`);
+        logger.debug(`[MeshCore] Name response: ${safeJson(nameResponse)}`);
+        logger.debug(`[MeshCore] Radio response: ${safeJson(radioResponse)}`);
 
         // Repeater CLI returns "  -> > DeviceName" format
         const nameMatch = nameResponse.match(/->\s*>\s*(.+)/);

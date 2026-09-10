@@ -31,6 +31,20 @@ export class TcpTransport extends EventEmitter implements ITransport {
   private staleConnectionTimeout: number = 300000; // 5 minutes default (in milliseconds)
   private healthCheckInterval: NodeJS.Timeout | null = null;
   private readonly HEALTH_CHECK_INTERVAL_MS = 60000; // Check every minute
+
+  // Initial-config-sync stall detection (#5122).
+  //
+  // A reporter watched a node go silent mid-sync and stay that way: no data, no
+  // error, no FIN. MeshMonitor's own state read `isConnected=true,
+  // configuring=true` for 70+ seconds with zero reconnect attempts, because the
+  // only liveness guard is the idle watchdog below — 5 minutes by default, polled
+  // once a minute. A sync that stalls is not an idle link: it will never recover
+  // on its own, and every second spent waiting is a sync that has to restart
+  // from scratch anyway. So while the manager says a sync is running, silence is
+  // policed on a much tighter budget.
+  private configSyncActive = false;
+  private readonly CONFIG_SYNC_STALL_MS = 60000; // 60s of total silence mid-sync
+  private readonly CONFIG_SYNC_CHECK_INTERVAL_MS = 15000; // poll 4x faster while syncing
   private readonly BUFFER_STALE_TIMEOUT_MS = 30000; // 30s: if buffer has data but no frames parsed, reset it
 
   // Configurable keepalive heartbeat (issues 2609 / 2616).
@@ -51,6 +65,20 @@ export class TcpTransport extends EventEmitter implements ITransport {
   private heartbeatPayloadFactory: (() => Uint8Array | Promise<Uint8Array>) | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
 
+  // The in-flight connect timeout, hoisted out of doConnect()'s closure.
+  //
+  // It used to be a bare local, which meant nothing outside that closure could
+  // cancel it. Every path that reclaims a socket calls removeAllListeners()
+  // first, so the 'connect'/'error'/'close' handlers that clear the timer are
+  // gone by the time the socket dies — leaving a live timer whose callback
+  // reads `this.socket`, i.e. whatever socket is current when it eventually
+  // fires. On a transport that connects again, that is a healthy, connected
+  // socket being destroyed by a stale timer, with no warning logged and an
+  // auto-reconnect scheduled right after: exactly the silent client-initiated
+  // FIN reported in #5122. Tracking it on the instance lets every teardown
+  // path cancel it.
+  private connectTimeout: NodeJS.Timeout | null = null;
+
   // Configurable TCP timing
   private connectTimeoutMs: number = 10000; // 10 second default
   private reconnectInitialDelayMs: number = 1000; // 1 second default
@@ -65,6 +93,31 @@ export class TcpTransport extends EventEmitter implements ITransport {
   // without changing steady-state backoff once the session stabilizes.
   private startupGraceUntil: number = 0;
   private startupGraceFastDelayMs: number = 0;
+
+  /**
+   * Fast-retry ramp after the link drops mid-config-sync (#5122).
+   *
+   * The reporter's packet captures show a node that goes silent for ~10s
+   * partway through a ~190-node NodeDB dump, flushes a backlog, then closes
+   * its own side. The retry then completes the full sync in about 2 seconds —
+   * so the recovery is cheap, and it was the 60s reconnect delay, not the
+   * failure itself, that made the mesh feel unusable.
+   *
+   * Retrying fast forever would be the wrong answer though: every reconnect
+   * makes the node re-dump its entire NodeDB, which is the very work that is
+   * stalling. So this ramps. One quick attempt catches the common case; if
+   * that also dies mid-sync, back off rather than hammer a node that has
+   * already told us twice it cannot finish.
+   *
+   * Only a *mid-sync* loss arms this. A node that is simply unreachable never
+   * starts a sync, so it keeps the ordinary backoff instead of collecting a
+   * SYN every three seconds.
+   */
+  private static readonly SYNC_LOSS_RETRY_LADDER_MS = [3_000, 10_000, 30_000];
+  /** How many rungs of the ladder this transport has spent. Reset on a sync that completes. */
+  private syncLossRetryStep = 0;
+  /** Set by `noteConfigSyncLoss()`, consumed by the next `scheduleReconnect()`. */
+  private syncLossRetryPending = false;
 
   // Protocol constants
   private readonly START1 = 0x94;
@@ -83,6 +136,45 @@ export class TcpTransport extends EventEmitter implements ITransport {
     }
 
     logger.debug(`⏱️  Stale connection timeout set to ${timeoutMs}ms (${Math.floor(timeoutMs / 1000 / 60)} minute(s))`);
+  }
+
+  /**
+   * Mark the initial config sync as running or finished (#5122).
+   *
+   * Re-arms the health check so the faster sync-phase cadence takes effect
+   * immediately rather than at the next minute boundary.
+   */
+  setConfigSyncActive(active: boolean): void {
+    if (this.configSyncActive === active) return;
+    this.configSyncActive = active;
+    logger.debug(`⏱️  Config-sync stall detection ${active ? 'armed' : 'disarmed'}`);
+    if (this.isConnected && this.healthCheckInterval) {
+      this.startHealthCheck();
+    }
+  }
+
+  /**
+   * The link dropped while the initial config sync was still running (#5122).
+   *
+   * Arms one rung of the fast-retry ramp for the reconnect that is about to be
+   * scheduled. Deliberately separate from `setConfigSyncActive(false)`, which
+   * fires on a *successful* sync too — only a loss should shorten the wait.
+   */
+  noteConfigSyncLoss(): void {
+    this.syncLossRetryPending = true;
+  }
+
+  /**
+   * A config sync ran to completion — spend the ladder back to the top (#5122).
+   *
+   * Without this, a source that recovers on the first fast retry and then hits
+   * an unrelated mid-sync loss hours later would start from whatever rung it
+   * left off on. The ladder is meant to measure consecutive failures, not
+   * lifetime ones.
+   */
+  resetConfigSyncLossRetries(): void {
+    this.syncLossRetryStep = 0;
+    this.syncLossRetryPending = false;
   }
 
   /**
@@ -178,6 +270,44 @@ export class TcpTransport extends EventEmitter implements ITransport {
     return this.doConnect();
   }
 
+  private clearConnectTimeout(): void {
+    if (this.connectTimeout) {
+      clearTimeout(this.connectTimeout);
+      this.connectTimeout = null;
+    }
+  }
+
+  /**
+   * Close the current socket and say who did it.
+   *
+   * Every teardown path has to strip the socket's listeners first, otherwise
+   * the 'close' handler treats a deliberate teardown as a lost link and
+   * schedules a reconnect. The side effect was that these paths closed the
+   * socket in complete silence — no log line, no event — which is why a report
+   * like #5122 (a client-initiated FIN with nothing in the application log)
+   * could not be attributed to any particular mechanism. Routing all of them
+   * through here means every FIN we send has a reason next to it.
+   */
+  private teardownSocket(reason: string): void {
+    this.clearConnectTimeout();
+    const socket = this.socket;
+    if (!socket) return;
+    this.socket = null;
+    // `wasConnected` separates "we hung up on a live link" (which a reader of
+    // the log will want to correlate with a FIN in a packet capture) from
+    // reclaiming a socket that never came up.
+    const wasConnected = this.isConnected;
+    try {
+      socket.removeAllListeners();
+      socket.destroy();
+    } catch { /* ignore */ }
+    if (wasConnected) {
+      logger.info(`🔌 Closing the live TCP connection to ${this.config?.host}:${this.config?.port} — ${reason}`);
+    } else {
+      logger.debug(`🔌 Discarded a TCP socket that was not connected — ${reason}`);
+    }
+  }
+
   private async doConnect(): Promise<void> {
     return new Promise((resolve, reject) => {
       if (!this.config) {
@@ -194,13 +324,7 @@ export class TcpTransport extends EventEmitter implements ITransport {
       // Reclaim any pre-existing socket before opening a new one. Without this
       // a single transport could leak two live sockets at the daemon — the
       // 2:1 "Force close previous TCP connection" fingerprint from #3270.
-      if (this.socket) {
-        try {
-          this.socket.removeAllListeners();
-          this.socket.destroy();
-        } catch { /* ignore */ }
-        this.socket = null;
-      }
+      this.teardownSocket('reclaimed before a new connect attempt');
 
       this.isConnecting = true;
       logger.debug(`📡 Connecting to TCP ${this.config.host}:${this.config.port}...`);
@@ -211,16 +335,31 @@ export class TcpTransport extends EventEmitter implements ITransport {
       this.socket.setKeepAlive(true, 300000); // Keep alive every 5 minutes (app-layer health check handles dead connections)
       this.socket.setNoDelay(true); // Disable Nagle's algorithm for low latency
 
-      // Connection timeout
-      const connectTimeout = setTimeout(() => {
-        if (this.socket) {
-          this.socket.destroy();
-          reject(new Error('Connection timeout'));
+      // Connection timeout. Bound to THIS attempt's socket, not to whatever
+      // `this.socket` happens to be when it fires — a stale timer must never
+      // be able to destroy a later, healthy connection (#5122). It is also
+      // cancelled by every teardown path, so it cannot outlive its socket.
+      const attemptSocket = this.socket;
+      this.clearConnectTimeout();
+      this.connectTimeout = setTimeout(() => {
+        this.connectTimeout = null;
+        if (this.socket !== attemptSocket) {
+          // The attempt this timer belongs to is long gone. Firing here would
+          // tear down an unrelated socket.
+          logger.debug('⏱️  Ignoring a connect timeout from a superseded attempt');
+          return;
         }
+        if (!this.isConnecting) {
+          // Already connected (or already torn down) — nothing to time out.
+          return;
+        }
+        logger.warn(`⏱️  TCP connect to ${this.config?.host}:${this.config?.port} timed out after ${this.connectTimeoutMs}ms — destroying the socket`);
+        attemptSocket.destroy();
+        reject(new Error('Connection timeout'));
       }, this.connectTimeoutMs);
 
       this.socket.once('connect', () => {
-        clearTimeout(connectTimeout);
+        this.clearConnectTimeout();
         this.isConnecting = false;
         this.isConnected = true;
         this.reconnectAttempts = 0;
@@ -248,7 +387,7 @@ export class TcpTransport extends EventEmitter implements ITransport {
       });
 
       this.socket.on('error', (error: Error) => {
-        clearTimeout(connectTimeout);
+        this.clearConnectTimeout();
         logger.error('❌ TCP socket error:', error.message);
         this.emit('error', error);
 
@@ -258,7 +397,7 @@ export class TcpTransport extends EventEmitter implements ITransport {
       });
 
       this.socket.on('close', () => {
-        clearTimeout(connectTimeout);
+        this.clearConnectTimeout();
         this.isConnecting = false;
         const wasConnected = this.isConnected;
         this.isConnected = false;
@@ -299,11 +438,34 @@ export class TcpTransport extends EventEmitter implements ITransport {
     // window, use the fast delay regardless of attempt count. Outside the
     // window, fall back to exponential backoff.
     const inGrace = this.startupGraceUntil > 0 && Date.now() < this.startupGraceUntil;
-    const delay = inGrace
-      ? this.startupGraceFastDelayMs
-      : Math.min(Math.pow(2, this.reconnectAttempts - 1) * this.reconnectInitialDelayMs, this.reconnectMaxDelayMs);
 
-    logger.debug(`🔄 Reconnecting in ${delay / 1000}s (attempt ${this.reconnectAttempts}${inGrace ? ', startup-grace' : ''})...`);
+    // A mid-sync loss (#5122) is the most specific signal we have about WHY the
+    // link went down, so its ramp wins over the startup grace window when both
+    // apply. The grace window stays in charge of every other early disconnect.
+    const ladder = TcpTransport.SYNC_LOSS_RETRY_LADDER_MS;
+    const useSyncLossLadder = this.syncLossRetryPending && this.syncLossRetryStep < ladder.length;
+    // Consume the flag either way: it describes the disconnect that just
+    // happened, not a standing preference, so it must not leak into the next one.
+    this.syncLossRetryPending = false;
+
+    let delay: number;
+    let label: string;
+    if (useSyncLossLadder) {
+      delay = ladder[this.syncLossRetryStep];
+      this.syncLossRetryStep++;
+      label = `, sync-loss retry ${this.syncLossRetryStep}/${ladder.length}`;
+    } else if (inGrace) {
+      delay = this.startupGraceFastDelayMs;
+      label = ', startup-grace';
+    } else {
+      delay = Math.min(
+        Math.pow(2, this.reconnectAttempts - 1) * this.reconnectInitialDelayMs,
+        this.reconnectMaxDelayMs,
+      );
+      label = '';
+    }
+
+    logger.debug(`🔄 Reconnecting in ${delay / 1000}s (attempt ${this.reconnectAttempts}${label})...`);
 
     this.reconnectTimeout = setTimeout(() => {
       this.doConnect().catch((error) => {
@@ -328,11 +490,7 @@ export class TcpTransport extends EventEmitter implements ITransport {
     // Stop keepalive heartbeat
     this.stopHeartbeat();
 
-    if (this.socket) {
-      this.socket.removeAllListeners();
-      this.socket.destroy();
-      this.socket = null;
-    }
+    this.teardownSocket('transport.disconnect() was called');
 
     this.isConnected = false;
     this.isConnecting = false;
@@ -536,9 +694,14 @@ export class TcpTransport extends EventEmitter implements ITransport {
 
     // When heartbeat is active, check at half the heartbeat interval so we
     // detect a missed reply within ~1.5 heartbeat intervals.
-    const checkInterval = this.heartbeatIntervalMs > 0
+    const baseInterval = this.heartbeatIntervalMs > 0
       ? Math.max(5000, Math.floor(this.heartbeatIntervalMs / 2))
       : this.HEALTH_CHECK_INTERVAL_MS;
+    // A 60s stall budget polled once a minute would take up to two minutes to
+    // notice. Poll faster while syncing so detection lands close to the budget.
+    const checkInterval = this.configSyncActive
+      ? Math.min(baseInterval, this.CONFIG_SYNC_CHECK_INTERVAL_MS)
+      : baseInterval;
 
     this.healthCheckInterval = setInterval(() => {
       this.checkConnection();
@@ -640,6 +803,23 @@ export class TcpTransport extends EventEmitter implements ITransport {
 
     const now = Date.now();
     const timeSinceLastData = now - this.lastDataReceived;
+
+    // Sync-phase stall (#5122). Checked BEFORE the general idle test because its
+    // budget is much tighter — 60s versus the 5-minute default — and because a
+    // stalled sync is a distinct failure: the link is open and healthy-looking,
+    // the peer has simply stopped talking part-way through the NodeDB stream and
+    // will never resume. Reconnecting is the only way out.
+    if (this.configSyncActive && timeSinceLastData > this.CONFIG_SYNC_STALL_MS) {
+      logger.warn(
+        `⚠️  Config sync stalled: no data received for ${Math.floor(timeSinceLastData / 1000)}s ` +
+        `while the initial sync was still running (budget: ${this.CONFIG_SYNC_STALL_MS / 1000}s). Forcing reconnection...`,
+      );
+      this.emit('stale-connection', { timeSinceLastData, timeout: this.CONFIG_SYNC_STALL_MS, phase: 'config-sync' });
+      if (this.socket) {
+        this.socket.destroy();
+      }
+      return;
+    }
 
     if (timeSinceLastData > effectiveTimeoutMs) {
       const secondsSinceLastData = Math.floor(timeSinceLastData / 1000);

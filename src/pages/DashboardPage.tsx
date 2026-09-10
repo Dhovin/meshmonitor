@@ -13,6 +13,7 @@ import { useTranslation } from 'react-i18next';
 import { SettingsProvider, useSettings } from '../contexts/SettingsContext';
 import { useAuth } from '../contexts/AuthContext';
 import { MapProvider, useMapContext } from '../contexts/MapContext';
+import { useUnreadBySource } from '../hooks/useUnreadBySource';
 import {
   useDashboardSources,
   useSourceStatuses,
@@ -51,6 +52,7 @@ import { ToastProvider } from '../components/ToastContainer';
 import api, { ApiError } from '../services/api';
 import { logger } from '../utils/logger';
 import { appBasename } from '../init';
+import { MESHCORE_DEFAULT_TCP_PORT } from '../constants';
 import { getReservedLandingPath, isReservedLandingValue } from '../utils/defaultLandingPage';
 import '../styles/dashboard.css';
 import { UiIcon } from '../components/icons';
@@ -188,7 +190,11 @@ function DashboardInner() {
   const [formMcTransport, setFormMcTransport] = useState<'usb' | 'tcp'>('usb');
   const [formMcSerialPort, setFormMcSerialPort] = useState('');
   const [formMcTcpHost, setFormMcTcpHost] = useState('');
-  const [formMcTcpPort, setFormMcTcpPort] = useState('4403');
+  // MeshCore WiFi/Ethernet companion firmware opens its TCP server on 5000
+  // (#5160). 4403 is Meshtastic's port, and also what MeshCore's less common
+  // "native TCP" companion builds use — but the WiFi/Ethernet build is what
+  // people actually add here, so it gets the default.
+  const [formMcTcpPort, setFormMcTcpPort] = useState(MESHCORE_DEFAULT_TCP_PORT);
   const [formMcDeviceType, setFormMcDeviceType] = useState<'companion' | 'repeater'>('companion');
   // MQTT broker (mqtt_broker) form state.
   const [formMqttListenPort, setFormMqttListenPort] = useState('1883');
@@ -306,7 +312,16 @@ function DashboardInner() {
   // toggle is on (DashboardInner sits inside MapProvider, so we can read it
   // here to gate the request). Unified pulls every source; single-source pulls
   // just the selected one. Non-MeshCore sources simply return no edges.
-  const { showNeighborInfo } = useMapContext();
+  const { showNeighborInfo, unreadIndicatorEnabled, setUnreadIndicatorEnabled } = useMapContext();
+  // #5124. `enabled: false` means the query never runs, so switching the badge
+  // off stops the polling too rather than merely hiding the answer.
+  const { data: unreadBySourceData } = useUnreadBySource({
+    // The app can be served under a base path (BASE_URL=/meshmonitor in the
+    // dev container), so the bare `/api/...` default would 404. Same
+    // `appBasename` every other query hook is handed.
+    baseUrl: appBasename,
+    enabled: isAuthenticated && unreadIndicatorEnabled,
+  });
   const neighborSourceIds = isUnifiedSelected
     ? sourceIds
     : (selectedSourceId && selectedSourceId !== UNIFIED_SOURCE_ID ? [selectedSourceId] : []);
@@ -403,7 +418,7 @@ function DashboardInner() {
     setFormMcTransport('usb');
     setFormMcSerialPort('');
     setFormMcTcpHost('');
-    setFormMcTcpPort('4403');
+    setFormMcTcpPort(MESHCORE_DEFAULT_TCP_PORT);
     setFormMcDeviceType('companion');
     setFormMqttListenPort('1883');
     setFormMqttUsername('');
@@ -567,7 +582,7 @@ function DashboardInner() {
     setFormMcTransport(mcTransport);
     setFormMcSerialPort(cfg?.serialPort ?? cfg?.port ?? '');
     setFormMcTcpHost(cfg?.tcpHost ?? '');
-    setFormMcTcpPort(cfg?.tcpPort != null ? String(cfg.tcpPort) : '4403');
+    setFormMcTcpPort(cfg?.tcpPort != null ? String(cfg.tcpPort) : MESHCORE_DEFAULT_TCP_PORT);
     setFormMcDeviceType(cfg?.deviceType === 'repeater' ? 'repeater' : 'companion');
     const link = cfg?.mqttLink as { enabled?: boolean; mqttBrokerSourceId?: string } | undefined;
     setFormMtMqttLinkBrokerId(link?.enabled && link.mqttBrokerSourceId ? link.mqttBrokerSourceId : '');
@@ -1262,6 +1277,9 @@ function DashboardInner() {
           onPruneOutsideRoi={onPruneOutsideRoi}
           onResyncSource={onResyncSource}
           connectingIds={connectingIds}
+          unreadBySource={unreadIndicatorEnabled ? unreadBySourceData?.sources : undefined}
+          unreadIndicatorEnabled={unreadIndicatorEnabled}
+          onToggleUnreadIndicator={setUnreadIndicatorEnabled}
           mobileOpen={mobileSidebarOpen}
           onMobileClose={() => setMobileSidebarOpen(false)}
           onNewsClick={() => {
@@ -1734,7 +1752,7 @@ function DashboardInner() {
                         type="number"
                         value={formMcTcpPort}
                         onChange={(e) => setFormMcTcpPort(e.target.value)}
-                        placeholder="4403"
+                        placeholder={MESHCORE_DEFAULT_TCP_PORT}
                       />
                     </label>
                   </>
@@ -2028,6 +2046,7 @@ function DashboardInner() {
                 <label className="dashboard-form-field">
                   <span className="dashboard-form-label">{t('source.form.mc_mqtt_broker_url', 'Broker URL')}</span>
                   <input
+                    className="dashboard-form-input"
                     type="text"
                     value={formMcMqttBrokerUrl}
                     onChange={(e) => setFormMcMqttBrokerUrl(e.target.value)}
@@ -2041,6 +2060,7 @@ function DashboardInner() {
                 <label className="dashboard-form-field">
                   <span className="dashboard-form-label">{t('source.form.mc_mqtt_region', 'Region (IATA)')}</span>
                   <input
+                    className="dashboard-form-input"
                     type="text"
                     value={formMcMqttRegion}
                     onChange={(e) => setFormMcMqttRegion(e.target.value)}
@@ -2054,6 +2074,7 @@ function DashboardInner() {
                 <label className="dashboard-form-field">
                   <span className="dashboard-form-label">{t('source.form.mc_mqtt_username', 'Username (optional)')}</span>
                   <input
+                    className="dashboard-form-input"
                     type="text"
                     value={formMcMqttUsername}
                     onChange={(e) => setFormMcMqttUsername(e.target.value)}
@@ -2064,6 +2085,7 @@ function DashboardInner() {
                 <label className="dashboard-form-field">
                   <span className="dashboard-form-label">{t('source.form.mc_mqtt_password', 'Password (optional)')}</span>
                   <input
+                    className="dashboard-form-input"
                     type="password"
                     value={formMcMqttPassword}
                     onChange={(e) => setFormMcMqttPassword(e.target.value)}

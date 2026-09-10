@@ -178,6 +178,9 @@ import {
   runMigration158Mysql,
 } from '../server/migrations/158_meshcore_packet_log_observer.js';
 import { migration as nodeIdentityMergesMigration, runMigration159Postgres, runMigration159Mysql } from '../server/migrations/159_node_identity_merges.js';
+import { migration as tracerouteTransportMechanismMigration, runMigration160Postgres, runMigration160Mysql } from '../server/migrations/160_traceroute_transport_mechanism.js';
+import { migration as userPrefsUnreadIndicatorMigration, runMigration161Postgres, runMigration161Mysql } from '../server/migrations/161_user_map_preferences_unread_indicator.js';
+import { migration as privacyDocumentsMigration, runMigration162Postgres, runMigration162Mysql } from '../server/migrations/162_privacy_documents.js';
 
 // ============================================================================
 // Registry
@@ -2573,4 +2576,56 @@ registry.register({
   sqlite: (db) => nodeIdentityMergesMigration.up(db),
   postgres: (client) => runMigration159Postgres(client),
   mysql: (pool) => runMigration159Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 160: `traceroutes.transportMechanism` (#5097) — which transport
+// carried the traceroute, so the map's Show RF / UDP / MQTT toggles can filter
+// route segments the way they already filter markers and neighbor links. NULL
+// on legacy rows (the transport was never recorded and cannot be recovered);
+// readers fall back to 'rf' so historical traceroutes stay visible.
+// Idempotent across SQLite / PostgreSQL / MySQL.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 160,
+  name: 'traceroute_transport_mechanism',
+  settingsKey: 'migration_160_traceroute_transport_mechanism',
+  sqlite: (db) => tracerouteTransportMechanismMigration.up(db),
+  postgres: (client) => runMigration160Postgres(client),
+  mysql: (pool) => runMigration160Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 161: `user_map_preferences.unread_indicator_enabled` (#5124) — per-user
+// switch for the Sources list's unread-DM badge. Defaults TRUE (the badge is
+// the feature); NULL on pre-migration rows reads as enabled.
+// Idempotent across SQLite / PostgreSQL / MySQL.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 161,
+  name: 'user_map_preferences_unread_indicator',
+  settingsKey: 'migration_161_user_map_preferences_unread_indicator',
+  sqlite: (db) => userPrefsUnreadIndicatorMigration.up(db),
+  postgres: (client) => runMigration161Postgres(client),
+  mysql: (pool) => runMigration161Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 162: `privacy_documents` (#5156) — the operator's hosted privacy
+// policy / terms / contact pages for a publicly-reachable instance. GLOBAL (no
+// sourceId): the document describes the deployment serving the dashboard, not
+// any one mesh source. `content` is Markdown source, never HTML, because the
+// page is served to anonymous visitors and tokenless embed viewers.
+// Idempotent across SQLite / PostgreSQL / MySQL.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 162,
+  name: 'privacy_documents',
+  settingsKey: 'migration_162_privacy_documents',
+  sqlite: (db) => privacyDocumentsMigration.up(db),
+  postgres: (client) => runMigration162Postgres(client),
+  mysql: (pool) => runMigration162Mysql(pool),
 });
