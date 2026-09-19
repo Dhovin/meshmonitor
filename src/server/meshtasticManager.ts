@@ -1,4 +1,5 @@
 import databaseService, { type DbMessage } from '../services/database.js';
+import { moduleAvailabilityFromMask, readExcludedModules, type ExcludedModuleKey } from '../utils/excludedModules.js';
 import { buildContactRow, buildContactRowV2 } from './services/atakContactService.js';
 import meshtasticProtobufService, { formatTakPreview, formatTakV2Preview } from './meshtasticProtobufService.js';
 import { takV2Variant } from './takV2Decoder.js';
@@ -10,6 +11,20 @@ import type { ITransport } from './transports/transport.js';
 import type { ISourceManager, SourceStatus } from './sourceManagerRegistry.js';
 import { sourceManagerRegistry } from './sourceManagerRegistry.js';
 import { calculateDistance } from '../utils/distance.js';
+
+/**
+ * What the Config tab reads to decide which module sections it can offer.
+ * The `ExcludedModuleKey` half comes from the device's own
+ * `DeviceMetadata.excluded_modules` bitmask (#5065); the named flags are the
+ * older firmware-version gates.
+ */
+type SupportedModules = Record<ExcludedModuleKey, boolean> & {
+  statusmessage: boolean;
+  trafficManagement: boolean;
+  meshBeacon: boolean;
+  /** Legacy alias of `rangetest`, read by the Config tab since #5041. */
+  rangeTest: boolean;
+};
 import { shouldDiscardPosition } from '../utils/nullIsland.js';
 import { getDiscardInvalidPositions } from '../utils/positionIngestConfig.js';
 import { isPointInGeofence, distanceToGeofenceCenter } from '../utils/geometry.js';
@@ -49,6 +64,7 @@ import { MessageQueueService } from './messageQueueService.js';
 import { resolveAutoWelcomeDelaySeconds } from './autoWelcomeDelay.js';
 import { TxDisabledError } from './errors/txDisabledError.js';
 import { resolveAutoAckPreSendDelaySeconds } from './autoAckDelay.js';
+import { clampHopLimitOverride, parseHopLimitOverride } from '../utils/hopLimitOverride.js';
 import { normalizeTriggerPatterns, normalizeTriggerChannels } from '../utils/autoResponderUtils.js';
 import { matchAutoResponderPattern } from './utils/autoResponderMatcher.js';
 import { isWithinTimeWindow } from './utils/timeWindow.js';
@@ -1018,6 +1034,10 @@ class MeshtasticManager implements ISourceManager {
     // #3923: firmware 2.8 build capability — XEdDSA signature verification
     // compiled in. Distinguishes "cannot sign" from "did not sign this packet".
     hasXeddsa?: boolean;
+    // #5065: DeviceMetadata.excluded_modules — the bitmask of module configs
+    // this firmware build left out. Undefined until a device reports it, which
+    // means "nothing excluded"; see src/server/utils/excludedModules.ts.
+    excludedModules?: number;
     // #3684: User capability flags from the local node's NodeInfo, surfaced to the
     // frontend Config tab via getCurrentConfig().localNodeInfo.
     isUnmessagable?: boolean;
@@ -1285,9 +1305,25 @@ class MeshtasticManager implements ISourceManager {
     const packetId = p.envelope.packet?.id !== undefined ? (p.envelope.packet.id >>> 0) : null;
     // Skip the echo of our OWN device's just-forwarded publish.
     if (packetId !== null && matchesMqttEcho(this.mqttLinkEchoDeviceToBroker, p.topic, packetId)) return;
+    // The broker's `local-packet` payload is deliberately untransformed — our
+    // ingestion and uplink-bridge paths must see the wire bytes as they
+    // arrived. This is an egress to a radio, though, so the linked broker's
+    // hop-limit policy (#5188/#5190) applies here exactly as it does to a
+    // radio subscribed over MQTT. Without this the policy would silently do
+    // nothing on the mqttLink topology.
+    // `in` narrows the MqttBrokerManager | MqttBridgeManager union to the
+    // broker, so the call is fully type-checked — a signature change on
+    // transformForwardedPayload breaks this line rather than silently drifting.
+    // A standalone mqtt_bridge link target has no policy of its own and
+    // forwards unchanged.
+    const broker = this.mqttLinkBroker;
+    const transformed =
+      broker && 'transformForwardedPayload' in broker
+        ? broker.transformForwardedPayload(p.topic, p.payload)
+        : null;
     const bytes = meshtasticProtobufService.encodeToRadioMqttClientProxyMessage({
       topic: p.topic,
-      data: p.payload,
+      data: transformed ?? p.payload,
       retained: p.retained,
     });
     if (!bytes) return;
@@ -1414,12 +1450,13 @@ class MeshtasticManager implements ISourceManager {
       });
     }
     // Initialize message queue service with send callback
-    this.messageQueue.setSendCallback(async (text: string, destination: number, replyId?: number, channel?: number, emoji?: number) => {
+    this.messageQueue.setSendCallback(async (text: string, destination: number, replyId?: number, channel?: number, emoji?: number, hopLimitOverride?: number) => {
+      const sendOptions = hopLimitOverride !== undefined ? { hopLimitOverride } : undefined;
       // For channel messages: channel is specified, destination is 0 (undefined in sendTextMessage)
       // For DMs: channel is undefined, destination is the node number
       if (channel !== undefined) {
         // Channel message - send to channel, no specific destination
-        return await this.sendTextMessage(text, channel, undefined, replyId, emoji);
+        return await this.sendTextMessage(text, channel, undefined, replyId, emoji, undefined, undefined, sendOptions);
       } else {
         // DM - use the channel we last heard the target node on.
         // Source-scoped lookup — composite PK (nodeNum, sourceId) requires it
@@ -1427,7 +1464,7 @@ class MeshtasticManager implements ISourceManager {
         const targetNode = await databaseService.nodes.getNode(destination, this.sourceId);
         const dmChannel = (targetNode?.channel !== undefined && targetNode?.channel !== null) ? targetNode.channel : 0;
         logger.debug(`📨 Queue DM to ${destination} - Using channel: ${dmChannel}`);
-        return await this.sendTextMessage(text, dmChannel, destination, replyId, emoji);
+        return await this.sendTextMessage(text, dmChannel, destination, replyId, emoji, undefined, undefined, sendOptions);
       }
     });
 
@@ -5540,7 +5577,7 @@ class MeshtasticManager implements ISourceManager {
   /**
    * Get the current device configuration
    */
-  getCurrentConfig(): { deviceConfig: any; moduleConfig: any; localNodeInfo: any; supportedModules: { statusmessage: boolean; trafficManagement: boolean; meshBeacon: boolean; rangeTest: boolean } } {
+  getCurrentConfig(): { deviceConfig: any; moduleConfig: any; localNodeInfo: any; supportedModules: SupportedModules } {
     logger.debug(`[CONFIG] getCurrentConfig called - hopLimit=${this.actualDeviceConfig?.lora?.hopLimit}`);
 
     // Apply Proto3 defaults to device config if it exists
@@ -5777,11 +5814,17 @@ class MeshtasticManager implements ISourceManager {
       logger.debug(`[CONFIG] Returning TrafficManagement config with positionMinIntervalSecs=${trafficManagementConfigWithDefaults.positionMinIntervalSecs}`);
     }
 
+    const moduleAvailability = moduleAvailabilityFromMask(this.localNodeInfo?.excludedModules);
+
     return {
       deviceConfig,
       moduleConfig,
       localNodeInfo: this.localNodeInfo,
       supportedModules: {
+        // The device's own DeviceMetadata.excluded_modules bitmask (#5065).
+        // Every key is true unless this build positively excluded that module,
+        // so an older firmware that never reports the field changes nothing.
+        ...moduleAvailability,
         // Gate on firmware version, NOT on presence of the decoded config
         // sub-message. Proto3 omits an all-default sub-message, so a fully
         // supported module whose config is untouched (the common case) would
@@ -5789,6 +5832,10 @@ class MeshtasticManager implements ISourceManager {
         statusmessage: this.supportsStatusMessage(),
         trafficManagement: this.supportsTrafficManagement(),
         meshBeacon: this.supportsMeshBeacon(),
+        // Range Test has two reasons to be unavailable, and they get separate
+        // keys because the UI explains them differently: `rangetest` (from the
+        // bitmask spread above) means this build left the module out, while
+        // `rangeTest` means firmware 2.8 dropped the module outright (#5031).
         rangeTest: this.supportsRangeTest()
       }
     };
@@ -5832,6 +5879,13 @@ class MeshtasticManager implements ISourceManager {
     // Firmware 2.8 build capability, surfaced alongside the transport flags so
     // the local node reports it the same way a remote node does (#3923).
     localNodeInfo.hasXeddsa = metadata.hasXeddsa === true;
+    // #5065: which module configs this build excluded. Absent on firmware that
+    // predates the field, and left undefined then so every module stays shown.
+    const excludedModules = readExcludedModules(metadata);
+    localNodeInfo.excludedModules = excludedModules;
+    if (excludedModules !== undefined) {
+      logger.debug(`📱 Device reports excluded modules: 0x${excludedModules.toString(16)}`);
+    }
     if (this.isLocalNodeBridged()) {
       logger.debug('🌉 Connected node reports no native WiFi/Ethernet — treating as a bridged node (OTA firmware update disabled)');
     }
@@ -9926,7 +9980,7 @@ class MeshtasticManager implements ISourceManager {
     return null;
   }
 
-  async sendTextMessage(text: string, channel: number = 0, destination?: number, replyId?: number, emoji?: number, userId?: number, attribution?: { sourceIp?: string | null; sourcePath?: 'http_api' | 'tcp_radio' | 'mqtt_bridge' | 'system' | null }): Promise<number> {
+  async sendTextMessage(text: string, channel: number = 0, destination?: number, replyId?: number, emoji?: number, userId?: number, attribution?: { sourceIp?: string | null; sourcePath?: 'http_api' | 'tcp_radio' | 'mqtt_bridge' | 'system' | null }, options?: { hopLimitOverride?: number }): Promise<number> {
     if (!this.isConnected || !this.transport) {
       throw new Error('Not connected to Meshtastic node');
     }
@@ -9985,7 +10039,12 @@ class MeshtasticManager implements ISourceManager {
         }
       }
 
-      const { data: textMessageData, messageId } = meshtasticProtobufService.createTextMessage(text, destination, channel, replyId, emoji, pkiEncrypted);
+      // #5121: an automated send may pin its hop count. Capped at this node's
+      // own hop limit so an override can only shorten reach, never extend it.
+      const hopLimit = clampHopLimitOverride(options?.hopLimitOverride, this.getConfiguredHopLimit());
+      const zeroHop = hopLimit === 0;
+
+      const { data: textMessageData, messageId } = meshtasticProtobufService.createTextMessage(text, destination, channel, replyId, emoji, pkiEncrypted, hopLimit);
 
       // Remember our own packet id so that if this message is overheard
       // rebroadcast, echoed by MQTT, or replayed by store-and-forward, it isn't
@@ -10053,8 +10112,12 @@ class MeshtasticManager implements ISourceManager {
           replyId: replyId || undefined,
           emoji: emoji || undefined,
           requestId: messageId, // Save requestId for routing error matching
-          wantAck: true, // Request acknowledgment for this message
-          deliveryState: 'pending', // Initial delivery state
+          // A zero-hop send goes out without an ACK request (see
+          // createTextMessage), so no routing ACK will ever arrive to move it
+          // off 'pending'. It is 'delivered' — handed to the radio — the
+          // moment transport.send returns.
+          wantAck: !zeroHop,
+          deliveryState: zeroHop ? 'delivered' : 'pending',
           createdAt: Date.now(),
           // Default attribution to 'system' when not provided (e.g. internal
           // ping/welcome/etc. callers); HTTP route passes 'http_api' + req.ip.
@@ -10139,9 +10202,12 @@ class MeshtasticManager implements ISourceManager {
     }
 
     try {
-      const tracerouteData = meshtasticProtobufService.createTracerouteMessage(destination, channel);
+      // Use the node's own hop limit, like admin packets and the Meshtastic
+      // CLI, rather than a fixed 7 that out-reached everything else it sends.
+      const hopLimit = this.getConfiguredHopLimit();
+      const tracerouteData = meshtasticProtobufService.createTracerouteMessage(destination, channel, hopLimit);
 
-      logger.debug(`🔍 Traceroute packet created: ${tracerouteData.length} bytes for dest=${destination} (0x${destination.toString(16)}), channel=${channel}`);
+      logger.debug(`🔍 Traceroute packet created: ${tracerouteData.length} bytes for dest=${destination} (0x${destination.toString(16)}), channel=${channel}, hopLimit=${hopLimit}`);
 
       await this.transport.send(tracerouteData);
 
@@ -11056,6 +11122,12 @@ class MeshtasticManager implements ISourceManager {
       const preSendDelaySeconds = resolveAutoAckPreSendDelaySeconds(
         await settings.getSettingForSource(sourceId, 'autoAckPreSendDelaySeconds'),
       );
+      // Hop-limit override (#5121) for both the tapback and the reply below.
+      // Unset/'inherit' keeps the node's own hop limit.
+      const ackHopLimitOverride = parseHopLimitOverride(
+        await settings.getSettingForSource(sourceId, 'autoAckHopLimit'),
+      );
+
       const dispatchAck = (enqueue: () => void): void => {
         if (preSendDelaySeconds > 0) {
           setTimeout(enqueue, preSendDelaySeconds * 1000);
@@ -11092,7 +11164,8 @@ class MeshtasticManager implements ISourceManager {
           },
           isDirectMessage ? undefined : channelIndex, // channel
           1, // maxAttempts - tapbacks are best-effort, don't retry
-          1 // emoji flag = 1 for tapback/reaction
+          1, // emoji flag = 1 for tapback/reaction
+          ackHopLimitOverride,
         ));
       }
 
@@ -11142,7 +11215,10 @@ class MeshtasticManager implements ISourceManager {
           (reason: string) => {
             logger.warn(`❌ Auto-acknowledge message failed to ${replyTarget}: ${reason}`);
           },
-          replyChannel // channel: undefined for DM, channel number for channel
+          replyChannel, // channel: undefined for DM, channel number for channel
+          undefined, // maxAttempts: the queue's default (forced to 1 at hop 0)
+          undefined, // not a tapback
+          ackHopLimitOverride,
         ));
       }
 
@@ -14275,7 +14351,10 @@ class MeshtasticManager implements ISourceManager {
       // 1. Migrate messages for moved channels
       if (moves.length > 0) {
         try {
-          await databaseService.messages.migrateMessagesForChannelMoves(moves);
+          // Scoped to this source (#5183): channel slots are per source, and an
+          // unscoped migration rewrote every other source's messages in the
+          // same slots too.
+          await databaseService.messages.migrateMessagesForChannelMoves(moves, this.sourceId);
           logger.info(`📦 Message migration complete for ${moves.length} channel move(s)`);
         } catch (error) {
           logger.error('📦 Failed to migrate messages on startup:', error);
@@ -14285,7 +14364,7 @@ class MeshtasticManager implements ISourceManager {
       // 2. Migrate user permissions for moved channels
       if (moves.length > 0) {
         try {
-          await databaseService.auth.migratePermissionsForChannelMoves(moves);
+          await databaseService.auth.migratePermissionsForChannelMoves(moves, this.sourceId);
           logger.info(`🔑 Permission migration complete for ${moves.length} channel move(s)`);
         } catch (error) {
           logger.error('🔑 Failed to migrate permissions on startup:', error);
@@ -14955,12 +15034,19 @@ class MeshtasticManager implements ISourceManager {
 export { MeshtasticManager };
 
 /**
- * Eager fallback instance. Used ONLY when no meshtastic_tcp source is registered
- * in the sourceManagerRegistry (S4: env-IP-only fallback connect, or early module
- * access before bootstrapSources runs). Never added to the registry itself.
+ * Eager fallback instance. It exists so that
+ * `getPrimaryMeshtasticManager(sourceManagerRegistry) ?? fallbackManager`
+ * always yields a concrete manager — never undefined — when no meshtastic_tcp
+ * source is registered, or during early module access before bootstrapSources
+ * has run. Never added to the registry itself.
  *
- * Exported so server.ts can pass the concrete instance as `deps.fallbackManager`
- * to bootstrapSources for the S4 env-IP fallback connect path.
+ * #5237: it is NEVER CONNECTED at startup. It used to be handed to
+ * bootstrapSources as `deps.fallbackManager` and connected against
+ * MESHTASTIC_NODE_IP whenever no tcp source auto-connected (the "S4" path);
+ * on installs that never set that env var it dialled the placeholder
+ * 192.168.1.100 forever. That path is gone — this instance is now purely a
+ * null-object, and only a real source row produces a connection.
+ *
  * WP3: no longer registered as the primary; all tcp sources use makeMeshtastic().
  */
 export const fallbackManager = new MeshtasticManager();

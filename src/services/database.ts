@@ -49,6 +49,7 @@ import {
   SourcesRepository,
   AnalysisRepository,
   WaypointsRepository,
+  WaypointNotificationsRepository,
   MeshCoreRepository,
   MqttPacketLogRepository,
   MqttOkToMqttViolationsRepository,
@@ -70,6 +71,7 @@ import {
   AutomationHomeAnchorsRepository,
   SavedRegionsRepository,
   PrivacyDocumentsRepository,
+  SolarNodeOverridesRepository,
   SolarEstimatesRepository,
   NewsCacheRepository,
   BackupHistoryRepository,
@@ -100,7 +102,7 @@ import type { ConversationReadStateMap } from '../db/repositories/index.js';
 import type { ConversationKind } from '../db/schema/conversationReadState.js';
 import type { DatabaseType, DbPacketLog as DbTypesPacketLog, DbPacketCountByNode, DbPacketCountByPortnum, DbDistinctRelayNode } from '../db/types.js';
 import { updateNodeMobility } from '../server/services/nodeMobilityService.js';
-import { selectNodeNeedingTraceroute } from '../server/services/autoTracerouteSelectionService.js';
+import { selectNodeNeedingTraceroute, parseTracerouteFilterMode, type TracerouteFilterMode } from '../server/services/autoTracerouteSelectionService.js';
 import { NodeCacheService } from '../server/services/nodeCacheService.js';
 
 // Configuration constants for traceroute history
@@ -546,6 +548,7 @@ class DatabaseService {
   public sourcesRepo: SourcesRepository | null = null;
   public analysisRepo: AnalysisRepository | null = null;
   public waypointsRepo: WaypointsRepository | null = null;
+  public waypointNotificationsRepo: WaypointNotificationsRepository | null = null;
   public meshcoreRepo: MeshCoreRepository | null = null;
   public mqttPacketLogRepo: MqttPacketLogRepository | null = null;
   public mqttOkToMqttViolationsRepo: MqttOkToMqttViolationsRepository | null = null;
@@ -567,6 +570,7 @@ class DatabaseService {
   public automationHomeAnchorsRepo: AutomationHomeAnchorsRepository | null = null;
   public savedRegionsRepo: SavedRegionsRepository | null = null;
   public privacyDocumentsRepo: PrivacyDocumentsRepository | null = null;
+  public solarNodeOverridesRepo: SolarNodeOverridesRepository | null = null;
   public solarEstimatesRepo: SolarEstimatesRepository | null = null;
   public newsCacheRepo: NewsCacheRepository | null = null;
   public backupHistoryRepo: BackupHistoryRepository | null = null;
@@ -681,6 +685,12 @@ class DatabaseService {
     return this.privacyDocumentsRepo;
   }
 
+  /** Manual solar classification per physical node (#3195). Global — not source-scoped. */
+  get solarNodeOverrides(): SolarNodeOverridesRepository {
+    if (!this.solarNodeOverridesRepo) throw new Error('Database not initialized');
+    return this.solarNodeOverridesRepo;
+  }
+
   get solarEstimates(): SolarEstimatesRepository {
     if (!this.solarEstimatesRepo) throw new Error('Database not initialized');
     return this.solarEstimatesRepo;
@@ -779,6 +789,11 @@ class DatabaseService {
   get waypoints(): WaypointsRepository {
     if (!this.waypointsRepo) throw new Error('Database not initialized');
     return this.waypointsRepo;
+  }
+
+  get waypointNotifications(): WaypointNotificationsRepository {
+    if (!this.waypointNotificationsRepo) throw new Error('Database not initialized');
+    return this.waypointNotificationsRepo;
   }
 
   get meshcore(): MeshCoreRepository {
@@ -1056,6 +1071,7 @@ class DatabaseService {
       this.sourcesRepo = new SourcesRepository(drizzleDb, this.drizzleDbType);
       this.analysisRepo = new AnalysisRepository(drizzleDb as any, this.drizzleDbType);
       this.waypointsRepo = new WaypointsRepository(drizzleDb, this.drizzleDbType);
+      this.waypointNotificationsRepo = new WaypointNotificationsRepository(drizzleDb, this.drizzleDbType);
       this.meshcoreRepo = new MeshCoreRepository(drizzleDb, this.drizzleDbType);
       this.mqttPacketLogRepo = new MqttPacketLogRepository(drizzleDb, this.drizzleDbType);
       this.mqttOkToMqttViolationsRepo = new MqttOkToMqttViolationsRepository(drizzleDb, this.drizzleDbType);
@@ -1077,6 +1093,7 @@ class DatabaseService {
       this.automationHomeAnchorsRepo = new AutomationHomeAnchorsRepository(drizzleDb, this.drizzleDbType);
       this.savedRegionsRepo = new SavedRegionsRepository(drizzleDb, this.drizzleDbType);
       this.privacyDocumentsRepo = new PrivacyDocumentsRepository(drizzleDb, this.drizzleDbType);
+      this.solarNodeOverridesRepo = new SolarNodeOverridesRepository(drizzleDb, this.drizzleDbType);
       this.solarEstimatesRepo = new SolarEstimatesRepository(drizzleDb, this.drizzleDbType);
       this.newsCacheRepo = new NewsCacheRepository(drizzleDb, this.drizzleDbType);
       this.backupHistoryRepo = new BackupHistoryRepository(drizzleDb, this.drizzleDbType);
@@ -2848,6 +2865,11 @@ class DatabaseService {
     filterRolesEnabled: boolean;
     filterHwModelsEnabled: boolean;
     filterRegexEnabled: boolean;
+    filterNodesMode: TracerouteFilterMode;
+    filterChannelsMode: TracerouteFilterMode;
+    filterRolesMode: TracerouteFilterMode;
+    filterHwModelsMode: TracerouteFilterMode;
+    filterRegexMode: TracerouteFilterMode;
     expirationHours: number;
     sortByHops: boolean;
     filterLastHeardEnabled: boolean;
@@ -2862,6 +2884,7 @@ class DatabaseService {
     const [
       enabledStr, channelsStr, rolesStr, hwModelsStr, regexStr,
       nodesEnStr, channelsEnStr, rolesEnStr, hwModelsEnStr, regexEnStr,
+      nodesModeStr, channelsModeStr, rolesModeStr, hwModelsModeStr, regexModeStr,
       expirationStr, sortByHopsStr,
       lastHeardEnStr, lastHeardHoursStr,
       hopsEnStr, hopsMinStr, hopsMaxStr,
@@ -2876,6 +2899,11 @@ class DatabaseService {
       read('tracerouteFilterRolesEnabled'),
       read('tracerouteFilterHwModelsEnabled'),
       read('tracerouteFilterRegexEnabled'),
+      read('tracerouteFilterNodesMode'),
+      read('tracerouteFilterChannelsMode'),
+      read('tracerouteFilterRolesMode'),
+      read('tracerouteFilterHwModelsMode'),
+      read('tracerouteFilterRegexMode'),
       read('tracerouteExpirationHours'),
       read('tracerouteSortByHops'),
       read('tracerouteFilterLastHeardEnabled'),
@@ -2908,6 +2936,11 @@ class DatabaseService {
       filterRolesEnabled: rolesEnStr !== 'false',
       filterHwModelsEnabled: hwModelsEnStr !== 'false',
       filterRegexEnabled: regexEnStr !== 'false',
+      filterNodesMode: parseTracerouteFilterMode(nodesModeStr),
+      filterChannelsMode: parseTracerouteFilterMode(channelsModeStr),
+      filterRolesMode: parseTracerouteFilterMode(rolesModeStr),
+      filterHwModelsMode: parseTracerouteFilterMode(hwModelsModeStr),
+      filterRegexMode: parseTracerouteFilterMode(regexModeStr),
       expirationHours: parseIntBounded(expirationStr, 24, 0, 168),
       sortByHops: sortByHopsStr === 'true',
       filterLastHeardEnabled: lastHeardEnStr === 'true',
@@ -2930,6 +2963,11 @@ class DatabaseService {
     filterRolesEnabled?: boolean;
     filterHwModelsEnabled?: boolean;
     filterRegexEnabled?: boolean;
+    filterNodesMode?: TracerouteFilterMode;
+    filterChannelsMode?: TracerouteFilterMode;
+    filterRolesMode?: TracerouteFilterMode;
+    filterHwModelsMode?: TracerouteFilterMode;
+    filterRegexMode?: TracerouteFilterMode;
     expirationHours?: number;
     sortByHops?: boolean;
     filterLastHeardEnabled?: boolean;
@@ -2954,6 +2992,13 @@ class DatabaseService {
       if (settings.filterRolesEnabled !== undefined) kv.tracerouteFilterRolesEnabled = settings.filterRolesEnabled ? 'true' : 'false';
       if (settings.filterHwModelsEnabled !== undefined) kv.tracerouteFilterHwModelsEnabled = settings.filterHwModelsEnabled ? 'true' : 'false';
       if (settings.filterRegexEnabled !== undefined) kv.tracerouteFilterRegexEnabled = settings.filterRegexEnabled ? 'true' : 'false';
+      // Modes are normalized on write as well as on read, so an unexpected
+      // value cannot be persisted and then read back as a silent 'or'.
+      if (settings.filterNodesMode !== undefined) kv.tracerouteFilterNodesMode = parseTracerouteFilterMode(settings.filterNodesMode);
+      if (settings.filterChannelsMode !== undefined) kv.tracerouteFilterChannelsMode = parseTracerouteFilterMode(settings.filterChannelsMode);
+      if (settings.filterRolesMode !== undefined) kv.tracerouteFilterRolesMode = parseTracerouteFilterMode(settings.filterRolesMode);
+      if (settings.filterHwModelsMode !== undefined) kv.tracerouteFilterHwModelsMode = parseTracerouteFilterMode(settings.filterHwModelsMode);
+      if (settings.filterRegexMode !== undefined) kv.tracerouteFilterRegexMode = parseTracerouteFilterMode(settings.filterRegexMode);
       if (settings.expirationHours !== undefined) kv.tracerouteExpirationHours = String(settings.expirationHours);
       if (settings.sortByHops !== undefined) kv.tracerouteSortByHops = settings.sortByHops ? 'true' : 'false';
       if (settings.filterLastHeardEnabled !== undefined) kv.tracerouteFilterLastHeardEnabled = settings.filterLastHeardEnabled ? 'true' : 'false';
@@ -2987,6 +3032,22 @@ class DatabaseService {
     }
     if (settings.filterRegexEnabled !== undefined) {
       this.setTracerouteFilterRegexEnabled(settings.filterRegexEnabled);
+    }
+    // Global (legacy, source-less) path. Written through the generic setter
+    // rather than five near-identical named ones — these carry no logic beyond
+    // the normalization already applied above.
+    const modeKeys: Array<[keyof typeof settings, string]> = [
+      ['filterNodesMode', 'tracerouteFilterNodesMode'],
+      ['filterChannelsMode', 'tracerouteFilterChannelsMode'],
+      ['filterRolesMode', 'tracerouteFilterRolesMode'],
+      ['filterHwModelsMode', 'tracerouteFilterHwModelsMode'],
+      ['filterRegexMode', 'tracerouteFilterRegexMode'],
+    ];
+    for (const [field, key] of modeKeys) {
+      const value = settings[field];
+      if (value !== undefined) {
+        this.setSetting(key, parseTracerouteFilterMode(value as string));
+      }
     }
     if (settings.expirationHours !== undefined) {
       this.setTracerouteExpirationHours(settings.expirationHours);
@@ -5301,6 +5362,7 @@ class DatabaseService {
     mapMaxAgeHours?: number | null;
     positionHistoryPointsOnly?: boolean;
       unreadIndicatorEnabled?: boolean;
+      spreadNodes?: boolean;
   }): Promise<void> {
     return this.mapPreferences!.saveMapPreferences(userId, preferences);
   }

@@ -2,6 +2,14 @@
   padding: 20px;
   max-width: 1400px;
   margin: 0 auto;
+  /*
+   * #5194: a grid/flex child defaults to `min-width: auto`, which floors it at
+   * its content's min-content width. That is how one over-wide table used to
+   * push this whole page — sticky nav included — past the viewport. Zeroing the
+   * floor keeps any future wide child's overflow inside its own scroll area
+   * instead of turning the document root into the scroller.
+   */
+  min-width: 0;
 }
 
 .security-header {
@@ -227,12 +235,42 @@
 }
 
 .node-info {
+  /* A flex ITEM of `.issue-header` (which is `display: flex`) — this grow
+     factor is live and load-bearing, independent of the `display: block` the
+     rule below sets for the element's own children. */
   flex: 1;
 }
 
 .node-name {
   font-size: 16px;
   margin-bottom: 5px;
+}
+
+/*
+ * Layout guard, deliberately scoped to the issue card.
+ *
+ * `.node-info` and `.node-name` are generic names that two other global sheets
+ * also claim, and both turn the element into a flex row:
+ *
+ *   AppHeader.css  `.node-info { display: flex; align-items: center }`
+ *   nodes.css      `.node-name { display: flex; flex: 1; min-width: 0 }`
+ *
+ * Nothing here ever declared `display`, so those won by default. A Security
+ * issue card's three stacked lines (name / node id / last seen) were laid out
+ * side by side, and the name — `flex: 1` with `min-width: 0` in a row too
+ * narrow to hold it — collapsed to zero width and rendered straight on top of
+ * the node id. Desktop hid it: the card is wide enough for the row to fit.
+ *
+ * The `.issue-header` scope (0,3,0) outranks the bare global selectors (0,1,0),
+ * so stating the intended block layout explicitly is enough. It is kept this
+ * narrow on purpose: `.node-name` is also a `<td>` class in
+ * `.top-broadcasters-table`, and that cell should keep whatever layout it has
+ * rather than be swept up in a fix for the cards. Don't widen or unscope this.
+ */
+.security-tab .issue-header .node-info,
+.security-tab .issue-header .node-name {
+  display: block;
+  min-width: 0;
 }
 
 .node-name strong {
@@ -311,6 +349,22 @@
   color: var(--color-text-subtle);
   font-size: 14px;
   margin-bottom: 15px;
+}
+
+/*
+ * #5194: these tables have no fixed width, but their cells hold unbreakable
+ * content — `!0aca5658` node IDs, `HELTEC_MESH_NODE_T114` hardware names — so
+ * the table's min-content width runs past a phone viewport. A bare <table> has
+ * nothing to scroll inside, so the overflow escaped all the way to the document
+ * root: the reader had to drag the entire layout, sticky nav and all, to read
+ * one cell. The wrapper gives the overflow somewhere to go.
+ */
+.security-table-scroll {
+  overflow-x: auto;
+  /* Keep the card's rounded corners now that the wrapper clips. Momentum
+     scrolling needs no help — `-webkit-overflow-scrolling: touch` has been a
+     no-op since iOS 13 made it the default for `overflow: auto`. */
+  border-radius: var(--radius-lg);
 }
 
 .top-broadcasters-table {
@@ -412,6 +466,14 @@
 
 .digest-input {
   flex: 1;
+  /*
+   * #5194: `flex: 1` is `1 1 0%`, but a flex item's default `min-width: auto`
+   * floors it at min-content — and an <input>'s min-content width is its
+   * intrinsic `size`, about 222px. Next to the 140px label that overflowed the
+   * card and, with nothing between here and the document root to absorb it,
+   * left the whole Security page panning sideways by 22px.
+   */
+  min-width: 0;
   padding: 6px 10px;
   background: var(--color-surface-hover);
   border: 1px solid var(--color-surface-active);
@@ -818,6 +880,25 @@
 
   .send-notification-btn {
     margin-left: 0;
+  }
+
+  /*
+   * #5194: below this width the table must scroll rather than squeeze. The
+   * min-width is what makes it scroll at all — without a floor the table
+   * compresses to the viewport and truncates every cell instead, which is the
+   * symptom the reporter saw before the whole page started panning.
+   */
+  .top-broadcasters-table {
+    min-width: 620px;
+  }
+
+  /* #5194: stack label over control so neither has to give up its own width. */
+  .digest-row {
+    flex-wrap: wrap;
+  }
+
+  .digest-label {
+    min-width: 0;
   }
 }
 

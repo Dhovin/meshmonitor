@@ -181,6 +181,11 @@ import { migration as nodeIdentityMergesMigration, runMigration159Postgres, runM
 import { migration as tracerouteTransportMechanismMigration, runMigration160Postgres, runMigration160Mysql } from '../server/migrations/160_traceroute_transport_mechanism.js';
 import { migration as userPrefsUnreadIndicatorMigration, runMigration161Postgres, runMigration161Mysql } from '../server/migrations/161_user_map_preferences_unread_indicator.js';
 import { migration as privacyDocumentsMigration, runMigration162Postgres, runMigration162Mysql } from '../server/migrations/162_privacy_documents.js';
+import { migration as meshcoreSnrRealMigration, runMigration163Postgres, runMigration163Mysql } from '../server/migrations/163_meshcore_snr_real.js';
+import { migration as spreadNodesPrefMigration, runMigration164Postgres, runMigration164Mysql } from '../server/migrations/164_user_map_preferences_spread_nodes.js';
+import { migration as waypointNotificationsMigration, runMigration165Postgres, runMigration165Mysql } from '../server/migrations/165_waypoint_notifications.js';
+import { migration as meshBeaconMuteMigration, runMigration166Postgres, runMigration166Mysql } from '../server/migrations/166_mesh_beacon_mute.js';
+import { migration as solarNodeOverridesMigration, runMigration167Postgres, runMigration167Mysql } from '../server/migrations/167_solar_node_overrides.js';
 
 // ============================================================================
 // Registry
@@ -2628,4 +2633,84 @@ registry.register({
   sqlite: (db) => privacyDocumentsMigration.up(db),
   postgres: (client) => runMigration162Postgres(client),
   mysql: (pool) => runMigration162Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 163: widen `meshcore_messages.snr` and `meshcore_heard_repeaters.snr`
+// from INTEGER to REAL/DOUBLE (#5175) — MeshCore SNR is quarter-dB fractional
+// (e.g. -8.25), which PostgreSQL's INTEGER column rejected outright.
+// Idempotent across SQLite / PostgreSQL / MySQL.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 163,
+  name: 'meshcore_snr_real',
+  settingsKey: 'migration_163_meshcore_snr_real',
+  sqlite: (db) => meshcoreSnrRealMigration.up(db),
+  postgres: (client) => runMigration163Postgres(client),
+  mysql: (pool) => runMigration163Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 164: `user_map_preferences.spread_nodes` (#5177) — per-user toggle
+// for the within-accuracy-cell marker offset. Default TRUE (today's behaviour);
+// unchecking pins every node at its exact reported position.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 164,
+  name: 'user_map_preferences_spread_nodes',
+  settingsKey: 'migration_164_user_map_preferences_spread_nodes',
+  sqlite: (db) => spreadNodesPrefMigration.up(db),
+  postgres: (client) => runMigration164Postgres(client),
+  mysql: (pool) => runMigration164Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 165: waypoint arrival notifications (#4750) — the four
+// `user_notification_preferences` columns (flag, radius, optional centre) plus
+// `waypoint_notifications`, the persisted dedupe ledger that stops a
+// rebroadcasting waypoint from alerting forever.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 165,
+  name: 'waypoint_notifications',
+  settingsKey: 'migration_165_waypoint_notifications',
+  sqlite: (db) => waypointNotificationsMigration.up(db),
+  postgres: (client) => runMigration165Postgres(client),
+  mysql: (pool) => runMigration165Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 166: `mesh_beacon_offers.mutedAt` (#5232) — the permanent form of
+// a dismissal. `dismissedAt` intentionally clears when the advertised network
+// changes; `mutedAt` never does, so a neighbour that keeps re-targeting its
+// beacon can be silenced for good.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 166,
+  name: 'mesh_beacon_mute',
+  settingsKey: 'migration_166_mesh_beacon_mute',
+  sqlite: (db) => meshBeaconMuteMigration.up(db),
+  postgres: (client) => runMigration166Postgres(client),
+  mysql: (pool) => runMigration166Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 167: `solar_node_overrides` (#3195) — the operator's manual solar
+// classification for a node, overriding the telemetry pattern detector when an
+// over-specced panel/battery never shows a charge/discharge cycle. GLOBAL (no
+// sourceId): a solar panel belongs to the physical node, and the Solar
+// Monitoring report pools telemetry across sources. Idempotent on all backends.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 167,
+  name: 'solar_node_overrides',
+  settingsKey: 'migration_167_solar_node_overrides',
+  sqlite: (db) => solarNodeOverridesMigration.up(db),
+  postgres: (client) => runMigration167Postgres(client),
+  mysql: (pool) => runMigration167Mysql(pool),
 });

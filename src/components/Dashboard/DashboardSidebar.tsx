@@ -26,6 +26,7 @@ import type { DashboardSource, SourceStatus, UnifiedStatus } from '../../hooks/u
 import { UNIFIED_SOURCE_ID } from '../../hooks/useDashboardData';
 import { useAuth } from '../../contexts/AuthContext';
 import { UiIcon } from '../icons';
+import { DRAG_HANDLE_TOUCH_STYLE } from '../dragHandleStyle';
 import SidebarFooter from '../SidebarFooter';
 import styles from './DashboardSidebar.module.css';
 import { isAnyMeshCoreSourceType } from '../../utils/nodeTypeCategory';
@@ -124,6 +125,14 @@ interface DashboardSidebarProps {
   unreadIndicatorEnabled?: boolean;
   /** Toggle the preference from the sidebar header (#5124). Omit to hide the control. */
   onToggleUnreadIndicator?: (value: boolean) => void;
+  /**
+   * Clear every source's unread DM badge at once (#5197). Omit to hide the
+   * control. Rendered only when something is actually unread, so it does not
+   * occupy the header on the common empty case.
+   */
+  onMarkAllDmsRead?: () => void;
+  /** True while the bulk clear is in flight, to disable the control (#5197). */
+  markAllDmsReadPending?: boolean;
   /** Mobile drawer state — on desktop the sidebar is always visible. */
   mobileOpen?: boolean;
   /** Called to close the drawer on mobile (after selecting a source or tapping backdrop). */
@@ -358,6 +367,7 @@ const SortableSourceCard: React.FC<{
         {...listeners}
         onClick={(e) => e.stopPropagation()}
         title="Drag to reorder"
+        data-testid="dashboard-source-drag-handle"
         style={{
           display: 'flex',
           alignItems: 'center',
@@ -366,13 +376,14 @@ const SortableSourceCard: React.FC<{
           marginLeft: '8px',
           cursor: isDragging ? 'grabbing' : 'grab',
           color: isDragging ? 'var(--color-accent)' : 'var(--color-text-disabled)',
-          fontSize: '1.2rem',
-          userSelect: 'none',
           flexShrink: 0,
-          touchAction: 'none',
+          // #5233: this handle already had `touch-action: none`, so dragging
+          // worked here — but the bare glyph was still selectable text, so a
+          // long-press could raise the iOS selection callout over it.
+          ...DRAG_HANDLE_TOUCH_STYLE,
         }}
       >
-        ⠿
+        <UiIcon name="dragHandle" size={17} />
       </div>
       <div style={{ flex: 1, minWidth: 0 }}>{children}</div>
     </div>
@@ -404,6 +415,8 @@ const DashboardSidebar: React.FC<DashboardSidebarProps> = ({
   unreadBySource,
   unreadIndicatorEnabled = true,
   onToggleUnreadIndicator,
+  onMarkAllDmsRead,
+  markAllDmsReadPending = false,
 }) => {
   const navigate = useNavigate();
   const { t } = useTranslation();
@@ -413,6 +426,32 @@ const DashboardSidebar: React.FC<DashboardSidebarProps> = ({
   // Admin short-circuit lives inside hasPermission, so existing admin users
   // still see the menu on every source they have a row for.
   const { hasPermission } = useAuth();
+
+  // #5197: total across every source the server chose to report. Drives both
+  // whether the bulk-clear control appears at all and whether it confirms
+  // first.
+  const totalUnreadDms = React.useMemo(
+    () => Object.values(unreadBySource ?? {}).reduce((sum, v) => sum + (v?.directMessages ?? 0), 0),
+    [unreadBySource],
+  );
+
+  /**
+   * Confirm only above a threshold. A stray tap that clears three badges costs
+   * nothing; one that silently clears a 200-message backlog is unrecoverable —
+   * read state has no undo. Below the threshold a prompt is just friction on
+   * the action people press most.
+   */
+  const MARK_ALL_CONFIRM_THRESHOLD = 50;
+  const handleMarkAllDmsRead = () => {
+    if (!onMarkAllDmsRead) return;
+    if (totalUnreadDms >= MARK_ALL_CONFIRM_THRESHOLD) {
+      const ok = window.confirm(
+        t('source.mark_all_dms_read_confirm', { count: totalUnreadDms }),
+      );
+      if (!ok) return;
+    }
+    onMarkAllDmsRead();
+  };
 
   // On mobile, wrap source selection so the drawer auto-closes after tap.
   const handleSelectSource = (id: string) => {
@@ -575,6 +614,28 @@ const DashboardSidebar: React.FC<DashboardSidebarProps> = ({
             title={t('settings.unread_indicator_help')}
           >
             {t('settings.unread_indicator')}
+          </button>
+        )}
+        {/* #5197: sits BESIDE the toggle above, not in place of it. The
+            original request was to replace that toggle on the grounds that it
+            is duplicated in Settings — it is not; the sidebar chip is its only
+            control, and it gates the 15s poll as well as the badge, so
+            dropping it would leave no way to stop either. This is the action
+            the request was really after: a user with 5+ sources otherwise has
+            to open each one to dismiss its badge.
+
+            Shown only when something is unread, so it costs no header space in
+            the common case — which is also what keeps both controls fitting on
+            a narrow screen. */}
+        {isAuthenticated && onMarkAllDmsRead && totalUnreadDms > 0 && (
+          <button
+            className="dashboard-add-source-btn"
+            style={{ marginLeft: 6, padding: '2px 8px', fontSize: 11 }}
+            onClick={handleMarkAllDmsRead}
+            disabled={markAllDmsReadPending}
+            title={t('source.mark_all_dms_read_help')}
+          >
+            {t('source.mark_all_dms_read')}
           </button>
         )}
       </div>
@@ -860,7 +921,7 @@ const DashboardSidebar: React.FC<DashboardSidebarProps> = ({
                     </button>
                   );
                 })()}
-              {!isUnified && source.type !== 'mqtt_broker' && (
+              {!isUnified && (
                 <button
                   className="dashboard-open-btn"
                   disabled={!source.enabled}

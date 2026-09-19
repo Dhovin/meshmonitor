@@ -43,6 +43,8 @@ export const VALID_SETTINGS_KEYS = [
   // to [1,3] server-side — an unbounded value would let Auto-Ack be abused as
   // a repeat-broadcast/spam mechanism. Channel sends stay hardcoded to 1.
   'autoAckMaxAttempts',
+  // Hop-limit override for Auto-Acknowledge replies and tapbacks (#5121).
+  'autoAckHopLimit',
   // Auto-ack 2x2 matrix (discussion #3564): {Channel,Direct} × {ZeroHop,MultiHop},
   // each cell with Reply / Tapback / Respond-via-DM. These supersede the legacy
   // hop-only keys above (autoAckDirect*/autoAckMultihop*/autoAckUseDM/
@@ -68,6 +70,8 @@ export const VALID_SETTINGS_KEYS = [
   'autoAnnounceMessage',
   'autoAnnounceChannelIndex',
   'autoAnnounceChannelIndexes',
+  // Hop-limit override for auto-announcements (#5121).
+  'autoAnnounceHopLimit',
   'autoAnnounceOnStart',
   'autoAnnounceUseSchedule',
   'autoAnnounceSchedule',
@@ -126,6 +130,7 @@ export const VALID_SETTINGS_KEYS = [
   'solarMonitoringAzimuth',
   'solarMonitoringDeclination',
   'mapPinStyle',
+  'mapPinColorMode',
   'nodeListStyle',
   'favoriteTelemetryStorageDays',
   'theme',
@@ -380,6 +385,9 @@ export const VALID_SETTINGS_KEYS = [
   // ReticulumRepository.upsertDestination prunes oldest-by-lastSeen beyond the
   // cap, skipping favorites (attach spec §11 risk 4).
   'reticulum_destinations_max',
+  // #5255: per-script update sources an admin typed in, as a JSON object keyed
+  // by script filename. Global, since scripts live on disk, not per source.
+  'scriptUpdateSources',
 ] as const;
 
 export type ValidSettingKey = typeof VALID_SETTINGS_KEYS[number];
@@ -408,6 +416,7 @@ export const PER_SOURCE_SETTINGS_KEYS = [
   'autoAckCooldownSeconds',
   'autoAckPreSendDelaySeconds',
   'autoAckMaxAttempts',
+  'autoAckHopLimit',
   'autoAckDirectEnabled',
   'autoAckDirectMessages',
   'autoAckDirectReplyEnabled',
@@ -441,6 +450,7 @@ export const PER_SOURCE_SETTINGS_KEYS = [
   'automationAirtimeCutoffNeighborMaxHops',
   // Auto-announce
   'autoAnnounceChannelIndexes',
+  'autoAnnounceHopLimit',
   'autoAnnounceEnabled',
   'autoAnnounceIntervalHours',
   'autoAnnounceMessage',
@@ -595,6 +605,13 @@ export const PER_SOURCE_SETTINGS_KEYS = [
   'tracerouteFilterRolesEnabled',
   'tracerouteFilterHwModelsEnabled',
   'tracerouteFilterRegexEnabled',
+  // Per-filter combine mode ('or' | 'and') — #5230. Absent/invalid reads as
+  // 'or', which is the behaviour every install had before the setting existed.
+  'tracerouteFilterNodesMode',
+  'tracerouteFilterChannelsMode',
+  'tracerouteFilterRolesMode',
+  'tracerouteFilterHwModelsMode',
+  'tracerouteFilterRegexMode',
   'tracerouteExpirationHours',
   'tracerouteSortByHops',
   'tracerouteFilterLastHeardEnabled',
@@ -723,6 +740,13 @@ export const PER_SOURCE_KEYS_NOT_POSTABLE = new Set<string>([
   'tracerouteFilterRolesEnabled',
   'tracerouteFilterHwModelsEnabled',
   'tracerouteFilterRegexEnabled',
+  // Per-filter combine mode ('or' | 'and') — #5230. Absent/invalid reads as
+  // 'or', which is the behaviour every install had before the setting existed.
+  'tracerouteFilterNodesMode',
+  'tracerouteFilterChannelsMode',
+  'tracerouteFilterRolesMode',
+  'tracerouteFilterHwModelsMode',
+  'tracerouteFilterRegexMode',
   'tracerouteExpirationHours',
   'tracerouteSortByHops',
   // ── Server-managed bookkeeping, never user-set ──────────────────────────

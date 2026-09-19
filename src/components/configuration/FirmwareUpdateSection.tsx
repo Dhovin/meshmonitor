@@ -6,6 +6,7 @@ import { useCsrfFetch } from '../../hooks/useCsrfFetch';
 import { useToast } from '../ToastContainer';
 import { usePoll } from '../../hooks/usePoll';
 import { useData } from '../../contexts/DataContext';
+import { getHardwareModelName } from '../../utils/hardwareModel';
 
 interface FirmwareUpdateSectionProps {
   baseUrl: string;
@@ -14,7 +15,23 @@ interface FirmwareUpdateSectionProps {
 // Mirror the server-side types for the frontend
 type UpdateState = 'idle' | 'awaiting-confirm' | 'in-progress' | 'success' | 'error';
 type UpdateStep = 'preflight' | 'backup' | 'download' | 'extract' | 'flash' | 'verify' | null;
-type FirmwareChannel = 'stable' | 'alpha' | 'custom' | 'nightly';
+type FirmwareChannel = 'stable' | 'alpha' | 'custom' | 'nightly' | 'local';
+
+/**
+ * Scale the unit rather than always printing MB: a 4 KB file reading
+ * "0.00 MB" looks like a failed upload (#5249).
+ */
+function formatFirmwareSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+}
+
+/** A `.bin` the user uploaded, held server-side until it is flashed (#5249). */
+interface StagedUpload {
+  originalName: string;
+  size: number;
+}
 
 interface PreflightInfo {
   currentVersion: string;
@@ -56,8 +73,11 @@ interface FirmwareStatusResponse {
   success: boolean;
   status: UpdateStatus;
   channel: FirmwareChannel;
-  customUrl: string;
+  // Null when nothing is saved — /status returns the stored setting verbatim.
+  customUrl: string | null;
   lastChecked: number | null;
+  /** Null when nothing is staged (#5249). Survives a page reload. */
+  stagedUpload?: StagedUpload | null;
 }
 
 interface FirmwareReleasesResponse {
@@ -159,6 +179,12 @@ const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({ baseUrl }
   // surfacing the raw "DELETE /api/firmware/recovery-marker/..." toast.
   const [halfFlashedNodeId, setHalfFlashedNodeId] = useState<string | null>(null);
   const [isClearingMarker, setIsClearingMarker] = useState(false);
+  // #5249: local-file upload. `acknowledgedRisk` gates Install — MeshMonitor
+  // cannot tell whether an uploaded binary belongs to this board, so the user
+  // confirms that explicitly rather than us implying a check we didn't do.
+  const [isUploading, setIsUploading] = useState(false);
+  const [acknowledgedRisk, setAcknowledgedRisk] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Ref for auto-scrolling logs
   const logRef = useRef<HTMLPreElement>(null);
@@ -219,6 +245,9 @@ const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({ baseUrl }
   const releases = releasesData?.releases ?? [];
   const backups = backupsData?.backups ?? [];
   const lastChecked = statusData?.lastChecked ?? null;
+  // #5011: Install fetches whatever the SERVER has stored, so gate the button
+  // on that rather than on unsaved text sitting in the input.
+  const savedCustomUrl = statusData?.customUrl ?? '';
 
   // ---- Handlers ----
 
@@ -238,7 +267,19 @@ const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({ baseUrl }
         const data = await res.json();
         throw new Error(data.error || 'Failed to save channel');
       }
-      showToast(t('firmware.channel', 'Release channel saved'), 'success');
+      // #5011: tell the operator when we rewrote a GitHub page URL into the
+      // raw-content one, rather than silently storing something different
+      // from what they typed.
+      const saved = await res.json().catch(() => null);
+      if (saved?.rewritten && saved?.customUrl) {
+        setCustomUrl(saved.customUrl);
+        showToast(
+          t('firmware.custom_url_rewritten', 'Saved — GitHub page URL converted to its raw-content URL'),
+          'success',
+        );
+      } else {
+        showToast(t('firmware.channel', 'Release channel saved'), 'success');
+      }
       void queryClient.invalidateQueries({ queryKey: ['firmware', 'status'] });
       void queryClient.invalidateQueries({ queryKey: ['firmware', 'releases'] });
     } catch (err) {
@@ -265,6 +306,110 @@ const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({ baseUrl }
       showToast(err instanceof Error ? err.message : 'Error checking for updates', 'error');
     } finally {
       setIsChecking(false);
+    }
+  };
+
+  const stagedUpload = statusData?.stagedUpload ?? null;
+
+  /**
+   * #5249: send the chosen `.bin` to the server, which holds it until Install.
+   * Raw body + X-Firmware-Filename rather than multipart, matching the other
+   * upload endpoints in the app.
+   */
+  const handleFileSelected = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    // Clear the input so re-picking the SAME file fires change again.
+    event.target.value = '';
+    if (!file) return;
+
+    if (!file.name.toLowerCase().endsWith('.bin')) {
+      showToast(t('firmware.upload_not_bin', 'Firmware must be a .bin file'), 'error');
+      return;
+    }
+
+    setIsUploading(true);
+    try {
+      const res = await csrfFetch(`${baseUrl}/api/firmware/upload`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'X-Firmware-Filename': file.name,
+        },
+        body: await file.arrayBuffer(),
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error || 'Upload failed');
+      }
+      // A new file invalidates the previous acknowledgement — the user is
+      // confirming THIS binary, not whichever one they picked before.
+      setAcknowledgedRisk(false);
+      void queryClient.invalidateQueries({ queryKey: ['firmware', 'status'] });
+      showToast(t('firmware.upload_ok', 'Firmware uploaded'), 'success');
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Error uploading firmware', 'error');
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  const handleDiscardUpload = async () => {
+    try {
+      const res = await csrfFetch(`${baseUrl}/api/firmware/upload`, { method: 'DELETE' });
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error || 'Failed to discard upload');
+      }
+      setAcknowledgedRisk(false);
+      void queryClient.invalidateQueries({ queryKey: ['firmware', 'status'] });
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Error discarding upload', 'error');
+    }
+  };
+
+  /** #5011: start the wizard against the saved custom URL. */
+  const handleInstallCustomUrl = async () => {
+    try {
+      const res = await csrfFetch(`${baseUrl}/api/firmware/update`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          useCustomUrl: true,
+          gatewayIp: gatewayInfo.gatewayIp,
+          hwModel: gatewayInfo.hwModel,
+          currentVersion: gatewayInfo.firmwareVersion,
+        }),
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error || 'Failed to start update');
+      }
+      void queryClient.invalidateQueries({ queryKey: ['firmware', 'status'] });
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Error starting update', 'error');
+    }
+  };
+
+  /** #5249: start the wizard against the staged upload instead of a release. */
+  const handleInstallUpload = async () => {
+    try {
+      const res = await csrfFetch(`${baseUrl}/api/firmware/update`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          useStagedUpload: true,
+          gatewayIp: gatewayInfo.gatewayIp,
+          hwModel: gatewayInfo.hwModel,
+          currentVersion: gatewayInfo.firmwareVersion,
+        }),
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error || 'Failed to start update');
+      }
+      void queryClient.invalidateQueries({ queryKey: ['firmware', 'status'] });
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Error starting update', 'error');
     }
   };
 
@@ -536,6 +681,7 @@ const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({ baseUrl }
             <option value="alpha">{t('firmware.channel_alpha', 'Alpha (Pre-release)')}</option>
             <option value="nightly">{t('firmware.channel_nightly', 'Nightly (Develop)')}</option>
             <option value="custom">{t('firmware.channel_custom', 'Custom URL')}</option>
+            <option value="local">{t('firmware.channel_local', 'Local File (Upload)')}</option>
           </select>
           <button
             className="save-button"
@@ -570,21 +716,154 @@ const FirmwareUpdateSection: React.FC<FirmwareUpdateSectionProps> = ({ baseUrl }
         </div>
       )}
 
-      {/* Custom URL Input */}
+      {/* Custom URL Input (#5011) */}
       {channel === 'custom' && (
-        <div className="setting-item">
-          <label htmlFor="firmware-custom-url">
-            {t('firmware.channel_custom', 'Custom URL')}
-          </label>
+        <div className="setting-item" style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+          <div>
+            <label htmlFor="firmware-custom-url">
+              {t('firmware.channel_custom', 'Custom URL')}
+            </label>
+            <input
+              id="firmware-custom-url"
+              type="url"
+              value={customUrl}
+              onChange={(e) => setCustomUrl(e.target.value)}
+              placeholder={t('firmware.custom_url_placeholder', 'https://example.com/firmware.bin')}
+              className="setting-input"
+              style={{ width: '100%' }}
+            />
+            <span className="setting-description">
+              {t(
+                'firmware.custom_url_hint',
+                'Must point directly at a .bin image. A GitHub file page link is converted to its raw-content URL when you save.',
+              )}
+            </span>
+          </div>
+
+          <div
+            role="alert"
+            style={{
+              padding: '0.75rem',
+              borderRadius: '6px',
+              border: '1px solid var(--color-warning)',
+              color: 'var(--color-warning)',
+              fontSize: '0.85rem',
+              lineHeight: 1.4,
+            }}
+          >
+            {t(
+              'firmware.custom_url_warning',
+              'MeshMonitor does not check that the downloaded file is firmware for this board. Flashing a binary built for a different board will brick the node, and recovery needs a USB cable. Make sure the URL was built for:',
+            )}{' '}
+            <strong>
+              {gatewayInfo.hwModel > 0
+                ? getHardwareModelName(gatewayInfo.hwModel)
+                : t('firmware.unknown_board', 'this board')}
+            </strong>
+          </div>
+
+          <div>
+            <button
+              className="save-button"
+              onClick={handleInstallCustomUrl}
+              disabled={!isOtaSupported || !savedCustomUrl}
+              data-testid="firmware-install-custom-url"
+              title={
+                savedCustomUrl
+                  ? undefined
+                  : t('firmware.custom_url_save_first', 'Press Save first to store the URL')
+              }
+            >
+              {t('firmware.install_from_url', 'Install from URL')}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Local file upload (#5249) */}
+      {channel === 'local' && (
+        <div className="setting-item" style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+          <div
+            role="alert"
+            style={{
+              padding: '0.75rem',
+              borderRadius: '6px',
+              border: '1px solid var(--color-warning)',
+              color: 'var(--color-warning)',
+              fontSize: '0.85rem',
+              lineHeight: 1.4,
+            }}
+          >
+            {t(
+              'firmware.local_warning',
+              'MeshMonitor does not check that an uploaded file is firmware for this board. Flashing a binary built for a different board will brick the node, and recovery needs a USB cable. Make sure the file you pick was built for:',
+            )}{' '}
+            <strong>{gatewayInfo.hwModel > 0
+              ? getHardwareModelName(gatewayInfo.hwModel)
+              : t('firmware.unknown_board', 'this board')}</strong>
+          </div>
+
           <input
-            id="firmware-custom-url"
-            type="url"
-            value={customUrl}
-            onChange={(e) => setCustomUrl(e.target.value)}
-            placeholder={t('firmware.custom_url_placeholder', 'https://example.com/firmware.bin')}
-            className="setting-input"
-            style={{ width: '100%' }}
+            ref={fileInputRef}
+            type="file"
+            accept=".bin,application/octet-stream"
+            onChange={handleFileSelected}
+            style={{ display: 'none' }}
+            data-testid="firmware-file-input"
           />
+
+          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+            <button
+              className="save-button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isUploading}
+            >
+              {isUploading
+                ? t('firmware.uploading', 'Uploading...')
+                : stagedUpload
+                  ? t('firmware.choose_different_file', 'Choose a different file')
+                  : t('firmware.choose_file', 'Choose .bin file')}
+            </button>
+            {stagedUpload && (
+              <>
+                <span style={{ color: 'var(--color-text)', fontSize: '0.9rem' }}>
+                  {stagedUpload.originalName} ({formatFirmwareSize(stagedUpload.size)})
+                </span>
+                <button className="save-button" onClick={handleDiscardUpload}>
+                  {t('firmware.discard_upload', 'Discard')}
+                </button>
+              </>
+            )}
+          </div>
+
+          {stagedUpload && (
+            <>
+              <label style={{ display: 'flex', gap: '0.5rem', alignItems: 'flex-start', fontSize: '0.85rem' }}>
+                <input
+                  type="checkbox"
+                  checked={acknowledgedRisk}
+                  onChange={(e) => setAcknowledgedRisk(e.target.checked)}
+                  data-testid="firmware-ack-risk"
+                />
+                <span>
+                  {t(
+                    'firmware.local_ack',
+                    'I built or obtained this file for this exact board, and I can recover the node over USB if it fails to boot.',
+                  )}
+                </span>
+              </label>
+              <div>
+                <button
+                  className="save-button"
+                  onClick={handleInstallUpload}
+                  disabled={!acknowledgedRisk || !isOtaSupported}
+                  data-testid="firmware-install-upload"
+                >
+                  {t('firmware.install_uploaded', 'Install uploaded firmware')}
+                </button>
+              </div>
+            </>
+          )}
         </div>
       )}
 

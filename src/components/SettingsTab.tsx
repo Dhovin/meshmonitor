@@ -28,6 +28,11 @@ import { getEffectiveTileset, type Theme, type AppearanceMode, type NodeHopsCalc
 import { type SortOption as DashboardSortOption } from './Dashboard/types';
 import { LanguageSelector } from './LanguageSelector';
 import SectionNav from './SectionNav';
+import {
+  GLOBAL_SETTINGS_SECTIONS,
+  SOURCE_SETTINGS_SECTIONS,
+  settingsNavItems,
+} from './search/configSections';
 import PositionEstimationSection from './PositionEstimationSection';
 import MeshIssuesSection from './MeshIssuesSection';
 import TapbackEmojiSettings from './TapbackEmojiSettings';
@@ -53,6 +58,7 @@ type PositionHistoryLineStyle = 'linear' | 'spline';
 type TimeFormat = '12' | '24';
 type DateFormat = 'MM/DD/YYYY' | 'DD/MM/YYYY' | 'YYYY-MM-DD';
 type MapPinStyle = 'meshmonitor' | 'official';
+type MapPinColorMode = 'node' | 'hops';
 type IconStyle = 'lucide' | 'emoji';
 
 // --- Task 5.3 (#3962 Phase 5) draft-object rewrite ---------------------------------------------
@@ -90,6 +96,7 @@ interface SettingsDraft {
   mapTilesetLight: TilesetId;
   mapTilesetDark: TilesetId;
   mapPinStyle: MapPinStyle;
+  mapPinColorMode: MapPinColorMode;
   nodeListStyle: NodeListStyle;
   iconStyle: IconStyle;
   neighborInfoMinZoom: number;
@@ -209,6 +216,7 @@ interface SettingsTabProps {
   mapTilesetLight: TilesetId;
   mapTilesetDark: TilesetId;
   mapPinStyle: MapPinStyle;
+  mapPinColorMode: MapPinColorMode;
   nodeListStyle: NodeListStyle;
   iconStyle: IconStyle;
   theme: Theme;
@@ -236,6 +244,7 @@ interface SettingsTabProps {
   onDateFormatChange: (format: DateFormat) => void;
   onMapTilesetsChange: (light: TilesetId, dark: TilesetId) => void;
   onMapPinStyleChange: (style: MapPinStyle) => void;
+  onMapPinColorModeChange: (mode: MapPinColorMode) => void;
   onNodeListStyleChange: (style: NodeListStyle) => void;
   onIconStyleChange: (style: IconStyle) => void;
   onLanguageChange: (language: string) => void;
@@ -247,27 +256,6 @@ interface SettingsTabProps {
   mode?: 'global' | 'source';
 }
 
-const GLOBAL_SECTIONS = new Set([
-  'settings-language', 'settings-units', 'settings-appearance', 'settings-link-previews', 'settings-privacy', 'settings-meshcore-messaging', 'settings-map',
-  'settings-security',
-  'settings-remote-admin',
-  'settings-apprise-server', 'settings-elevation', 'settings-atak-cot', 'settings-backup', 'settings-channel-database',
-  'settings-scripts',
-  'settings-maintenance', 'settings-analytics',
-  // Position estimation is a single global, cross-source batch job (issue
-  // #3271) — it belongs in global Settings, not the per-source Automation tab.
-  'settings-position-estimation',
-  // Mesh Issues Analysis is a single global, cross-source batch job (#4964)
-  // — same reasoning as position estimation above.
-  'settings-mesh-issues',
-]);
-
-const SOURCE_SECTIONS = new Set([
-  'settings-sorting', 'settings-node-display', 'settings-telemetry',
-  'settings-notifications', 'settings-packet-monitor', 'settings-solar',
-  'settings-firmware', 'settings-reset-ui',
-  'settings-management', 'settings-danger',
-]);
 
 const SettingsTab: React.FC<SettingsTabProps> = ({
   maxNodeAgeHours,
@@ -286,6 +274,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
   mapTilesetLight,
   mapTilesetDark,
   mapPinStyle,
+  mapPinColorMode,
   nodeListStyle,
   iconStyle,
   language,
@@ -312,6 +301,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
   onDateFormatChange,
   onMapTilesetsChange,
   onMapPinStyleChange,
+  onMapPinColorModeChange,
   onNodeListStyleChange,
   onIconStyleChange,
   onLanguageChange,
@@ -323,7 +313,9 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
   mode
 }) => {
   const show = (sectionId: string) =>
-    !mode || (mode === 'global' ? GLOBAL_SECTIONS.has(sectionId) : SOURCE_SECTIONS.has(sectionId));
+    !mode || (mode === 'global'
+      ? GLOBAL_SETTINGS_SECTIONS.has(sectionId)
+      : SOURCE_SETTINGS_SECTIONS.has(sectionId));
 
   const { t } = useTranslation();
   const csrfFetch = useCsrfFetch();
@@ -414,6 +406,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     mapTilesetLight,
     mapTilesetDark,
     mapPinStyle,
+  mapPinColorMode,
     nodeListStyle,
     iconStyle,
     neighborInfoMinZoom,
@@ -724,6 +717,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
       mapTilesetLight,
       mapTilesetDark,
       mapPinStyle,
+      mapPinColorMode,
       nodeListStyle,
       iconStyle,
       neighborInfoMinZoom,
@@ -778,7 +772,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     };
   }, [maxNodeAgeHours, inactiveNodeThresholdHours, inactiveNodeCheckIntervalMinutes, inactiveNodeCooldownHours,
       temperatureUnit, distanceUnit, positionHistoryLineStyle, telemetryVisualizationHours, favoriteTelemetryStorageDays,
-      preferredSortField, preferredSortDirection, timeFormat, dateFormat, mapTilesetLight, mapTilesetDark, mapPinStyle, nodeListStyle,
+      preferredSortField, preferredSortDirection, timeFormat, dateFormat, mapTilesetLight, mapTilesetDark, mapPinStyle, mapPinColorMode, nodeListStyle,
       iconStyle, neighborInfoMinZoom, defaultMapCenterLat, defaultMapCenterLon, defaultMapCenterZoom, mapCenterTargetZoom, mapZoomGateThreshold,
       defaultLandingPage, appearanceMode, darkTheme, lightTheme, nodeHopsCalculation, preferredDashboardSortOption,
       linkPreviewsEnabled, discardInvalidPositions, noIndexEnabled, meshcoreChannelRetryEnabled, showIncompleteNodes,
@@ -823,6 +817,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
         mapTilesetLight,
         mapTilesetDark,
         mapPinStyle,
+        mapPinColorMode,
         nodeListStyle,
         iconStyle,
         neighborInfoMinZoom,
@@ -854,7 +849,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     });
   }, [maxNodeAgeHours, inactiveNodeThresholdHours, inactiveNodeCheckIntervalMinutes, inactiveNodeCooldownHours,
       temperatureUnit, distanceUnit, positionHistoryLineStyle, telemetryVisualizationHours, favoriteTelemetryStorageDays,
-      preferredSortField, preferredSortDirection, timeFormat, dateFormat, mapTilesetLight, mapTilesetDark, mapPinStyle, nodeListStyle,
+      preferredSortField, preferredSortDirection, timeFormat, dateFormat, mapTilesetLight, mapTilesetDark, mapPinStyle, mapPinColorMode, nodeListStyle,
       iconStyle, neighborInfoMinZoom, defaultMapCenterLat, defaultMapCenterLon, defaultMapCenterZoom, mapCenterTargetZoom, mapZoomGateThreshold,
       defaultLandingPage, appearanceMode, darkTheme, lightTheme, nodeHopsCalculation, preferredDashboardSortOption,
       linkPreviewsEnabled, discardInvalidPositions, noIndexEnabled, meshcoreChannelRetryEnabled, showIncompleteNodes,
@@ -894,7 +889,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     onMaxNodeAgeChange, onInactiveNodeThresholdHoursChange, onInactiveNodeCheckIntervalMinutesChange,
     onInactiveNodeCooldownHoursChange, onTemperatureUnitChange, onDistanceUnitChange, onPositionHistoryLineStyleChange,
     onTelemetryVisualizationChange, onFavoriteTelemetryStorageDaysChange, onPreferredSortFieldChange,
-    onPreferredSortDirectionChange, onTimeFormatChange, onDateFormatChange, onMapTilesetsChange, onMapPinStyleChange, onNodeListStyleChange,
+    onPreferredSortDirectionChange, onTimeFormatChange, onDateFormatChange, onMapTilesetsChange, onMapPinStyleChange, onMapPinColorModeChange, onNodeListStyleChange,
     onIconStyleChange, onSolarMonitoringEnabledChange, onSolarMonitoringLatitudeChange, onSolarMonitoringLongitudeChange,
     onSolarMonitoringAzimuthChange, onSolarMonitoringDeclinationChange,
   });
@@ -902,7 +897,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     onMaxNodeAgeChange, onInactiveNodeThresholdHoursChange, onInactiveNodeCheckIntervalMinutesChange,
     onInactiveNodeCooldownHoursChange, onTemperatureUnitChange, onDistanceUnitChange, onPositionHistoryLineStyleChange,
     onTelemetryVisualizationChange, onFavoriteTelemetryStorageDaysChange, onPreferredSortFieldChange,
-    onPreferredSortDirectionChange, onTimeFormatChange, onDateFormatChange, onMapTilesetsChange, onMapPinStyleChange, onNodeListStyleChange,
+    onPreferredSortDirectionChange, onTimeFormatChange, onDateFormatChange, onMapTilesetsChange, onMapPinStyleChange, onMapPinColorModeChange, onNodeListStyleChange,
     onIconStyleChange, onSolarMonitoringEnabledChange, onSolarMonitoringLatitudeChange, onSolarMonitoringLongitudeChange,
     onSolarMonitoringAzimuthChange, onSolarMonitoringDeclinationChange,
   };
@@ -927,6 +922,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     cb.onDateFormatChange(d.dateFormat);
     cb.onMapTilesetsChange(d.mapTilesetLight, d.mapTilesetDark);
     cb.onMapPinStyleChange(d.mapPinStyle);
+    cb.onMapPinColorModeChange(d.mapPinColorMode);
     cb.onNodeListStyleChange(d.nodeListStyle);
     cb.onIconStyleChange(d.iconStyle);
     cb.onSolarMonitoringEnabledChange(d.solarMonitoringEnabled);
@@ -1006,6 +1002,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
         mapTilesetLight: draft.mapTilesetLight,
         mapTilesetDark: draft.mapTilesetDark,
         mapPinStyle: draft.mapPinStyle,
+        mapPinColorMode: draft.mapPinColorMode,
         nodeListStyle: draft.nodeListStyle,
         iconStyle: draft.iconStyle,
         neighborInfoMinZoom: draft.neighborInfoMinZoom.toString(),
@@ -1275,6 +1272,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
       updateField('mapTilesetLight', 'osm');
       updateField('mapTilesetDark', 'cartoDark');
       updateField('mapPinStyle', 'meshmonitor');
+      updateField('mapPinColorMode', 'node');
       updateField('nodeListStyle', 'monochrome');
       updateField('appearanceMode', 'system');
       updateField('darkTheme', 'mocha');
@@ -1306,6 +1304,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
       onDateFormatChange('MM/DD/YYYY');
       onMapTilesetsChange('osm', 'cartoDark');
       onMapPinStyleChange('meshmonitor');
+      onMapPinColorModeChange('node');
       onNodeListStyleChange('monochrome');
       setAppearanceMode('system');
       setDarkTheme('mocha');
@@ -1544,37 +1543,19 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
         >
           <UiIcon name="heart" /> {t('settings.support')}</a>
       </div>
-      <SectionNav items={[
-        { id: 'settings-language', label: t('settings.language') },
-        { id: 'settings-units', label: t('settings.units_and_formats') },
-        { id: 'settings-sorting', label: t('settings.sorting') },
-        { id: 'settings-appearance', label: t('settings.appearance') },
-        { id: 'settings-link-previews', label: t('settings.link_previews', 'Link Previews') },
-        { id: 'settings-privacy', label: t('settings.privacy', 'Privacy') },
-        { id: 'settings-meshcore-messaging', label: t('settings.meshcore_messaging', 'MeshCore Messaging') },
-        { id: 'settings-map', label: t('settings.map') },
-        { id: 'settings-node-display', label: t('settings.node_display') },
-        { id: 'settings-telemetry', label: t('settings.telemetry') },
-        { id: 'settings-notifications', label: t('settings.notifications_and_security') },
-        { id: 'settings-security', label: t('settings.security', 'Security') },
-        { id: 'settings-packet-monitor', label: t('settings.packet_monitor') },
-        { id: 'settings-solar', label: t('settings.solar_monitoring') },
-        ...(isAdmin ? [{ id: 'settings-remote-admin', label: t('settings.remote_admin_section', 'Remote Administration') }] : []),
-        ...(isAdmin ? [{ id: 'settings-apprise-server', label: t('settings.apprise_server_section', 'Apprise API Server') }] : []),
-        ...(isAdmin ? [{ id: 'settings-elevation', label: t('settings.elevation_section', 'Elevation / Terrain') }] : []),
-        { id: 'settings-backup', label: t('settings.system_backup', 'System Backup') },
-        ...(isAdmin ? [{ id: 'settings-channel-database', label: t('channel_database.title', 'Channel Database') }] : []),
-        ...(isAdmin ? [{ id: 'settings-scripts', label: t('settings.scripts_section', 'Scripts') }] : []),
-        // Only show Database Maintenance for SQLite - it uses SQLite-specific features like VACUUM
-        ...(databaseType === 'sqlite' ? [{ id: 'settings-maintenance', label: t('maintenance.title', 'Database Maintenance') }] : []),
-        ...(isAdmin && firmwareOtaEnabled ? [{ id: 'settings-firmware', label: t('firmware.title', 'Firmware Updates') }] : []),
-        { id: 'settings-reset-ui', label: t('settings.reset_ui_positions') },
-        ...(isAdmin ? [{ id: 'settings-analytics', label: t('settings.analytics') }] : []),
-        ...(canWriteSettings ? [{ id: 'settings-position-estimation', label: t('automation.position_estimation.title', 'Position Estimation') }] : []),
-        ...(canWriteSettings ? [{ id: 'settings-mesh-issues', label: t('automation.mesh_issues.title', 'Mesh Issues Analysis') }] : []),
-        { id: 'settings-management', label: t('settings.settings_management') },
-        { id: 'settings-danger', label: t('settings.danger_zone') },
-      ].filter(item => show(item.id))} />
+      <SectionNav
+        searchable
+        searchPlaceholder={t('config_search.filter_settings', 'Search settings...')}
+        searchLabel={t('config_search.filter_settings', 'Search settings...')}
+        noMatchesLabel={t('config_search.no_sections', 'No matching sections')}
+        items={settingsNavItems(t, {
+          mode,
+          isAdmin,
+          canWriteSettings,
+          databaseType,
+          firmwareOtaEnabled,
+        })}
+      />
       <div className="settings-content settings-multi-column">
         {show('settings-language') && <div id="settings-language" className="settings-section">
           <h3>{t('settings.language')}</h3>
@@ -1785,6 +1766,31 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
               <option value="official">{t('settings.map_pin_official')}</option>
             </select>
           </div>
+          {/* #5018: only the official circle has a colour to choose. The
+              teardrop pin is hop-coloured by construction, so offering the
+              control there would imply a choice that does not exist. */}
+          {draft.mapPinStyle === 'official' && (
+            <div className="setting-item">
+              <label htmlFor="mapPinColorMode">
+                {t('settings.map_pin_color_label', 'Official Pin Color')}
+                <span className="setting-description">
+                  {t(
+                    'settings.map_pin_color_description',
+                    'What the official pin\'s color means. Node Identity gives every node the same color the Android/iOS apps use, derived from its node ID. Hop Count colors it by hop distance instead, the same scale the MeshMonitor teardrop pin uses — pick this to keep hop distance readable at a glance.',
+                  )}
+                </span>
+              </label>
+              <select
+                id="mapPinColorMode"
+                value={draft.mapPinColorMode}
+                onChange={(e) => updateField('mapPinColorMode', e.target.value as MapPinColorMode)}
+                className="setting-input"
+              >
+                <option value="node">{t('settings.map_pin_color_node', 'Node Identity')}</option>
+                <option value="hops">{t('settings.map_pin_color_hops', 'Hop Count')}</option>
+              </select>
+            </div>
+          )}
           <div className="setting-item">
             <label htmlFor="nodeListStyle">
               {t('settings.node_list_style_label', 'Node List Style')}

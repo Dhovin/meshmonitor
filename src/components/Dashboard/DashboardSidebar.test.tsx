@@ -545,6 +545,34 @@ describe('DashboardSidebar', () => {
       fireEvent.click(screen.getByRole('button', { name: 'source.edit_mode_done' }));
       expect(queryDragHandles().length).toBe(0);
     });
+
+    // Issue #5233 — a reorder handle is only draggable under a finger if the
+    // browser is told not to claim the touch gesture for scrolling or text
+    // selection first. The Channels handle shipped without `touch-action: none`
+    // and could not be dragged on iOS at all; this one always had it, but the
+    // bare ⠿ glyph it drew was still selectable, so a long-press could raise
+    // the selection callout over it. Both now share DRAG_HANDLE_TOUCH_STYLE.
+    //
+    // `-webkit-touch-callout` is not asserted here: jsdom does not know the
+    // property and drops it on serialization, so the element cannot report it
+    // regardless of what React rendered. dragHandleStyle.test.tsx pins it on
+    // the constant instead.
+    it('gives every drag handle the styles a touch drag needs (#5233)', () => {
+      renderSidebar({ onReorderSources: vi.fn() });
+      fireEvent.click(screen.getByRole('button', { name: 'source.edit_mode' }));
+
+      const handles = Array.from(queryDragHandles()) as HTMLElement[];
+      expect(handles.length).toBe(3);
+
+      handles.forEach((handle) => {
+        expect(handle.style.touchAction).toBe('none');
+        expect(handle.style.userSelect).toBe('none');
+        expect(handle.style.getPropertyValue('-webkit-user-select')).toBe('none');
+        // Drawn as a UiIcon now, not a selectable braille character.
+        expect(handle.textContent).not.toContain('⠿');
+        expect(handle.querySelector('svg')).not.toBeNull();
+      });
+    });
   });
 
   // Issue #3356 — resizable sidebar with persisted width.
@@ -653,6 +681,110 @@ describe('DashboardSidebar', () => {
       );
       renderSidebar({ isAdmin: false });
       expect(screen.queryByTitle('source.sidebar.settings')).toBeNull();
+    });
+  });
+
+  // ── #5197: bulk "Mark all read" ─────────────────────────────────────────────
+  //
+  // Added BESIDE the #5124 visibility toggle, not in place of it. The request
+  // asked to replace that toggle on the grounds that it is duplicated in
+  // Settings; it is not — the sidebar chip is its only control and it gates the
+  // 15s poll as well as the badge. These pin the rendering rules that keep both
+  // controls usable in one header.
+  describe('mark all DMs read (#5197)', () => {
+    const markAllButton = () => screen.queryByText('source.mark_all_dms_read');
+
+    it('is hidden when nothing is unread', () => {
+      // Otherwise it would occupy header space permanently for an action that
+      // has nothing to do — and crowd the toggle next to it on a narrow screen.
+      renderSidebar({ unreadBySource: {}, onMarkAllDmsRead: vi.fn() });
+      expect(markAllButton()).not.toBeInTheDocument();
+    });
+
+    it('appears once any source has an unread DM', () => {
+      renderSidebar({
+        unreadBySource: { 'src-2': { directMessages: 3 } },
+        onMarkAllDmsRead: vi.fn(),
+      });
+      expect(markAllButton()).toBeInTheDocument();
+    });
+
+    it('is hidden for an unauthenticated viewer', () => {
+      renderSidebar({
+        isAuthenticated: false,
+        unreadBySource: { 'src-2': { directMessages: 3 } },
+        onMarkAllDmsRead: vi.fn(),
+      });
+      expect(markAllButton()).not.toBeInTheDocument();
+    });
+
+    it('is hidden when the owner supplies no handler', () => {
+      renderSidebar({ unreadBySource: { 'src-2': { directMessages: 3 } } });
+      expect(markAllButton()).not.toBeInTheDocument();
+    });
+
+    it('fires immediately below the confirm threshold', () => {
+      const onMarkAllDmsRead = vi.fn();
+      const confirmSpy = vi.spyOn(window, 'confirm');
+      renderSidebar({
+        unreadBySource: { 'src-2': { directMessages: 3 } },
+        onMarkAllDmsRead,
+      });
+
+      fireEvent.click(markAllButton()!);
+      expect(confirmSpy).not.toHaveBeenCalled();
+      expect(onMarkAllDmsRead).toHaveBeenCalledTimes(1);
+      confirmSpy.mockRestore();
+    });
+
+    it('confirms first when the total is large, and honours a cancel', () => {
+      // Read state has no undo, so clearing a big backlog by stray tap is
+      // unrecoverable. 50+ is the line; below it a prompt is just friction.
+      const onMarkAllDmsRead = vi.fn();
+      const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+      renderSidebar({
+        unreadBySource: { 'src-2': { directMessages: 30 }, 'src-3': { directMessages: 25 } },
+        onMarkAllDmsRead,
+      });
+
+      fireEvent.click(markAllButton()!);
+      expect(confirmSpy).toHaveBeenCalled();
+      expect(onMarkAllDmsRead).not.toHaveBeenCalled();
+      confirmSpy.mockRestore();
+    });
+
+    it('proceeds when a large-total confirm is accepted', () => {
+      const onMarkAllDmsRead = vi.fn();
+      const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+      renderSidebar({
+        unreadBySource: { 'src-2': { directMessages: 80 } },
+        onMarkAllDmsRead,
+      });
+
+      fireEvent.click(markAllButton()!);
+      expect(onMarkAllDmsRead).toHaveBeenCalledTimes(1);
+      confirmSpy.mockRestore();
+    });
+
+    it('is disabled while the request is in flight', () => {
+      renderSidebar({
+        unreadBySource: { 'src-2': { directMessages: 3 } },
+        onMarkAllDmsRead: vi.fn(),
+        markAllDmsReadPending: true,
+      });
+      expect(markAllButton()).toBeDisabled();
+    });
+
+    it('renders alongside the #5124 visibility toggle, not instead of it', () => {
+      // The explicit anti-regression for the "replace it" half of the request:
+      // with both handlers wired, BOTH controls must be present.
+      renderSidebar({
+        unreadBySource: { 'src-2': { directMessages: 3 } },
+        onMarkAllDmsRead: vi.fn(),
+        onToggleUnreadIndicator: vi.fn(),
+      });
+      expect(screen.getByText('settings.unread_indicator')).toBeInTheDocument();
+      expect(markAllButton()).toBeInTheDocument();
     });
   });
 

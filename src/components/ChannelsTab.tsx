@@ -8,7 +8,8 @@
 import React, { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import '../styles/messages.css';
-import BeaconOffersPanel from './beacons/BeaconOffersPanel';
+import BeaconsPanel from './beacons/BeaconsPanel';
+import { useIsMobileViewport } from '../hooks/useIsMobileViewport';
 import { Channel } from '../types/device';
 import { MeshMessage } from '../types/message';
 import { ResourceType } from '../types/permission';
@@ -21,6 +22,9 @@ import { getUtf8ByteLength, formatByteCount, isEmoji } from '../utils/text';
 import { scrollInputIntoView } from '../utils/scrollInputIntoView';
 import { applyHomoglyphOptimization } from '../utils/homoglyph';
 import { renderMessageWithLinks } from '../utils/linkRenderer';
+import MentionAutocomplete from './mentions/MentionAutocomplete';
+import { useMentionAutocomplete } from '../hooks/useMentionAutocomplete';
+import { mentionCandidatesFromNodes } from '../utils/mentionCandidates';
 import { useAutoResizeTextarea } from '../hooks/useAutoResizeTextarea';
 import HopCountDisplay from './HopCountDisplay';
 import LinkPreview from './LinkPreview';
@@ -150,7 +154,8 @@ export interface ChannelsTabProps {
   handleDeleteMessage: (message: MeshMessage) => Promise<void>;
   handleSendTapback: (emoji: string, message: MeshMessage) => void;
   handlePurgeChannelMessages: (channelId: number) => Promise<void>;
-  handleSenderClick: (nodeId: string, event: React.MouseEvent) => void;
+  /** Opens the node popup. The event anchors it; without one it centers. */
+  handleSenderClick: (nodeId: string, event?: React.MouseEvent | React.KeyboardEvent) => void;
   onSendBell?: (channel: number, text: string) => Promise<void>;
   onSendPosition?: (channel: number) => Promise<void>;
 
@@ -238,6 +243,18 @@ export default function ChannelsTab({
   // / Show-MQTT into a single kebab next to the selector on narrow screens (#3385).
   const [showChannelMenu, setShowChannelMenu] = useState(false);
 
+  // #5265: the mobile header is a single nowrap row by design (#3385) — the
+  // Beacons button (#5232) landed in it afterwards and squeezed the channel
+  // selector until its name truncated. On mobile those page-level actions move
+  // to their own short row below the header, which also lets the composer drop
+  // from two rows to one.
+  //
+  // Width-only, matching this tab's own `@media (max-width: 768px)` rules. The
+  // sibling `useIsMobileLayoutViewport` adds the short-landscape clause and is
+  // the right hook for components whose CSS carries it (#5060); this tab's does
+  // not, and the JS must not disagree with the sheet.
+  const isMobileViewport = useIsMobileViewport();
+
   const handleMuteChannel = async (channelId: number, muteUntil: number | null) => {
     await muteChannel(channelId, muteUntil);
     setShowMuteMenu(null);
@@ -254,6 +271,31 @@ export default function ChannelsTab({
   const channelMessageInputRef = useRef<HTMLTextAreaElement>(null);
 
   useAutoResizeTextarea(channelMessageInputRef, newMessage);
+
+  // #5276: `@` mention autocomplete over the nodes this source knows.
+  const mentionCandidates = useMemo(
+    () => mentionCandidatesFromNodes(nodes, currentNodeId),
+    [nodes, currentNodeId]
+  );
+  const mentions = useMentionAutocomplete({
+    value: newMessage,
+    onChange: setNewMessage,
+    textareaRef: channelMessageInputRef,
+    candidates: mentionCandidates,
+  });
+  // Resolves a mention token to the node's CURRENT name at render time, so a
+  // rename shows through in old messages.
+  const mentionRenderOptions = useMemo(() => ({
+    resolveNodeName: (nodeId: string) => {
+      const name = getNodeName(nodeId);
+      return name && name !== nodeId ? name : undefined;
+    },
+    // Pass the real event: handleSenderClick measures event.currentTarget to
+    // place the node popup next to what was clicked.
+    onMentionClick: (nodeId: string, event: React.MouseEvent | React.KeyboardEvent) =>
+      handleSenderClick(nodeId, event as React.MouseEvent),
+    selfNodeId: currentNodeId,
+  }), [getNodeName, handleSenderClick, currentNodeId]);
 
   // State for "Jump to Bottom" button
   const [showJumpToBottom, setShowJumpToBottom] = useState(false);
@@ -572,6 +614,37 @@ export default function ChannelsTab({
 
   const availableChannels = getAvailableChannels();
 
+  /**
+   * "Send alert bell" and "Send position" (#5265).
+   *
+   * These act on the SELECTED CHANNEL, like sending a message — they are not
+   * page-level settings. Keeping them in one definition and moving that
+   * definition between the composer and the mobile action row preserves the
+   * single-instance invariant the a11y tree needs.
+   */
+  const channelSendActionButtons = (
+    <>
+      <button
+        onClick={() => { void onSendBell?.(selectedChannel, newMessage); setNewMessage(''); }}
+        disabled={txDisabled}
+        className="send-btn channel-action-btn"
+        title={txDisabled ? (txDisabledTooltip ?? t('tx_disabled.control_tooltip')) : 'Send alert bell'}
+        aria-label="Send alert bell"
+      >
+        <UiIcon name="notifications" size={16} />
+      </button>
+      <button
+        onClick={() => onSendPosition?.(selectedChannel)}
+        disabled={txDisabled}
+        className="send-btn channel-action-btn"
+        title={txDisabled ? (txDisabledTooltip ?? t('tx_disabled.control_tooltip')) : 'Send position'}
+        aria-label="Send position"
+      >
+        <UiIcon name="location" size={16} />
+      </button>
+    </>
+  );
+
   return (
     <div className="tab-content channels-tab-content">
       <div className="channels-header">
@@ -744,6 +817,20 @@ export default function ChannelsTab({
               </button>
             </div>
           )}
+          {/* MeshBeacon invitations (#4723, #5232) — an offer to join a channel
+              belongs next to the channel list, but as a button with a count
+              rather than a stack of cards: beacons re-advertise on their own
+              interval, and the cards grew without bound and pushed the message
+              list off a phone screen. Renders nothing until a beacon has been
+              heard, so pre-2.8 meshes see no empty surface. */}
+          {!isMobileViewport && (
+            <BeaconsPanel
+              sourceId={sourceId}
+              channels={channels}
+              canWrite={hasPermission('nodes', 'write')}
+              nodeName={(nodeNum) => nodes.find((n) => n.nodeNum === nodeNum)?.user?.longName}
+            />
+          )}
           {!mqttReadOnly && (
             <label className="mqtt-toggle">
               <input type="checkbox" checked={showMqttMessages} onChange={e => setShowMqttMessages(e.target.checked)} />
@@ -827,6 +914,33 @@ export default function ChannelsTab({
           )}
         </div>
       </div>
+
+      {/* #5265 — mobile action row.
+          The header above is a deliberate single nowrap row (#3385): heading +
+          selector + the "⋯" kebab. Beacons (#5232) was added into it later and
+          took width from the selector until the channel name truncated. Page
+          and channel actions get their own short row here instead.
+
+          Rendered only on mobile: on desktop the header has room and these
+          controls stay where they already were, so nothing moves for anyone
+          who was not affected. */}
+      {isMobileViewport && shouldShowData() && availableChannels.length > 0 && (
+        <div className="channels-action-row">
+          <BeaconsPanel
+            sourceId={sourceId}
+            channels={channels}
+            canWrite={hasPermission('nodes', 'write')}
+            nodeName={(nodeNum) => nodes.find((n) => n.nodeNum === nodeNum)?.user?.longName}
+          />
+          {/* The row itself renders whenever there are channels, because
+              Beacons is channel-agnostic. The send actions need a channel and
+              a writable source, so they are gated separately — with no channel
+              selected the row shows Beacons alone, which is intended. */}
+          {selectedChannel !== -1 && !mqttReadOnly && (
+            <span className="channels-action-row-send">{channelSendActionButtons}</span>
+          )}
+        </div>
+      )}
 
       {shouldShowData() ? (
         availableChannels.length > 0 ? (
@@ -942,16 +1056,6 @@ export default function ChannelsTab({
                 );
               })}
             </div>
-
-            {/* MeshBeacon invitations (#4723) — an offer to join a channel
-                belongs next to the channel list. Renders nothing when no
-                beacons have been heard, so pre-2.8 meshes see no empty surface. */}
-            <BeaconOffersPanel
-              sourceId={sourceId}
-              channels={channels}
-              canWrite={hasPermission('nodes', 'write')}
-              nodeName={(nodeNum) => nodes.find((n) => n.nodeNum === nodeNum)?.user?.longName}
-            />
 
             {/* Selected Channel Messaging */}
             {selectedChannel !== -1 && (
@@ -1145,7 +1249,7 @@ export default function ChannelsTab({
                                     )}
                                     <div className="message-text-row">
                                       <div className="message-text" style={{ whiteSpace: 'pre-line' }}>
-                                        {renderMessageWithLinks(msg.text)}
+                                        {renderMessageWithLinks(msg.text, mentionRenderOptions)}
                                       </div>
                                       <div className="message-meta">
                                         <span className="message-time">
@@ -1288,18 +1392,52 @@ export default function ChannelsTab({
                       {/* Hide message input for Channel Database channels (read-only) - device channels are 0-7 */}
                       {hasPermission(`channel_${selectedChannel}` as ResourceType, 'write') && selectedChannel >= 0 && selectedChannel < CHANNEL_DB_OFFSET && (
                         <div className="message-input-container">
-                          <div className="input-with-counter">
+                          <div className="input-with-counter" style={{ position: 'relative' }}>
+                            <MentionAutocomplete
+                              id="channel-mention-list"
+                              candidates={mentions.suggestions}
+                              activeIndex={mentions.activeIndex}
+                              onHover={mentions.setActiveIndex}
+                              onSelect={mentions.select}
+                            />
                             <textarea
                               ref={channelMessageInputRef}
                               value={newMessage}
-                              onChange={e => setNewMessage(e.target.value)}
+                              onChange={e => {
+                                setNewMessage(e.target.value);
+                                mentions.handleChange(e.target.value, e.target.selectionStart);
+                              }}
+                              onSelect={e => mentions.syncFromCaret(
+                                e.currentTarget.value,
+                                e.currentTarget.selectionStart
+                              )}
+                              onBlur={mentions.close}
+                              role="combobox"
+                              aria-expanded={mentions.isOpen}
+                              aria-controls={mentions.isOpen ? 'channel-mention-list' : undefined}
+                              aria-activedescendant={mentions.activeDescendantId('channel-mention-list')}
+                              aria-autocomplete="list"
                               onFocus={scrollInputIntoView}
-                              placeholder={t('channels.send_placeholder', { name: getChannelName(selectedChannel) })}
+                              placeholder={
+                                /* #5265: the composer is one row on mobile, so
+                                   the input is ~270px and the full "Send
+                                   message to X..." wraps to a second line
+                                   inside a single-line box — the text renders
+                                   half-clipped. The short form fits, and the
+                                   channel is already named in the selector
+                                   directly above. */
+                                isMobileViewport
+                                  ? t('channels.send_placeholder_short', { name: getChannelName(selectedChannel) })
+                                  : t('channels.send_placeholder', { name: getChannelName(selectedChannel) })
+                              }
                               className="message-input"
                               rows={1}
                               disabled={txDisabled}
                               title={txDisabled ? (txDisabledTooltip ?? t('tx_disabled.control_tooltip')) : undefined}
                               onKeyDown={e => {
+                                // The open suggestion list claims Enter/Tab/arrows
+                                // first, or picking a node would send instead.
+                                if (mentions.handleKeyDown(e)) return;
                                 if (
                                   txDisabled ||
                                   !(
@@ -1326,24 +1464,13 @@ export default function ChannelsTab({
                             value={newMessage}
                             onChange={setNewMessage}
                           />
-                          <button
-                            onClick={() => { void onSendBell?.(selectedChannel, newMessage); setNewMessage(''); }}
-                            disabled={txDisabled}
-                            className="send-btn channel-action-btn"
-                            title={txDisabled ? (txDisabledTooltip ?? t('tx_disabled.control_tooltip')) : 'Send alert bell'}
-                            aria-label="Send alert bell"
-                          >
-                            <UiIcon name="notifications" size={16} />
-                          </button>
-                          <button
-                            onClick={() => onSendPosition?.(selectedChannel)}
-                            disabled={txDisabled}
-                            className="send-btn channel-action-btn"
-                            title={txDisabled ? (txDisabledTooltip ?? t('tx_disabled.control_tooltip')) : 'Send position'}
-                            aria-label="Send position"
-                          >
-                            <UiIcon name="location" size={16} />
-                          </button>
+                          {/* #5265: on mobile these live in the action row under
+                              the header instead, so the composer is one row.
+                              Rendered in exactly one place either way — two
+                              copies would mean two elements sharing an
+                              aria-label, which is worse than the layout it
+                              would fix. */}
+                          {!isMobileViewport && channelSendActionButtons}
                           <button
                             onClick={() => handleSendMessage(selectedChannel)}
                             disabled={!newMessage.trim() || txDisabled}
@@ -1651,7 +1778,7 @@ export default function ChannelsTab({
           nodes={mappedNodes}
           onNodeClick={(nodeId) => {
             setDetailsState(null);
-            handleSenderClick(nodeId, { stopPropagation: () => {} } as React.MouseEvent);
+            handleSenderClick(nodeId);
           }}
           onClose={() => setDetailsState(null)}
         />

@@ -44,7 +44,7 @@ import {
 } from '../../hooks/useDashboardData';
 import { getSourceColor, resolveSourceColor } from '../../utils/sourceColors';
 import { getOwnNodePositions } from '../../utils/ownNodePositions';
-import { nodePassesTransportFilter } from '../../utils/nodeTransport';
+import { nodePassesTransportFilter, isMqttOnlySourceType } from '../../utils/nodeTransport';
 import {
   hopTransportClass,
   segmentPassesTransportFilter,
@@ -208,6 +208,7 @@ export default function DashboardMap({
 }: DashboardMapProps) {
   const {
     mapPinStyle,
+    mapPinColorMode,
     setMapTileset,
     cartoApiKey,
     overlayColors,
@@ -239,6 +240,14 @@ export default function DashboardMap({
   const isUnified = sourceId === UNIFIED_SOURCE_ID;
   const polarSourceIds = isUnified ? allSourceIds : sourceId ? [sourceId] : [];
   const sourceStatuses = useSourceStatuses(polarSourceIds);
+  // mqtt_bridge/mqtt_broker sources have no RF path — every node on them
+  // arrived over MQTT, so the RF/UDP/MQTT toggles (and their saved
+  // preferences) have no meaning and can only blank the map. Resolved from
+  // `allSources` (not SourceContext — the Dashboard route renders outside any
+  // SourceProvider, so `useSource()` would never see the selected source's
+  // type here). Never true on the Unified map, which mixes sources by design.
+  const selectedDashboardSource = allSources.find((s: DashboardSource) => s.id === sourceId);
+  const isMqttOnlySource = !isUnified && isMqttOnlySourceType(selectedDashboardSource?.type);
 
   // Tile selector + legend overlays — hidden by default, toggled from the Map
   // Features panel. Persisted under the same localStorage keys the NodesTab map
@@ -290,11 +299,11 @@ export default function DashboardMap({
     setShowRoute,
     showAccuracyRegions,
     setShowAccuracyRegions,
-    showRfNodes,
+    showRfNodes: rawShowRfNodes,
     setShowRfNodes,
-    showUdpNodes,
+    showUdpNodes: rawShowUdpNodes,
     setShowUdpNodes,
-    showMqttNodes,
+    showMqttNodes: rawShowMqttNodes,
     setShowMqttNodes,
     showNeighborInfo,
     setShowNeighborInfo,
@@ -306,7 +315,12 @@ export default function DashboardMap({
     setShowPolarGrid,
     mapMaxAgeHours,
     setMapMaxAgeHours,
+    spreadNodes,
+    setSpreadNodes,
   } = useMapContext();
+  const showRfNodes = isMqttOnlySource ? true : rawShowRfNodes;
+  const showUdpNodes = isMqttOnlySource ? true : rawShowUdpNodes;
+  const showMqttNodes = isMqttOnlySource ? true : rawShowMqttNodes;
 
   // Effective map age cap from the Map Features age slider (#3322), clamped to
   // [1, maxNodeAgeHours]. null = follow the setting, so default is unchanged.
@@ -391,10 +405,14 @@ export default function DashboardMap({
         bits: node.positionPrecisionBits,
         isOverride: node.positionIsOverride,
       })),
+      // #5177: "Spread Nodes" off pins every marker on its reported point.
+      { enabled: spreadNodes },
     ).map(({ item: node, latLng }) => ({ node, pos: { lat: latLng[0], lng: latLng[1] } }));
 
     return { nodesWithPosition: positionedNodes, nowMs: referenceNowMs, cutoffTime: ageCutoffTime };
-  }, [nodes, effectiveMaxAge, effectiveInfraMaxAge, infraNever, showRfNodes, showUdpNodes, showMqttNodes]);
+  // `spreadNodes` (#5177) changes every resolved position without changing any
+  // node, so it has to be a dependency or toggling it leaves the markers put.
+  }, [nodes, effectiveMaxAge, effectiveInfraMaxAge, infraNever, showRfNodes, showUdpNodes, showMqttNodes, spreadNodes]);
 
   // Array form of node positions for MapBoundsUpdater (fit bounds).
   const nodePositions: [number, number][] = nodesWithPosition.map((e) => [e.pos.lat, e.pos.lng]);
@@ -684,7 +702,7 @@ export default function DashboardMap({
     return {
       key: markerKey,
       position: [pos.lat, pos.lng],
-      iconSig: `${hops}|${shortName ?? ''}|${isRouter ? 1 : 0}|${roleCategory}|${node.isUnmessagable ? 1 : 0}|${mapPinStyle}`,
+      iconSig: `${hops}|${shortName ?? ''}|${isRouter ? 1 : 0}|${roleCategory}|${node.isUnmessagable ? 1 : 0}|${mapPinStyle}|${mapPinColorMode}`,
       buildIcon: () =>
         createNodeIcon({
           variant: 'meshtastic',
@@ -696,6 +714,7 @@ export default function DashboardMap({
           shortName,
           showLabel: true,
           pinStyle: mapPinStyle,
+          colorMode: mapPinColorMode,
           nodeNum: Number.isFinite(Number(node.nodeNum)) ? Number(node.nodeNum) : undefined,
         }),
       opacity: ageOpacity,
@@ -1039,30 +1058,55 @@ export default function DashboardMap({
             />
             <span>Show Accuracy Regions</span>
           </label>
-          <label className="map-control-item">
+          {/* #5177: obscured low-precision nodes are drawn at a stable offset
+              inside their accuracy cell so same-cell markers don't stack
+              (#4016/#4155). A reporter compared a pin to the node's reported
+              GPS on OpenStreetMap and read that as the map lying, so it's now
+              a choice. Off = every node sits exactly where it said it was. */}
+          <label
+            className="map-control-item"
+            title="Offset low-precision nodes within their accuracy area so same-cell markers do not stack. Turn off to pin every node at exactly the position it reported."
+          >
             <input
               type="checkbox"
-              checked={showRfNodes}
-              onChange={(e) => setShowRfNodes(e.target.checked)}
+              checked={spreadNodes}
+              onChange={(e) => setSpreadNodes(e.target.checked)}
             />
-            <span>Show RF</span>
+            <span>Spread Nodes</span>
           </label>
-          <label className="map-control-item">
-            <input
-              type="checkbox"
-              checked={showUdpNodes}
-              onChange={(e) => setShowUdpNodes(e.target.checked)}
-            />
-            <span>Show UDP</span>
-          </label>
-          <label className="map-control-item">
-            <input
-              type="checkbox"
-              checked={showMqttNodes}
-              onChange={(e) => setShowMqttNodes(e.target.checked)}
-            />
-            <span>Show MQTT</span>
-          </label>
+          {/* RF/UDP/MQTT transport toggles have no meaning on an MQTT-only
+              source (mqtt_bridge/mqtt_broker) — every node there arrived
+              over MQTT, so the filter is skipped outright above and the
+              controls are hidden rather than offering a toggle that can
+              only blank the map (#5283 review). */}
+          {!isMqttOnlySource && (
+            <>
+              <label className="map-control-item">
+                <input
+                  type="checkbox"
+                  checked={showRfNodes}
+                  onChange={(e) => setShowRfNodes(e.target.checked)}
+                />
+                <span>Show RF</span>
+              </label>
+              <label className="map-control-item">
+                <input
+                  type="checkbox"
+                  checked={showUdpNodes}
+                  onChange={(e) => setShowUdpNodes(e.target.checked)}
+                />
+                <span>Show UDP</span>
+              </label>
+              <label className="map-control-item">
+                <input
+                  type="checkbox"
+                  checked={showMqttNodes}
+                  onChange={(e) => setShowMqttNodes(e.target.checked)}
+                />
+                <span>Show MQTT</span>
+              </label>
+            </>
+          )}
           <label className="map-control-item" title={unavailableIn3DTitle}>
             <input
               type="checkbox"

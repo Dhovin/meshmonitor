@@ -47,6 +47,9 @@ import {
 import {
   pushSubscriptionsSqlite, pushSubscriptionsPostgres, pushSubscriptionsMysql,
   userNotificationPreferencesSqlite, userNotificationPreferencesPostgres, userNotificationPreferencesMysql,
+  waypointNotificationsSqlite,
+  waypointNotificationsPostgres,
+  waypointNotificationsMysql,
   readMessagesSqlite, readMessagesPostgres, readMessagesMysql,
 } from './schema/notifications.js';
 
@@ -152,6 +155,9 @@ import {
 import {
   privacyDocumentsSqlite, privacyDocumentsPostgres, privacyDocumentsMysql,
 } from './schema/privacyDocuments.js';
+import {
+  solarNodeOverridesSqlite, solarNodeOverridesPostgres, solarNodeOverridesMysql,
+} from './schema/solarNodeOverrides.js';
 
 // Waypoints table
 import {
@@ -242,6 +248,8 @@ export interface ActiveSchema {
   // Notification tables
   pushSubscriptions: any;
   userNotificationPreferences: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #4750: matches every sibling in this map; typing the three Drizzle dialects here is Phase 6 burn-down work, not this feature's.
+  waypointNotifications: any;
   readMessages: any;
 
   // Per-user conversation read watermarks (issue #4607)
@@ -317,6 +325,8 @@ export interface ActiveSchema {
   // Operator-hosted privacy documents (global — no sourceId) (#5156)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matches ActiveSchema per-dialect table pattern
   privacyDocuments: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #3195 dialect-union table slot, same shape as every sibling here
+  solarNodeOverrides: any;
 
   // Waypoints
   waypoints: any;
@@ -395,6 +405,7 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     apiTokens: apiTokensSqlite,
     pushSubscriptions: pushSubscriptionsSqlite,
     userNotificationPreferences: userNotificationPreferencesSqlite,
+    waypointNotifications: waypointNotificationsSqlite,
     readMessages: readMessagesSqlite,
     conversationReadState: conversationReadStateSqlite,
     packetLog: packetLogSqlite,
@@ -435,6 +446,7 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     automationHomeAnchors: automationHomeAnchorsSqlite,
     meshcoreSavedRegions: meshcoreSavedRegionsSqlite,
     privacyDocuments: privacyDocumentsSqlite,
+    solarNodeOverrides: solarNodeOverridesSqlite,
     waypoints: waypointsSqlite,
     sources: sourcesSqlite,
     estimatedPositions: estimatedPositionsSqlite,
@@ -469,6 +481,7 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     apiTokens: apiTokensPostgres,
     pushSubscriptions: pushSubscriptionsPostgres,
     userNotificationPreferences: userNotificationPreferencesPostgres,
+    waypointNotifications: waypointNotificationsPostgres,
     readMessages: readMessagesPostgres,
     conversationReadState: conversationReadStatePostgres,
     packetLog: packetLogPostgres,
@@ -509,6 +522,7 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     automationHomeAnchors: automationHomeAnchorsPostgres,
     meshcoreSavedRegions: meshcoreSavedRegionsPostgres,
     privacyDocuments: privacyDocumentsPostgres,
+    solarNodeOverrides: solarNodeOverridesPostgres,
     waypoints: waypointsPostgres,
     sources: sourcesPostgres,
     estimatedPositions: estimatedPositionsPostgres,
@@ -543,6 +557,7 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     apiTokens: apiTokensMysql,
     pushSubscriptions: pushSubscriptionsMysql,
     userNotificationPreferences: userNotificationPreferencesMysql,
+    waypointNotifications: waypointNotificationsMysql,
     readMessages: readMessagesMysql,
     conversationReadState: conversationReadStateMysql,
     packetLog: packetLogMysql,
@@ -583,6 +598,7 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     automationHomeAnchors: automationHomeAnchorsMysql,
     meshcoreSavedRegions: meshcoreSavedRegionsMysql,
     privacyDocuments: privacyDocumentsMysql,
+    solarNodeOverrides: solarNodeOverridesMysql,
     waypoints: waypointsMysql,
     sources: sourcesMysql,
     estimatedPositions: estimatedPositionsMysql,

@@ -5,7 +5,8 @@
  * is a very large component wired into many contexts and child sections; this
  * suite mocks every dependency that isn't the elevation section under test so
  * it can render in isolation. `mode="global"` narrows the rendered sections to
- * `GLOBAL_SECTIONS` (elevation is global, not per-source) which keeps the
+ * `GLOBAL_SETTINGS_SECTIONS` (elevation is global, not per-source, see
+ * `search/configSections.ts`) which keeps the
  * mocked-child surface as small as possible; `hasPermission` is stubbed to
  * return false so the (also-global, canWriteSettings-gated) Position
  * Estimation section doesn't need its own mock.
@@ -271,6 +272,7 @@ const baseProps = {
   mapTilesetLight: 'osm' as const,
   mapTilesetDark: 'osm' as const,
   mapPinStyle: 'meshmonitor' as const,
+  mapPinColorMode: 'node' as const,
   nodeListStyle: 'monochrome' as const,
   iconStyle: 'lucide' as const,
   theme: 'catppuccin' as const,
@@ -298,6 +300,7 @@ const baseProps = {
   onDateFormatChange: noop,
   onMapTilesetsChange: noop,
   onMapPinStyleChange: noop,
+  onMapPinColorModeChange: noop,
   onNodeListStyleChange: noop,
   onIconStyleChange: noop,
   onLanguageChange: noop,

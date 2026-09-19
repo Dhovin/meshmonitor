@@ -14,6 +14,7 @@ import { SaveBarProvider, SaveBarGroup } from '../contexts/SaveBarContext';
 import { ToastProvider } from '../components/ToastContainer';
 import { SaveBar } from '../components/SaveBar';
 import SettingsTab from '../components/SettingsTab';
+import ConfigSearchHost from '../components/search/ConfigSearchHost';
 import { appBasename } from '../init';
 import '../styles/settings.css';
 
@@ -37,6 +38,7 @@ function GlobalSettingsInner() {
     mapTilesetLight,
     mapTilesetDark,
     mapPinStyle,
+    mapPinColorMode,
     nodeListStyle,
     iconStyle,
     theme,
@@ -61,6 +63,7 @@ function GlobalSettingsInner() {
     setDateFormat,
     setMapTilesets,
     setMapPinStyle,
+    setMapPinColorMode,
     setNodeListStyle,
     setIconStyle,
     setLanguage,
@@ -106,6 +109,7 @@ function GlobalSettingsInner() {
         mapTilesetLight={mapTilesetLight}
         mapTilesetDark={mapTilesetDark}
         mapPinStyle={mapPinStyle}
+        mapPinColorMode={mapPinColorMode}
         nodeListStyle={nodeListStyle}
         iconStyle={iconStyle}
         theme={theme}
@@ -133,6 +137,7 @@ function GlobalSettingsInner() {
         onDateFormatChange={setDateFormat}
         onMapTilesetsChange={setMapTilesets}
         onMapPinStyleChange={setMapPinStyle}
+        onMapPinColorModeChange={setMapPinColorMode}
         onNodeListStyleChange={setNodeListStyle}
         onIconStyleChange={setIconStyle}
         onLanguageChange={setLanguage}
@@ -154,6 +159,12 @@ export default function GlobalSettingsPage() {
         <ToastProvider>
           <SaveBarProvider>
             <GlobalSettingsInner />
+            {/* Cross-page configuration search (#5182). No SourceProvider here,
+                so useSource() reports no source and the palette offers only the
+                global settings sections — which is the right answer: with
+                several sources configured there is no "the" source to send a
+                per-source deep link to. */}
+            <ConfigSearchHost baseUrl={appBasename} />
             <SaveBar />
           </SaveBarProvider>
         </ToastProvider>
