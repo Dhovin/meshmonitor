@@ -1,9 +1,9 @@
 import { createRequire } from 'module';
 
 const require = createRequire(import.meta.url);
-let RE2Constructor: any;
+let RE2Constructor: RegExpConstructor;
 try {
-  RE2Constructor = require('re2');
+  RE2Constructor = require('re2') as unknown as RegExpConstructor;
 } catch {
   RE2Constructor = RegExp;
 }

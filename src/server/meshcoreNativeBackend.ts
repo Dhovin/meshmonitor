@@ -2265,7 +2265,7 @@ export class MeshCoreNativeBackend extends EventEmitter {
         const manufParts = rawManuf.split('\u0000').filter((s) => s.length > 0);
         const model = manufParts[0] ?? '';
         const verString = info?.firmwareVersion ?? manufParts[1];
-        const res: Record<string, any> = {
+        const res: Record<string, unknown> = {
           'fw ver': info?.firmwareVer,
           fw_build: info?.firmware_build_date,
           model,
@@ -2398,12 +2398,20 @@ export class MeshCoreNativeBackend extends EventEmitter {
         const count = typeof params.count === 'number' ? params.count : 10;
         const offset = typeof params.offset === 'number' ? params.offset : 0;
         const orderBy = typeof params.order_by === 'number' ? params.order_by : 0;
-        const result: any = await this.runExclusiveRadioOp(
+        const result = await this.runExclusiveRadioOp<{
+          totalNeighboursCount?: number;
+          neighbours?: Array<{
+            publicKeyPrefix: Uint8Array;
+            heardSecondsAgo: number;
+            snr?: number;
+          }>;
+        }>(
           () => c.getNeighbours(publicKey, count, offset, orderBy, 8, 15000),
+          'get_neighbours',
         );
         return {
           total: result.totalNeighboursCount,
-          neighbours: (result.neighbours ?? []).map((n: any) => ({
+          neighbours: (result.neighbours ?? []).map((n) => ({
             public_key_prefix: bytesToHex(n.publicKeyPrefix),
             heard_seconds_ago: n.heardSecondsAgo,
             snr: n.snr,

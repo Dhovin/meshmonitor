@@ -745,7 +745,9 @@ appriseRouter.post('/configure', requireAdmin(), async (req: Request, res: Respo
     ];
 
     const invalidUrls: string[] = [];
-    const normalizedInputUrls = Array.isArray(urls) ? urls.map((u: any) => typeof u === 'string' ? normalizeAppriseUrl(u) : u) : [];
+    const normalizedInputUrls: string[] = Array.isArray(urls)
+      ? urls.map((u: unknown) => (typeof u === 'string' ? normalizeAppriseUrl(u) : String(u)))
+      : [];
     const validUrls = normalizedInputUrls.filter((url: string) => {
       if (typeof url !== 'string' || !url.trim()) {
         invalidUrls.push(url);
