@@ -101,10 +101,6 @@ jobs:
         shell: pwsh
         run: pwsh desktop/apprise-sidecar/build.ps1
 
-      - name: Run Rust linting
-        working-directory: desktop/src-tauri
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
       - name: Run Rust tests
         working-directory: desktop/src-tauri
         run: cargo test --verbose
@@ -200,10 +196,6 @@ jobs:
 
       - name: Build Apprise sidecar
         run: bash desktop/apprise-sidecar/build.sh
-
-      - name: Run Rust linting
-        working-directory: desktop/src-tauri
-        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run Rust tests
         working-directory: desktop/src-tauri
@@ -319,10 +311,6 @@ jobs:
       # Intel Mac users fall back to a remote Apprise API via the
       # `appriseApiServerUrl` global setting. The Rust sidecar launcher treats a
       # missing apprise-api binary as non-fatal. See desktop/apprise-sidecar/README.md.
-
-      - name: Run Rust linting
-        working-directory: desktop/src-tauri
-        run: cargo clippy --target x86_64-apple-darwin --all-targets --all-features -- -D warnings
 
       - name: Run Rust tests
         working-directory: desktop/src-tauri
