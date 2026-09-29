@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to build (e.g., 2.21.2-test)'
+        description: 'Version to build (e.g., 4.16.2)'
         required: true
-        default: 'test'
+        default: '4.16.2'
 
 env:
   REGISTRY: ghcr.io
@@ -257,7 +257,7 @@ jobs:
       - name: Check if release is a pre-release
         id: check_prerelease
         run: |
-          if [[ "${{ github.event.release.prerelease }}" == "true" || "${GITHUB_REF}" == *"-rc"* || "${GITHUB_REF}" == *"-beta"* || "${GITHUB_REF}" == *"-alpha"* ]]; then
+          if [[ "${{ github.event.release.prerelease }}" == "true" || "${GITHUB_REF}" == *"-rc"* || "${GITHUB_REF}" == *"-beta"* || "${GITHUB_REF}" == *"-alpha"* || "${{ github.event.inputs.version }}" == *"-rc"* || "${{ github.event.inputs.version }}" == *"-beta"* || "${{ github.event.inputs.version }}" == *"-alpha"* ]]; then
             echo "is_prerelease=true" >> $GITHUB_OUTPUT
           else
             echo "is_prerelease=false" >> $GITHUB_OUTPUT
@@ -286,21 +286,21 @@ jobs:
             ${{ env.REGISTRY }}/${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-armv7
 
       - name: Create and push manifest for minor version tag
-        if: (github.event_name == 'release' || github.event_name == 'push') && steps.check_prerelease.outputs.is_prerelease == 'false'
+        if: (github.event_name == 'release' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.check_prerelease.outputs.is_prerelease == 'false'
         run: |
           docker buildx imagetools create -t ${{ env.REGISTRY }}/${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.minor }} \
             ${{ env.REGISTRY }}/${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-main \
             ${{ env.REGISTRY }}/${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-armv7
 
       - name: Create and push manifest for major version tag
-        if: (github.event_name == 'release' || github.event_name == 'push') && steps.check_prerelease.outputs.is_prerelease == 'false'
+        if: (github.event_name == 'release' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.check_prerelease.outputs.is_prerelease == 'false'
         run: |
           docker buildx imagetools create -t ${{ env.REGISTRY }}/${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.major }} \
             ${{ env.REGISTRY }}/${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-main \
             ${{ env.REGISTRY }}/${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-armv7
 
       - name: Create and push manifest for latest tag (stable release only)
-        if: (github.event_name == 'release' || github.event_name == 'push') && steps.check_prerelease.outputs.is_prerelease == 'false'
+        if: (github.event_name == 'release' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && steps.check_prerelease.outputs.is_prerelease == 'false'
         run: |
           docker buildx imagetools create -t ${{ env.REGISTRY }}/${{ steps.meta.outputs.image }}:latest \
             ${{ env.REGISTRY }}/${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-main \
@@ -314,7 +314,7 @@ jobs:
       # so promoting it to `:dev` too keeps the fast track a superset of the
       # stable track and never moves `:dev` backwards.
       - name: Create and push manifest for dev tag (every release, incl. stable)
-        if: github.event_name == 'release' || github.event_name == 'push'
+        if: github.event_name == 'release' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         run: |
           docker buildx imagetools create -t ${{ env.REGISTRY }}/${{ steps.meta.outputs.image }}:dev \
             ${{ env.REGISTRY }}/${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}-main \
