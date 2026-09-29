@@ -200,10 +200,21 @@ export class MeshCoreRoomSyncScheduler {
       // refused every time. Switch auto-sync off now rather than re-floods
       // that only add rejected-login entries to the operator's log.
       const disable = outcome === 'rejected';
+      if (outcome === 'not_on_device') {
+        logger.warn(
+          `[RoomSyncScheduler] Room ${shortKey} is not in the radio's contact list — login not sent (#5349).`,
+        );
+      }
       const failures = await databaseService.meshcore.recordRoomSyncFailure(
         sourceId,
         target.publicKey,
-        outcome,
+        // The failure column only knows rejected / no_reply. "Not on the
+        // device" still counts towards auto-disable so it cannot retry for
+        // ever (#5036), recorded as no_reply.
+        // `cancelled` needs an AbortSignal, which the scheduler never passes
+        // (#5400); should one appear, it still counts, so it cannot dodge the
+        // #5036 threshold.
+        outcome === 'not_on_device' || outcome === 'cancelled' ? 'no_reply' : outcome,
         { disable },
       );
 

@@ -16,7 +16,9 @@
 import { describe, it, expect } from 'vitest';
 import {
   hopTransportClass,
+  reachTransportClass,
   segmentPassesTransportFilter,
+  segmentTransportMechanism,
   tracerouteTransportClass,
   transportFilterIsInert,
   type NodeTransportClass,
@@ -104,6 +106,79 @@ describe('segmentPassesTransportFilter', () => {
   it('accepts a Set, which is how the aggregated layer accumulates classes', () => {
     expect(segmentPassesTransportFilter(new Set<NodeTransportClass>(['mqtt']), RF_ONLY)).toBe(false);
     expect(segmentPassesTransportFilter(new Set<NodeTransportClass>(['mqtt', 'rf']), RF_ONLY)).toBe(true);
+  });
+});
+
+describe('reachTransportClass', () => {
+  const base = { fromNodeNum: 1, toNodeNum: 2 };
+
+  it('maps the record mechanism when no forward hop is unknown', () => {
+    expect(reachTransportClass({ ...base, transportMechanism: null, route: '[]', snrTowards: '[]' })).toBe('rf');
+    expect(reachTransportClass({ ...base, transportMechanism: TX_MQTT, route: '[]', snrTowards: '[]' })).toBe('mqtt');
+    expect(reachTransportClass({ ...base, transportMechanism: TX_MULTICAST_UDP, route: '[]', snrTowards: '[]' })).toBe('udp');
+    expect(reachTransportClass({ ...base, transportMechanism: TX_INTERNAL, route: '[]', snrTowards: '[]' })).toBe('rf');
+    expect(reachTransportClass({ ...base, transportMechanism: TX_API, route: '[]', snrTowards: '[]' })).toBe('rf');
+  });
+
+  it('an RF record with a forward sentinel reads mqtt — the sentinel wins', () => {
+    // route has one intermediate hop; snrTowards has a real sample for it
+    // and a sentinel (-128 raw / 4 = -32) arriving at the endpoint.
+    expect(reachTransportClass({
+      ...base, transportMechanism: TX_LORA, route: '[10]', snrTowards: '[40,-128]',
+    })).toBe('mqtt');
+  });
+
+  it('an empty route with a sentinel-only snrTowards still reads mqtt', () => {
+    expect(reachTransportClass({
+      ...base, transportMechanism: TX_LORA, route: '[]', snrTowards: '[-128]',
+    })).toBe('mqtt');
+  });
+
+  it('never sees a return-leg sentinel — the type has no routeBack/snrBack fields', () => {
+    // `hops` (route.length) does not count the return leg, so
+    // ReachTransportInput deliberately has no routeBack/snrBack — a sentinel
+    // that exists only there cannot reach this classifier at all.
+    expect(reachTransportClass({
+      ...base, transportMechanism: TX_LORA, route: '[10]', snrTowards: '[40,60]',
+    })).toBe('rf');
+  });
+
+  it('falls back to the record class when snrTowards is empty or absent', () => {
+    expect(reachTransportClass({ ...base, transportMechanism: TX_LORA, route: '[10]', snrTowards: '[]' })).toBe('rf');
+    expect(reachTransportClass({ ...base, transportMechanism: TX_LORA, route: '[10]', snrTowards: null })).toBe('rf');
+    expect(reachTransportClass({ ...base, transportMechanism: TX_MQTT, route: '[10]', snrTowards: undefined })).toBe('mqtt');
+  });
+
+  it('a UDP record with a forward sentinel still reads mqtt — sentinel wins', () => {
+    expect(reachTransportClass({
+      ...base, transportMechanism: TX_MULTICAST_UDP, route: '[]', snrTowards: '[-128]',
+    })).toBe('mqtt');
+  });
+});
+
+describe('segmentTransportMechanism', () => {
+  it('a sentinel raw arrival SNR (-128) stores MQTT (5), regardless of the record mechanism', () => {
+    expect(segmentTransportMechanism(TX_LORA, -128)).toBe(TX_MQTT);
+    expect(segmentTransportMechanism(TX_MULTICAST_UDP, -128)).toBe(TX_MQTT);
+    expect(segmentTransportMechanism(null, -128)).toBe(TX_MQTT);
+  });
+
+  it('a normal raw arrival SNR passes the record mechanism through', () => {
+    expect(segmentTransportMechanism(TX_LORA, 40)).toBe(TX_LORA);
+    expect(segmentTransportMechanism(TX_MULTICAST_UDP, 160)).toBe(TX_MULTICAST_UDP);
+  });
+
+  it('an undefined raw arrival SNR (no sample) passes the record mechanism through', () => {
+    expect(segmentTransportMechanism(TX_LORA, undefined)).toBe(TX_LORA);
+  });
+
+  it('a NULL record mechanism with no sentinel stays NULL (reads as RF)', () => {
+    expect(segmentTransportMechanism(null, 40)).toBeNull();
+    expect(segmentTransportMechanism(undefined, 40)).toBeNull();
+  });
+
+  it('a UDP record with a sentinel arrival SNR still stores MQTT — sentinel wins', () => {
+    expect(segmentTransportMechanism(TX_MULTICAST_UDP, -128)).toBe(TX_MQTT);
   });
 });
 

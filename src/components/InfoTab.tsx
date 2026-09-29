@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import NetworkSurveyPanel from './survey/NetworkSurveyPanel';
 import { UiIcon } from './icons';
@@ -10,9 +10,9 @@ import { TimeFormat, DateFormat } from '../contexts/SettingsContext';
 import { formatDateTime } from '../utils/datetime';
 import TelemetryGraphs from './TelemetryGraphs';
 import PacketRateGraphs from './PacketRateGraphs';
+import TransportSeriesGraphs from './TransportSeriesGraphs';
 import { version } from '../../package.json';
-import apiService from '../services/api';
-import { formatDistance } from '../utils/distance';
+import apiService, { type MessageCounts, type RouteSegmentRecords, type RouteSegmentView } from '../services/api';
 import { logger } from '../utils/logger';
 import { useToast } from './ToastContainer';
 import { getDeviceRoleName } from '../utils/deviceRole';
@@ -21,20 +21,16 @@ import { getPacketDistributionStats } from '../services/packetApi';
 import { PacketDistributionStats } from '../types/packet';
 import PacketStatsChart, { ChartDataEntry, DISTRIBUTION_COLORS } from './PacketStatsChart';
 import { useSource } from '../contexts/SourceContext';
+import { useAuth } from '../contexts/AuthContext';
 import { useDashboardSources } from '../hooks/useDashboardData';
 import { getSourceEndpointLabel } from '../utils/sourceEndpoint';
+import TransportBreakdown from './TransportBreakdown';
+import RouteSegmentRecord from './RouteSegmentRecord';
+import DeviceCounterNote from './DeviceCounterNote';
+import { countNodesByTransport, transportCutoffSec, isMqttOnlySourceType, type NodeTransportClass } from '../utils/nodeTransport';
 
-interface RouteSegment {
-  id: number;
-  fromNodeNum: number;
-  toNodeNum: number;
-  fromNodeId: string;
-  toNodeId: string;
-  fromNodeName: string;
-  toNodeName: string;
-  distanceKm: number;
-  timestamp: number;
-}
+const TRANSPORT_FILTER_OPTIONS = ['all', 'rf', 'udp', 'mqtt'] as const;
+const ROUTE_SEGMENT_TRANSPORT_ORDER: NodeTransportClass[] = ['rf', 'udp', 'mqtt'];
 
 interface InfoTabProps {
   connectionStatus: ConnectionStatus;
@@ -54,13 +50,15 @@ interface InfoTabProps {
   timeFormat?: TimeFormat;
   dateFormat?: DateFormat;
   isAuthenticated?: boolean;
+  /** Active-window cutoff for the transport breakdown decay (#5101), from `useSettings()`. */
+  maxNodeAgeHours?: number;
 }
 
 const InfoTab: React.FC<InfoTabProps> = React.memo(({
   connectionStatus,
   nodeAddress,
   deviceInfo,
-  deviceConfig,
+  deviceConfig: deviceConfigProp,
   nodes,
   channels,
   messages,
@@ -73,20 +71,33 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
   distanceUnit = 'km',
   timeFormat = '24',
   dateFormat = 'MM/DD/YYYY',
-  isAuthenticated = false
+  isAuthenticated = false,
+  maxNodeAgeHours
 }) => {
   const { t } = useTranslation();
   const { showToast } = useToast();
-  const { sourceId: activeSourceId } = useSource();
+  const { sourceId: activeSourceId, sourceType } = useSource();
+  const { hasPermission } = useAuth();
+  const canReadTraceroute = hasPermission('traceroute', 'read');
+  const canWriteTraceroute = hasPermission('traceroute', 'write');
+  const isMqttOnlySource = isMqttOnlySourceType(sourceType);
+  const showTransport = !isMqttOnlySource;
+  // An MQTT broker/bridge source has no local node, so it has no device
+  // identity or config of its own. Never render one for it, even if a
+  // stale or misrouted payload carries another source's (#5367).
+  const deviceConfig = isMqttOnlySource ? null : deviceConfigProp;
   const { data: dashboardSources = [] } = useDashboardSources();
   const activeSource = activeSourceId
     ? dashboardSources.find((s) => s.id === activeSourceId)
     : undefined;
-  const displayNodeAddress = getSourceEndpointLabel(activeSource) ?? nodeAddress;
-  const [longestActiveSegment, setLongestActiveSegment] = useState<RouteSegment | null>(null);
-  const [recordHolderSegment, setRecordHolderSegment] = useState<RouteSegment | null>(null);
+  // `nodeAddress` is the server's Meshtastic node IP (the env default when the
+  // source row has no host). An MQTT-only source has no node, so only show
+  // an address its own config supplies (#5367).
+  const displayNodeAddress = getSourceEndpointLabel(activeSource) ?? (isMqttOnlySource ? null : nodeAddress);
+  const [longestActiveSegment, setLongestActiveSegment] = useState<RouteSegmentRecords | null>(null);
+  const [recordHolderSegment, setRecordHolderSegment] = useState<RouteSegmentRecords | null>(null);
   const [loadingSegments, setLoadingSegments] = useState(false);
-  const [showConfirmDialog, setShowConfirmDialog] = useState(false);
+  const [clearTarget, setClearTarget] = useState<NodeTransportClass | 'all' | null>(null);
   const [virtualNodeStatus, setVirtualNodeStatus] = useState<any>(null);
   const [loadingVirtualNode, setLoadingVirtualNode] = useState(false);
   const [serverInfo, setServerInfo] = useState<any>(null);
@@ -97,10 +108,17 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
   const [showPrivateKey, setShowPrivateKey] = useState(false);
   const [packetDistribution, setPacketDistribution] = useState<PacketDistributionStats | null>(null);
   const [distributionTimeRange, setDistributionTimeRange] = useState<'hour' | '24h' | 'all'>('24h');
+  const [distributionTransport, setDistributionTransport] = useState<'all' | NodeTransportClass>('all');
   const [loadingDistribution, setLoadingDistribution] = useState(false);
   const [selectedPortnum, setSelectedPortnum] = useState<number | null>(4); // Default to NODEINFO_APP
   const [portnumNodeDistribution, setPortnumNodeDistribution] = useState<PacketDistributionStats | null>(null);
   const [loadingPortnumNodes, setLoadingPortnumNodes] = useState(false);
+  const [messageCounts, setMessageCounts] = useState<MessageCounts | null>(null);
+
+  const nodeTransportTally = useMemo(
+    () => countNodesByTransport(nodes, maxNodeAgeHours ? transportCutoffSec(maxNodeAgeHours) : undefined),
+    [nodes, maxNodeAgeHours]
+  );
 
   const fetchVirtualNodeStatus = async () => {
     if (connectionStatus !== 'connected') return;
@@ -172,7 +190,7 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
   };
 
   const fetchRouteSegments = async () => {
-    if (connectionStatus !== 'connected') return;
+    if (connectionStatus !== 'connected' || !canReadTraceroute) return;
 
     setLoadingSegments(true);
     try {
@@ -190,7 +208,7 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
   };
 
   const fetchSecurityKeys = async () => {
-    if (connectionStatus !== 'connected' || !isAuthenticated) return;
+    if (connectionStatus !== 'connected' || !isAuthenticated || isMqttOnlySource) return;
 
     setLoadingSecurityKeys(true);
     try {
@@ -218,14 +236,15 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
       }
       // 'all' = undefined (no since filter)
 
-      const distribution = await getPacketDistributionStats(since, undefined, undefined, activeSourceId ?? undefined);
+      const transport = distributionTransport === 'all' ? undefined : distributionTransport;
+      const distribution = await getPacketDistributionStats(since, undefined, undefined, activeSourceId ?? undefined, transport);
       setPacketDistribution(distribution);
     } catch (error) {
       logger.error('Error fetching packet distribution:', error);
     } finally {
       setLoadingDistribution(false);
     }
-  }, [connectionStatus, distributionTimeRange, activeSourceId]);
+  }, [connectionStatus, distributionTimeRange, activeSourceId, distributionTransport]);
 
   const fetchPortnumNodeDistribution = useCallback(async () => {
     if (connectionStatus !== 'connected' || selectedPortnum === null) return;
@@ -240,25 +259,46 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
         since = now - 86400;
       }
 
-      const distribution = await getPacketDistributionStats(since, undefined, selectedPortnum, activeSourceId ?? undefined);
+      const transport = distributionTransport === 'all' ? undefined : distributionTransport;
+      const distribution = await getPacketDistributionStats(since, undefined, selectedPortnum, activeSourceId ?? undefined, transport);
       setPortnumNodeDistribution(distribution);
     } catch (error) {
       logger.error('Error fetching portnum node distribution:', error);
     } finally {
       setLoadingPortnumNodes(false);
     }
-  }, [connectionStatus, selectedPortnum, distributionTimeRange, activeSourceId]);
+  }, [connectionStatus, selectedPortnum, distributionTimeRange, activeSourceId, distributionTransport]);
 
-  const handleClearRecordHolder = async () => {
-    setShowConfirmDialog(true);
+  const fetchMessageCounts = useCallback(async () => {
+    if (connectionStatus !== 'connected' || !activeSourceId) {
+      setMessageCounts(null);
+      return;
+    }
+    try {
+      const counts = await apiService.getMessageCounts(activeSourceId);
+      setMessageCounts(counts);
+    } catch (error) {
+      logger.error('Error fetching message counts:', error);
+    }
+  }, [connectionStatus, activeSourceId]);
+
+  const handleClearRecordHolder = async (target: NodeTransportClass | 'all') => {
+    setClearTarget(target);
   };
 
   const confirmClearRecordHolder = async () => {
-    setShowConfirmDialog(false);
+    const target = clearTarget;
+    setClearTarget(null);
+    if (!target) return;
     try {
-      await apiService.clearRecordHolderSegment(activeSourceId);
-      setRecordHolderSegment(null);
-      showToast(t('info.record_cleared'), 'success');
+      await apiService.clearRecordHolderSegment(activeSourceId, target === 'all' ? undefined : target);
+      // Re-fetch rather than clearing local state: clearing one class must
+      // leave the other classes' records on screen (§4.6).
+      await fetchRouteSegments();
+      showToast(
+        target === 'all' ? t('info.record_cleared') : t('info.record_cleared_transport', { transport: t(`transport.${target}`) }),
+        'success'
+      );
     } catch (error) {
       logger.error('Error clearing record holder:', error);
       if (error instanceof Error && error.message.includes('403')) {
@@ -273,7 +313,7 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
     void fetchRouteSegments();
     const interval = setInterval(fetchRouteSegments, 60000); // Refresh every minute
     return () => clearInterval(interval);
-  }, [connectionStatus, activeSourceId]);
+  }, [connectionStatus, activeSourceId, canReadTraceroute]);
 
   useEffect(() => {
     void fetchVirtualNodeStatus();
@@ -312,6 +352,12 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
     }
   }, [fetchPortnumNodeDistribution, selectedPortnum]);
 
+  useEffect(() => {
+    void fetchMessageCounts();
+    const interval = setInterval(fetchMessageCounts, 60000); // Refresh every minute
+    return () => clearInterval(interval);
+  }, [fetchMessageCounts]);
+
   // Helper function to format uptime
   const formatUptime = (uptimeSeconds: number): string => {
     const days = Math.floor(uptimeSeconds / 86400);
@@ -329,17 +375,79 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
   };
 
   // Stable callbacks
-  const handleClearRecordClick = useCallback(() => {
-    void handleClearRecordHolder();
+  const handleClearRecordClick = useCallback((target: NodeTransportClass | 'all') => {
+    void handleClearRecordHolder(target);
   }, [handleClearRecordHolder]);
 
   const handleCancelConfirm = useCallback(() => {
-    setShowConfirmDialog(false);
+    setClearTarget(null);
   }, []);
 
   const handleConfirmClear = useCallback(() => {
     void confirmClearRecordHolder();
   }, [confirmClearRecordHolder]);
+
+  // Renders a "Longest Active" / "Record Holder" card: one labelled
+  // RouteSegmentRecord per non-null byTransport class (RF -> UDP -> MQTT),
+  // or a single unlabelled record for MQTT-only sources (#5101 P2 §4.6).
+  const renderRouteSegmentCard = (
+    data: RouteSegmentRecords | null,
+    timeLabel: string,
+    noDataText: string,
+    opts: { showTrophy?: boolean; withClear?: boolean } = {}
+  ): React.ReactNode => {
+    if (!data) {
+      return <p className="no-data">{noDataText}</p>;
+    }
+
+    const legacyNote = opts.withClear ? t('info.record_legacy_transport_note') : undefined;
+
+    if (!showTransport) {
+      return (
+        <RouteSegmentRecord
+          segment={data}
+          timeLabel={timeLabel}
+          distanceUnit={distanceUnit}
+          timeFormat={timeFormat}
+          dateFormat={dateFormat}
+          showTrophy={opts.showTrophy}
+          legacyNote={legacyNote}
+          onClear={opts.withClear && canWriteTraceroute ? () => handleClearRecordClick('all') : undefined}
+          clearLabel={t('info.clear_record')}
+          testId="route-segment-record-unlabelled"
+        />
+      );
+    }
+
+    const entries = ROUTE_SEGMENT_TRANSPORT_ORDER
+      .map((cls) => [cls, data.byTransport[cls]] as const)
+      .filter((entry): entry is [NodeTransportClass, RouteSegmentView] => entry[1] !== null);
+
+    if (entries.length === 0) {
+      return <p className="no-data">{noDataText}</p>;
+    }
+
+    return (
+      <>
+        {entries.map(([cls, segment]) => (
+          <RouteSegmentRecord
+            key={cls}
+            segment={segment}
+            transportLabel={t(`transport.${cls}`)}
+            timeLabel={timeLabel}
+            distanceUnit={distanceUnit}
+            timeFormat={timeFormat}
+            dateFormat={dateFormat}
+            showTrophy={opts.showTrophy}
+            legacyNote={legacyNote}
+            onClear={opts.withClear && canWriteTraceroute ? () => handleClearRecordClick(cls) : undefined}
+            clearLabel={t('info.clear_record')}
+            testId={`route-segment-record-${cls}`}
+          />
+        ))}
+      </>
+    );
+  };
 
   return (
     <div className="tab-content">
@@ -347,8 +455,13 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
       <div className="device-info">
         <div className="info-section">
           <h3>{t('info.connection_status')}</h3>
-          {isAuthenticated && (
+          {isAuthenticated && displayNodeAddress && (
             <p><strong>{t('info.node_address')}</strong> {displayNodeAddress}</p>
+          )}
+          {isMqttOnlySource && (
+            <p className="info-no-local-node" data-testid="info-no-local-node">
+              {t('info.no_local_node', 'This source is an MQTT feed. It has no local node, so there is no node identity or device configuration to show.')}
+            </p>
           )}
           {deviceConfig?.basic?.nodeId && (
             <p><strong>{t('info.node_id')}</strong> {deviceConfig.basic.nodeId}</p>
@@ -518,9 +631,9 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
                   <>
                     <p><strong>{t('info.server_running')}</strong> {source.isRunning ? t('common.yes') : t('common.no')}</p>
                     <p><strong>{t('info.virtual_node_admin_commands')}</strong> {source.allowAdminCommands ? t('info.virtual_node_admin_allowed') : t('info.virtual_node_admin_blocked')}</p>
-                    {typeof source.allowPkiExport === 'boolean' && (
-                      <p><strong>{t('info.virtual_node_pki_export')}</strong> {source.allowPkiExport ? t('info.virtual_node_admin_allowed') : t('info.virtual_node_admin_blocked')}</p>
-                    )}
+                    {/* MeshCore-only PKI export/import flags live on the MeshCore
+                        Node Info view (MeshCoreVirtualNodeCard, #5380): a MeshCore
+                        source never opens this tab. */}
                     <p><strong>{t('info.connected_clients')}</strong> {source.clientCount}</p>
 
                     {source.clients && source.clients.length > 0 && (
@@ -555,13 +668,32 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
         <div className="info-section">
           <h3>{t('info.network_stats')}</h3>
           <p><strong>{t('info.total_nodes')}</strong> {nodes.length}</p>
+          {showTransport && nodes.length > 0 && (
+            <TransportBreakdown
+              label={t('info.heard_via')}
+              counts={nodeTransportTally}
+              note={
+                nodeTransportTally.rf + nodeTransportTally.udp + nodeTransportTally.mqtt > nodes.length
+                  ? t('info.transport_overlap_note')
+                  : undefined
+              }
+              testId="info-nodes-transport"
+            />
+          )}
           <p><strong>{t('info.total_channels')}</strong> {channels.length}</p>
-          <p><strong>{t('info.total_messages')}</strong> {messages.length}</p>
+          <p><strong>{t('info.total_messages')}</strong> {activeSourceId ? (messageCounts?.total ?? '—') : messages.length}</p>
+          {showTransport && messageCounts && messageCounts.total > 0 && (
+            <TransportBreakdown
+              counts={{ rf: messageCounts.byTransport.rf, udp: messageCounts.byTransport.udp ?? 0, mqtt: messageCounts.byTransport.mqtt }}
+              testId="info-messages-transport"
+            />
+          )}
           <p><strong>{t('info.active_channels')}</strong> {getAvailableChannels().length}</p>
           {localStats?.numPacketsTx !== undefined && (
             <>
               <p><strong>{t('info.packets_tx')}</strong> {localStats.numPacketsTx.toLocaleString()}</p>
               <p><strong>{t('info.packets_rx')}</strong> {localStats.numPacketsRx?.toLocaleString() || t('info.na')}</p>
+              <DeviceCounterNote text={t('info.device_counters_note')} testId="info-packets-device-note" />
             </>
           )}
           {localStats?.hostUptimeSeconds !== undefined && localStats?.numPacketsTx === undefined && (
@@ -643,6 +775,7 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
           return (
             <div className="info-section">
               <h3>{t('info.radio_statistics', 'Radio Statistics')}</h3>
+              <DeviceCounterNote text={t('info.device_counters_note')} testId="info-radio-device-note" />
               <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                 {rxTotal > 0 && (
                   <PacketStatsChart
@@ -732,59 +865,85 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
             </div>
           );
 
+          // #5101: one shared selector drives both the donut cards below and
+          // the per-portnum node dropdown further down, so they never disagree
+          // about which transport slice they're showing. Hidden on MQTT-only
+          // sources, where every packet is MQTT by construction (#5283).
+          const transportButtons = showTransport ? (
+            <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+              {TRANSPORT_FILTER_OPTIONS.map((cls) => (
+                <button
+                  key={cls}
+                  onClick={() => setDistributionTransport(cls)}
+                  aria-pressed={distributionTransport === cls}
+                  data-testid={`dist-transport-${cls}`}
+                  style={timeRangeButtonStyle(distributionTransport === cls)}
+                >
+                  {t(`transport.${cls}`)}
+                </button>
+              ))}
+            </div>
+          ) : null;
+
+          // #5101: the header row (title, total, both button groups) stays on
+          // screen even when the current transport slice is empty — otherwise
+          // picking "UDP" on a mesh with no UDP traffic would remove the very
+          // buttons needed to undo it.
           return (
-            <>
-              {loadingDistribution && (
-                <div className="info-section">
-                  <p>{t('common.loading_indicator')}</p>
+            <div className="info-section-wide">
+              {/*
+                * #5195: this row is title-plus-buttons with no wrap, and a
+                * flex item will not shrink below its min-content width, so
+                * on a phone the toggle group was clipped by the card edge
+                * with "All Data" unreachable. Wrapping drops the group onto
+                * its own line instead; `rowGap` keeps the two lines apart.
+                */}
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', rowGap: '0.5rem', marginBottom: '0.75rem' }}>
+                <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.75rem', flexWrap: 'wrap', minWidth: 0 }}>
+                  <h3 style={{ margin: 0 }}>{t('info.packet_distribution', 'Packet Distribution')}</h3>
+                  <span style={{ fontSize: '0.9em', color: 'var(--color-text-subtle)', fontWeight: 600 }}>
+                    {t('info.total_packets', { count: packetDistribution.total, defaultValue: 'Total: {{count}} packets' })}
+                  </span>
                 </div>
+                <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap', alignItems: 'center' }}>
+                  {transportButtons}
+                  {timeRangeButtons}
+                </div>
+              </div>
+
+              {loadingDistribution && (
+                <p>{t('common.loading_indicator')}</p>
               )}
 
               {!loadingDistribution && packetDistribution.total > 0 && (
-                <div className="info-section-wide">
-                  {/*
-                    * #5195: this row is title-plus-buttons with no wrap, and a
-                    * flex item will not shrink below its min-content width, so
-                    * on a phone the toggle group was clipped by the card edge
-                    * with "All Data" unreachable. Wrapping drops the group onto
-                    * its own line instead; `rowGap` keeps the two lines apart.
-                    */}
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', rowGap: '0.5rem', marginBottom: '0.75rem' }}>
-                    <div style={{ display: 'flex', alignItems: 'baseline', gap: '0.75rem', flexWrap: 'wrap', minWidth: 0 }}>
-                      <h3 style={{ margin: 0 }}>{t('info.packet_distribution', 'Packet Distribution')}</h3>
-                      <span style={{ fontSize: '0.9em', color: 'var(--color-text-subtle)', fontWeight: 600 }}>
-                        {t('info.total_packets', { count: packetDistribution.total, defaultValue: 'Total: {{count}} packets' })}
-                      </span>
-                    </div>
-                    {timeRangeButtons}
-                  </div>
-                  <div className="packet-distribution-grid">
-                    <PacketStatsChart
-                      title={t('info.packets_by_device')}
-                      data={deviceData}
-                      total={packetDistribution.total}
-                      chartId="dist-device"
-                      bare
-                      stacked
-                    />
-                    <PacketStatsChart
-                      title={t('info.packets_by_type')}
-                      data={typeData}
-                      total={packetDistribution.total}
-                      chartId="dist-type"
-                      bare
-                      stacked
-                    />
-                  </div>
+                <div className="packet-distribution-grid">
+                  <PacketStatsChart
+                    title={t('info.packets_by_device')}
+                    data={deviceData}
+                    total={packetDistribution.total}
+                    chartId="dist-device"
+                    bare
+                    stacked
+                  />
+                  <PacketStatsChart
+                    title={t('info.packets_by_type')}
+                    data={typeData}
+                    total={packetDistribution.total}
+                    chartId="dist-type"
+                    bare
+                    stacked
+                  />
                 </div>
               )}
 
               {!loadingDistribution && packetDistribution.total === 0 && (
-                <div className="info-section">
-                  <p style={{ color: '#888', fontStyle: 'italic' }}>{t('info.no_packet_data')}</p>
-                </div>
+                <p style={{ color: '#888', fontStyle: 'italic' }}>
+                  {distributionTransport === 'all'
+                    ? t('info.no_packet_data')
+                    : t('info.no_packets_for_transport', { transport: t(`transport.${distributionTransport}`) })}
+                </p>
               )}
-            </>
+            </div>
           );
         })()}
 
@@ -923,50 +1082,21 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
           }</p>
         </div>
 
-        <div className="info-section">
-          <h3>{t('info.longest_route')}</h3>
-          {loadingSegments && <p>{t('common.loading_indicator')}</p>}
-          {!loadingSegments && longestActiveSegment && (
-            <>
-              <p><strong>{t('info.distance')}</strong> {formatDistance(longestActiveSegment.distanceKm, distanceUnit)}</p>
-              <p><strong>{t('info.from')}</strong> {longestActiveSegment.fromNodeName} ({longestActiveSegment.fromNodeId})</p>
-              <p><strong>{t('info.to')}</strong> {longestActiveSegment.toNodeName} ({longestActiveSegment.toNodeId})</p>
-              <p style={{ fontSize: '0.85em', color: '#888' }}>
-                {t('info.last_seen')} {formatDateTime(new Date(longestActiveSegment.timestamp), timeFormat, dateFormat)}
-              </p>
-            </>
-          )}
-          {!loadingSegments && !longestActiveSegment && (
-            <p className="no-data">{t('info.no_active_routes')}</p>
-          )}
-        </div>
+        {canReadTraceroute && (
+          <div className="info-section">
+            <h3>{t('info.longest_route')}</h3>
+            {loadingSegments && <p>{t('common.loading_indicator')}</p>}
+            {!loadingSegments && renderRouteSegmentCard(longestActiveSegment, t('info.last_seen'), t('info.no_active_routes'))}
+          </div>
+        )}
 
-        <div className="info-section">
-          <h3>{t('info.record_holder')}</h3>
-          {loadingSegments && <p>{t('common.loading_indicator')}</p>}
-          {!loadingSegments && recordHolderSegment && (
-            <>
-              <p><strong>{t('info.distance')}</strong> {formatDistance(recordHolderSegment.distanceKm, distanceUnit)} <UiIcon name="trophy" /></p>
-              <p><strong>{t('info.from')}</strong> {recordHolderSegment.fromNodeName} ({recordHolderSegment.fromNodeId})</p>
-              <p><strong>{t('info.to')}</strong> {recordHolderSegment.toNodeName} ({recordHolderSegment.toNodeId})</p>
-              <p style={{ fontSize: '0.85em', color: '#888' }}>
-                {t('info.achieved')} {formatDateTime(new Date(recordHolderSegment.timestamp), timeFormat, dateFormat)}
-              </p>
-              {isAuthenticated && (
-                <button
-                  onClick={handleClearRecordClick}
-                  className="danger-button"
-                  style={{ marginTop: '8px' }}
-                >
-                  {t('info.clear_record')}
-                </button>
-              )}
-            </>
-          )}
-          {!loadingSegments && !recordHolderSegment && (
-            <p className="no-data">{t('info.no_record_holder')}</p>
-          )}
-        </div>
+        {canReadTraceroute && (
+          <div className="info-section">
+            <h3>{t('info.record_holder')}</h3>
+            {loadingSegments && <p>{t('common.loading_indicator')}</p>}
+            {!loadingSegments && renderRouteSegmentCard(recordHolderSegment, t('info.achieved'), t('info.no_record_holder'), { showTrophy: true, withClear: true })}
+          </div>
+        )}
 
         {!deviceConfig && (
           <div className="info-section">
@@ -988,7 +1118,13 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
         </div>
       )}
 
-      {showConfirmDialog && (
+      {showTransport && currentNodeId && connectionStatus === 'connected' && (
+        <div className="info-section-full-width">
+          <TransportSeriesGraphs nodeId={currentNodeId} telemetryHours={telemetryHours} baseUrl={baseUrl} />
+        </div>
+      )}
+
+      {clearTarget && (
         <div style={{
           position: 'fixed',
           top: 0,
@@ -1009,7 +1145,11 @@ const InfoTab: React.FC<InfoTabProps> = React.memo(({
             border: '1px solid var(--color-surface-active)'
           }}>
             <h3 style={{ marginTop: 0 }}>{t('info.clear_record_title')}</h3>
-            <p>{t('info.clear_record_confirm')}</p>
+            <p>
+              {clearTarget === 'all'
+                ? t('info.clear_record_confirm')
+                : t('info.clear_record_confirm_transport', { transport: t(`transport.${clearTarget}`) })}
+            </p>
             <div style={{ display: 'flex', gap: '1rem', justifyContent: 'flex-end', marginTop: '1.5rem' }}>
               <button
                 onClick={handleCancelConfirm}

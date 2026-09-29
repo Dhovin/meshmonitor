@@ -8,7 +8,7 @@ export { BaseRepository, ALL_SOURCES } from './base.js';
 export type { DrizzleDatabase, SQLiteDrizzle, PostgresDrizzle, SourceScope } from './base.js';
 export { SettingsRepository } from './settings.js';
 export { ChannelsRepository, type ChannelInput } from './channels.js';
-export { NodesRepository, type NodesCacheHook } from './nodes.js';
+export { NodesRepository, type NodesCacheHook, type AircraftAgeOutCandidate } from './nodes.js';
 export { MessagesRepository } from './messages.js';
 export { TelemetryRepository, type TelemetryCadenceAggregate } from './telemetry.js';
 export { AuthRepository } from './auth.js';
@@ -46,8 +46,9 @@ export type { NewsCache, UserNewsStatus } from './newsCache.js';
 export { BackupHistoryRepository } from './backupHistory.js';
 export type { BackupHistory } from './backupHistory.js';
 export { ChannelDatabaseRepository, type ChannelDatabaseInput, type ChannelDatabaseUpdate, type ChannelDatabasePermissionInput } from './channelDatabase.js';
-export { IgnoredNodesRepository, type IgnoredNodeRecord } from './ignoredNodes.js';
+export { IgnoredNodesRepository, type IgnoredNodeRecord, type IgnoreReason } from './ignoredNodes.js';
 export { MeshCoreRepository } from './meshcore.js';
+export { MeshCoreChannelRemapRepository } from './meshcoreChannelRemap.js';
 export type { DbMeshCoreNode, DbMeshCoreMessage } from './meshcore.js';
 export { EmbedProfileRepository } from './embedProfiles.js';
 export type { EmbedProfile, EmbedProfileInput } from './embedProfiles.js';
@@ -77,6 +78,8 @@ export { PrivacyDocumentsRepository } from './privacyDocuments.js';
 export type { PrivacyDocument, PrivacyDocumentMeta } from './privacyDocuments.js';
 export { SolarNodeOverridesRepository } from './solarNodeOverrides.js';
 export type { SolarNodeOverride } from './solarNodeOverrides.js';
+export { AssetNodesRepository } from './assetNodes.js';
+export type { AssetNode, AssetNodeSettings } from './assetNodes.js';
 export { SourcesRepository } from './sources.js';
 export type { Source, CreateSourceInput } from './sources.js';
 export { AnalysisRepository } from './analysis.js';
@@ -112,6 +115,41 @@ export type {
   DbMeshtasticHeardRepeater,
   RecordMeshtasticHeardRepeaterParams,
 } from './meshtasticHeardRepeaters.js';
+export { CoverageReceptionsRepository } from './coverageReceptions.js';
+export type {
+  DbCoverageReception,
+  RecordCoverageReceptionParams,
+  GetCoverageReceptionsArgs,
+  CoverageReceptionsPage,
+  GetCoverageReceiversArgs,
+  CoverageReceiverRow,
+  GetCoverageSenderSummaryArgs,
+  CoverageSenderSummaryRow,
+  CoverageRetentionExemptionWindow,
+} from './coverageReceptions.js';
+export { CoverageSurveysRepository } from './coverageSurveys.js';
+export type {
+  DbCoverageSurvey,
+  CreateCoverageSurveyParams,
+  UpdateCoverageSurveyPatch,
+  CoverageSurveyExemptionWindow,
+} from './coverageSurveys.js';
+export { AircraftFlightMatchesRepository } from './aircraftFlightMatches.js';
+export type {
+  AircraftFlightMatchRow,
+  FlightMatchStatus,
+  FlightMatchResultWrite,
+  FlightMatchLookupWrite,
+} from './aircraftFlightMatches.js';
+export { MeshCoreFiltersRepository } from './meshcoreFilters.js';
+export type {
+  MeshCoreIgnoredNodeRow,
+  MeshCoreMessageFilterRow,
+  MeshCoreMessageFilterInput,
+  MeshCoreFilterMode,
+  MeshCoreFilterMatchType,
+  MeshCoreFilterFields,
+} from './meshcoreFilters.js';
 export { MeshIssuesRepository } from './meshIssues.js';
 export type {
   DbMeshIssue,

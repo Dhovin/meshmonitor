@@ -10,26 +10,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 
-vi.mock('react-i18next', () => ({
-  useTranslation: () => ({
-    t: (key: string, fallback?: string | Record<string, unknown>, vars?: Record<string, unknown>) => {
-      // Mimic i18next interpolation for the {{idx}} placeholder used by the
-      // "unnamed channel" fallback so tests can assert on the rendered string.
-      if (typeof fallback === 'string') {
-        if (vars && typeof vars === 'object') {
-          return fallback.replace(/\{\{(\w+)\}\}/g, (_m, k) => String((vars as any)[k] ?? ''));
-        }
-        return fallback;
-      }
-      // when fallback was actually an interpolation `values` object, return key
-      return key;
-    },
-  }),
-  // Required by config/i18n (pulled in transitively via SettingsContext, which
-  // the embedded <LinkPreview> imports). Without these the mock is incomplete.
-  Trans: ({ children }: { children?: unknown }) => children,
-  initReactI18next: { type: '3rdParty', init: () => {} },
-}));
+vi.mock('react-i18next', async () => {
+  const { createReactI18nextMock } = await import('../../test/mockI18n');
+  return createReactI18nextMock();
+});
 
 // Mutable so a test can simulate a read-only / anonymous viewer.
 let permissionFn: (resource: string, action: string) => boolean = () => true;
@@ -43,6 +27,8 @@ vi.mock('../../hooks/useCsrfFetch', () => ({
 }));
 
 import { MeshCoreChannelsView } from './MeshCoreChannelsView';
+import { remapChannelCustomOrder } from './meshcoreChannelOrder';
+import { emitChannelsReordered } from './meshcoreChannelReorderEvents';
 import type { MeshCoreActions, ConnectionStatus, MeshCoreMessage } from './hooks/useMeshCore';
 import type { MeshCoreContact } from '../../utils/meshcoreHelpers';
 
@@ -1138,5 +1124,224 @@ describe('MeshCoreChannelsView — receive-only mode (#4547 Phase 2 WP3)', () =>
     const input = screen.getByPlaceholderText('Type a message…');
     expect(input).not.toBeDisabled();
     expect(input).not.toHaveAttribute('title');
+  });
+});
+
+describe('MeshCoreChannelsView — display order (#5385, #5379)', () => {
+  function orderFetch(latestTimestamps: Record<number, number> = {}) {
+    return (url: string) => {
+      if (url.includes('/channels/all')) {
+        return Promise.resolve(jsonResponse([
+          { id: 0, name: 'Public' },
+          { id: 1, name: 'zulu' },
+          { id: 2, name: 'alpha' },
+        ]));
+      }
+      if (url.includes('/channel-counts')) {
+        return Promise.resolve(jsonResponse({ success: true, counts: {}, latestTimestamps }));
+      }
+      return Promise.resolve(jsonResponse({ success: true, data: [] }));
+    };
+  }
+
+  const rowNames = (container: HTMLElement) =>
+    Array.from(container.querySelectorAll('.mc-channel-row-name')).map(n => n.textContent);
+
+  function renderView(actions: MeshCoreActions = makeActions()) {
+    return render(
+      <MeshCoreChannelsView
+        messages={[]}
+        contacts={contacts}
+        status={makeStatus()}
+        actions={actions}
+        baseUrl=""
+        sourceId="src-a"
+      />,
+    );
+  }
+
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it('defaults to device order and sorts by name from the dropdown, persisted per source', async () => {
+    csrfFetchMock.mockImplementation(orderFetch());
+    const { container } = renderView();
+    await waitFor(() => expect(rowNames(container)).toEqual(['# Public', '# zulu', '# alpha']));
+
+    fireEvent.change(screen.getByLabelText('Sort channels by'), { target: { value: 'name' } });
+    await waitFor(() => expect(rowNames(container)).toEqual(['# alpha', '# Public', '# zulu']));
+    expect(localStorage.getItem('meshmonitor-meshcore-channel-sort-mode-src-a')).toBe('name');
+    expect(localStorage.getItem('meshmonitor-meshcore-channel-sort-mode-src-b')).toBeNull();
+  });
+
+  it('sorts by last message, newest first', async () => {
+    csrfFetchMock.mockImplementation(orderFetch({ 1: 100, 2: 900 }));
+    localStorage.setItem('meshmonitor-meshcore-channel-sort-mode-src-a', 'lastMessage');
+    const { container } = renderView();
+    await waitFor(() => expect(rowNames(container)).toEqual(['# alpha', '# zulu', '# Public']));
+  });
+
+  it('reorder mode saves a custom order without touching the device', async () => {
+    csrfFetchMock.mockImplementation(orderFetch());
+    const actions = makeActions();
+    const { container } = renderView(actions);
+    await waitFor(() => expect(rowNames(container)).toEqual(['# Public', '# zulu', '# alpha']));
+
+    fireEvent.click(screen.getByRole('button', { name: /Reorder/ }));
+    expect(await screen.findAllByTestId('mc-channel-reorder-row')).toHaveLength(3);
+
+    // Move alpha to the top with the keyboard-friendly arrow buttons.
+    fireEvent.click(screen.getByLabelText('Move # alpha up'));
+    fireEvent.click(screen.getByLabelText('Move # alpha up'));
+    fireEvent.click(screen.getByText('Save order'));
+
+    await waitFor(() => expect(rowNames(container)).toEqual(['# alpha', '# Public', '# zulu']));
+    expect(JSON.parse(localStorage.getItem('meshmonitor-meshcore-channel-custom-order-src-a') ?? '[]'))
+      .toEqual([2, 0, 1]);
+    expect((screen.getByLabelText('Sort channels by') as HTMLSelectElement).value).toBe('custom');
+
+    // Display-only: nothing but GETs went out, and no send action fired.
+    for (const call of csrfFetchMock.mock.calls) {
+      expect(call[1]?.method ?? 'GET').toBe('GET');
+    }
+    expect(actions.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('loads each source its own sort mode when the source changes', async () => {
+    csrfFetchMock.mockImplementation(orderFetch());
+    localStorage.setItem('meshmonitor-meshcore-channel-sort-mode-src-a', 'name');
+    const { container, rerender } = renderView();
+    await waitFor(() => expect(rowNames(container)).toEqual(['# alpha', '# Public', '# zulu']));
+
+    rerender(
+      <MeshCoreChannelsView
+        messages={[]}
+        contacts={contacts}
+        status={makeStatus()}
+        actions={makeActions()}
+        baseUrl=""
+        sourceId="src-b"
+      />,
+    );
+    await waitFor(() => expect((screen.getByLabelText('Sort channels by') as HTMLSelectElement).value).toBe('device'));
+    await waitFor(() => expect(rowNames(container)).toEqual(['# Public', '# zulu', '# alpha']));
+  });
+
+  it('hides the Reorder button when there is only one channel', async () => {
+    csrfFetchMock.mockImplementation((url: string) => {
+      if (url.includes('/channels/all')) return Promise.resolve(jsonResponse([{ id: 0, name: 'Public' }]));
+      return Promise.resolve(jsonResponse({ success: true, data: [] }));
+    });
+    renderView();
+    await waitFor(() => expect(screen.getByText('# Public')).toBeTruthy());
+    expect(screen.queryByRole('button', { name: /Reorder/ })).toBeNull();
+  });
+
+  it('keeps the Custom display order after an on-device slot reorder (#5379)', async () => {
+    // Device order before: 1 zulu, 2 alpha. After the device reorder the two
+    // channels trade slots; the saved display order must follow the channels.
+    let swapped = false;
+    csrfFetchMock.mockImplementation((url: string) => {
+      if (url.includes('/channels/all')) {
+        return Promise.resolve(jsonResponse(swapped
+          ? [{ id: 0, name: 'Public' }, { id: 1, name: 'alpha' }, { id: 2, name: 'zulu' }]
+          : [{ id: 0, name: 'Public' }, { id: 1, name: 'zulu' }, { id: 2, name: 'alpha' }]));
+      }
+      return orderFetch()(url);
+    });
+    localStorage.setItem('meshmonitor-meshcore-channel-sort-mode-src-a', 'custom');
+    localStorage.setItem('meshmonitor-meshcore-channel-custom-order-src-a', JSON.stringify([2, 0, 1]));
+    const { container } = renderView();
+    await waitFor(() => expect(rowNames(container)).toEqual(['# alpha', '# Public', '# zulu']));
+
+    swapped = true;
+    const moves = [{ from: 1, to: 2 }, { from: 2, to: 1 }];
+    // useMeshCore does this on the socket event, then re-broadcasts it.
+    act(() => {
+      remapChannelCustomOrder('src-a', moves);
+      emitChannelsReordered({ sourceId: 'src-a', moves });
+    });
+
+    await waitFor(() => expect(rowNames(container)).toEqual(['# alpha', '# Public', '# zulu']));
+    expect(JSON.parse(localStorage.getItem('meshmonitor-meshcore-channel-custom-order-src-a') ?? '[]'))
+      .toEqual([1, 0, 2]);
+  });
+
+  it('opens reorder mode on a click that lands before the post-commit effects run', async () => {
+    // Regression for the CI flake in this block. The Reorder button first
+    // appears in the commit that loads the channel list; that same commit
+    // changes the channel-set key. The panel used to close on a
+    // `useEffect([channelIdsKey])`, so a click landing before React flushed
+    // that effect was undone by it. `waitFor` can resolve in exactly that gap
+    // (MutationObserver microtask vs. the scheduler's macrotask), so it only
+    // failed under CI load. Click from a MutationObserver to hit the gap every
+    // time.
+    csrfFetchMock.mockImplementation(orderFetch());
+    const { container } = renderView();
+    const opened = await new Promise<boolean>((resolve) => {
+      const mo = new MutationObserver(() => {
+        const btn = Array.from(container.querySelectorAll('button')).find(b => /Reorder/.test(b.textContent ?? ''));
+        if (!btn) return;
+        mo.disconnect();
+        fireEvent.click(btn);
+        resolve(screen.queryAllByTestId('mc-channel-reorder-row').length === 3);
+      });
+      mo.observe(container, { childList: true, subtree: true });
+    });
+    expect(opened).toBe(true);
+  });
+
+  it('closes reorder mode when a reconnect re-sync changes the channel set', async () => {
+    let extra = false;
+    csrfFetchMock.mockImplementation((url: string) => {
+      if (url.includes('/channels/all')) {
+        const rows = [{ id: 0, name: 'Public' }, { id: 1, name: 'zulu' }, { id: 2, name: 'alpha' }];
+        return Promise.resolve(jsonResponse(extra ? [...rows, { id: 3, name: 'bravo' }] : rows));
+      }
+      return orderFetch()(url);
+    });
+    const actions = makeActions();
+    const view = (connected: boolean) => (
+      <MeshCoreChannelsView
+        messages={[]}
+        contacts={contacts}
+        status={{ ...makeStatus(), connected }}
+        actions={actions}
+        baseUrl=""
+        sourceId="src-a"
+      />
+    );
+    const { container, rerender } = render(view(true));
+    await waitFor(() => expect(rowNames(container)).toEqual(['# Public', '# zulu', '# alpha']));
+
+    fireEvent.click(screen.getByRole('button', { name: /Reorder/ }));
+    expect(await screen.findAllByTestId('mc-channel-reorder-row')).toHaveLength(3);
+
+    // Same channel set again: the panel stays open.
+    rerender(view(false));
+    rerender(view(true));
+    await waitFor(() => expect(csrfFetchMock.mock.calls.filter(c => String(c[0]).includes('/channels/all'))).toHaveLength(3));
+    expect(screen.getAllByTestId('mc-channel-reorder-row')).toHaveLength(3);
+
+    // A slot appears: the stale draft is dropped.
+    extra = true;
+    rerender(view(false));
+    rerender(view(true));
+    await waitFor(() => expect(rowNames(container)).toEqual(['# Public', '# zulu', '# alpha', '# bravo']));
+    expect(screen.queryAllByTestId('mc-channel-reorder-row')).toHaveLength(0);
+  });
+
+  it('cancel discards the draft order', async () => {
+    csrfFetchMock.mockImplementation(orderFetch());
+    const { container } = renderView();
+    await waitFor(() => expect(rowNames(container)).toEqual(['# Public', '# zulu', '# alpha']));
+
+    fireEvent.click(screen.getByRole('button', { name: /Reorder/ }));
+    fireEvent.click(await screen.findByLabelText('Move # Public down'));
+    fireEvent.click(screen.getByText('Cancel'));
+
+    await waitFor(() => expect(rowNames(container)).toEqual(['# Public', '# zulu', '# alpha']));
+    expect(localStorage.getItem('meshmonitor-meshcore-channel-custom-order-src-a')).toBeNull();
   });
 });

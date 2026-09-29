@@ -18,14 +18,34 @@ import { parseDiscardInvalidPositions } from '../../utils/positionIngestConfig.j
 import { parseNoIndexEnabled } from '../../utils/robotsConfig.js';
 import { securityDigestService } from '../services/securityDigestService.js';
 import { invalidatePkiDmGlobalCache } from '../services/sourcePkiKeyStore.js';
-import { VALID_SETTINGS_KEYS, GLOBAL_ONLY_SETTINGS_KEYS, stripSecretSettings } from '../constants/settings.js';
+import { invalidateCoverageMqttEnabled } from '../services/coverageMqttSettings.js';
+import { invalidateSignFlipContext, SIGN_FLIP_SETTING_KEYS } from '../services/signFlipCorrection.js';
+import { COVERAGE_MQTT_ENABLED_SETTING } from '../../utils/coverage.js';
+import { VALID_SETTINGS_KEYS, GLOBAL_ONLY_SETTINGS_KEYS, stripSecretSettings, isSecretSettingKey } from '../constants/settings.js';
 import { ok, fail } from '../utils/apiResponse.js';
-import { resolveSourceManager } from '../utils/resolveSourceManager.js';
+import { resolveOwnMeshtasticManager } from '../utils/resolveSourceManager.js';
 import { validateFilterNameRegexOnSave } from '../utils/filterNameRegex.js';
 import { positionEstimationScheduler } from '../services/positionEstimationScheduler.js';
+import {
+  autoEnrichmentScheduler,
+  AutoEnrichmentInProgressError,
+  cronFiresAtMostHourly,
+  MIN_INTERVAL_MINUTES as AUTO_ENRICHMENT_MIN_INTERVAL_MINUTES,
+  MAX_INTERVAL_MINUTES as AUTO_ENRICHMENT_MAX_INTERVAL_MINUTES,
+} from '../services/autoEnrichmentScheduler.js';
 import { autoDeleteByDistanceService } from '../services/autoDeleteByDistanceService.js';
-import { NODE_DISPLAY_RANGES, NODE_DISPLAY_SETTING_KEYS, MAX_INFRA_NODE_AGE_HOURS_RANGE } from '../../constants/nodeDisplayDefaults.js';
+import { NODE_DISPLAY_RANGES, SETTINGS_TAB_PER_SOURCE_KEYS, MAX_INFRA_NODE_AGE_HOURS_RANGE, TX_TARGET_MAX_AGE_HOURS_WHEN_UNLIMITED_RANGE } from '../../constants/nodeDisplayDefaults.js';
 import { resolveAppriseServerUrl } from '../services/appriseNotificationService.js';
+import {
+  AIRCRAFT_AGL_RANGE,
+  AIRCRAFT_MSL_RANGE,
+  AIRCRAFT_AGE_OUT_HOURS_RANGE,
+  isAircraftAgeOutAction,
+} from '../../utils/aircraftClassification.js';
+import { aircraftClassificationService } from '../services/aircraftClassificationService.js';
+import { isAdsbFeed, ADSB_FEED_IDS } from '../../utils/adsbFeeds.js';
+import { clampIntervalSetting, GEOFENCE_WHILE_INSIDE_MINUTES } from '../utils/schedulerInterval.js';
+import { GEOFENCE_RADIUS_KM_MAX } from '../../utils/geofenceLimits.js';
 
 // ─── Tile URL validation ─────────────────────────────────────────────────
 
@@ -268,11 +288,12 @@ router.get('/', optionalAuth(), async (req: Request, res: Response) => {
       // source created after migration 131 has no seeded per-source row, and would
       // otherwise display the legacy global value while behaving as the hardcoded
       // default. Exclude them from the global back-fill; they end up present only
-      // when the per-source row exists.
+      // when the per-source row exists. Same for the later standalone per-source
+      // keys in SETTINGS_TAB_PER_SOURCE_KEYS (#5376).
       const cleaned: Record<string, string> = {};
       for (const [k, v] of Object.entries(globalSettings)) {
         if (k.startsWith('source:')) continue;
-        if ((NODE_DISPLAY_SETTING_KEYS as readonly string[]).includes(k)) continue;
+        if ((SETTINGS_TAB_PER_SOURCE_KEYS as readonly string[]).includes(k)) continue;
         cleaned[k] = v;
       }
       const sourceSettings = await databaseService.settings.getSourceSettings(sourceId);
@@ -311,8 +332,13 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
     // so the deny branch is unreachable and ignoredKeys stays empty).
     const filteredSettings: Record<string, string> = {};
     const ignoredKeys: string[] = [];
+    // Secret keys are never sent to non-admins (stripSecretSettings), so a
+    // non-admin's Settings save carries them blank. Drop them rather than let
+    // that save wipe a stored key (#5374; elevationSourceUrl had the same gap).
+    const isAdminWriter = req.user?.isAdmin === true;
     for (const key of VALID_SETTINGS_KEYS) {
       if (!(key in settings)) continue;
+      if (!isAdminWriter && isSecretSettingKey(key)) continue;
       if (sourceId && GLOBAL_ONLY_SETTINGS_KEYS.has(key)) {
         ignoredKeys.push(key);
         continue;
@@ -337,7 +363,18 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
     // arrays stay unmodified (#4547 Phase 2 WP2). Sits before both write paths
     // (setSourceSettings below and setSettings further down) and before
     // callbacks.refreshMeshcoreReceiveOnly fires, so a rejected request writes nothing.
-    const STRICT_BOOLEAN_SETTINGS_KEYS = ['meshcoreReceiveOnly'] as const;
+    const STRICT_BOOLEAN_SETTINGS_KEYS = [
+      'meshcoreReceiveOnly',
+      // Likely-aircraft detection (#5364/#5365 spec §4.5): both booleans gate
+      // real behavior (classification writes / Auto-Favorite exclusion), so a
+      // typo'd value should 400 rather than silently read as false.
+      'aircraftDetectionEnabled',
+      'autoFavoriteExcludeAircraft',
+      // Aircraft age-out (#5364/#5365 Phase 2): ignores or deletes nodes.
+      'aircraftAgeOutEnabled',
+      // ADS-B flight matching (#5374): turns on third-party HTTP requests.
+      'adsbMatchEnabled',
+    ] as const;
 
     for (const key of STRICT_BOOLEAN_SETTINGS_KEYS) {
       if (!(key in filteredSettings)) continue;
@@ -345,6 +382,37 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
       if (v !== 'true' && v !== 'false') {
         return fail(res, 400, 'INVALID_BOOLEAN_SETTING',
           `${key} must be the boolean true or false (received "${v}")`);
+      }
+    }
+
+    // Auto-Enrichment schedule floor (#5287). The scheduler clamps and rejects
+    // these again at read time; validating here as well turns a bad value into
+    // a visible 400 instead of a schedule that silently never fires.
+    if ('autoEnrichmentIntervalMinutes' in filteredSettings) {
+      const minutes = Number(filteredSettings.autoEnrichmentIntervalMinutes);
+      if (!Number.isInteger(minutes)
+        || minutes < AUTO_ENRICHMENT_MIN_INTERVAL_MINUTES
+        || minutes > AUTO_ENRICHMENT_MAX_INTERVAL_MINUTES) {
+        return fail(res, 400, 'INVALID_AUTO_ENRICHMENT_INTERVAL',
+          `autoEnrichmentIntervalMinutes must be a whole number from ${AUTO_ENRICHMENT_MIN_INTERVAL_MINUTES} to ${AUTO_ENRICHMENT_MAX_INTERVAL_MINUTES}`);
+      }
+    }
+    if ('autoEnrichmentScheduleType' in filteredSettings
+      && !['interval', 'cron'].includes(filteredSettings.autoEnrichmentScheduleType)) {
+      return fail(res, 400, 'INVALID_AUTO_ENRICHMENT_SCHEDULE_TYPE',
+        'autoEnrichmentScheduleType must be "interval" or "cron"');
+    }
+    {
+      // A cron only has to be valid when it is the schedule in effect, so a
+      // user can switch to interval mode without first clearing a bad cron.
+      const effectiveType = filteredSettings.autoEnrichmentScheduleType
+        ?? currentSettings.autoEnrichmentScheduleType;
+      const cron = filteredSettings.autoEnrichmentCron ?? currentSettings.autoEnrichmentCron ?? '';
+      if (effectiveType === 'cron'
+        && ('autoEnrichmentCron' in filteredSettings || 'autoEnrichmentScheduleType' in filteredSettings)
+        && !cronFiresAtMostHourly(cron)) {
+        return fail(res, 400, 'INVALID_AUTO_ENRICHMENT_CRON',
+          'autoEnrichmentCron must be a valid cron expression that fires at most once an hour');
       }
     }
 
@@ -430,6 +498,62 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
       if (isNaN(hours) || hours < R.min || hours > R.max) {
         return fail(res, 400, 'INVALID_MAX_INFRA_NODE_AGE_HOURS',
           `maxInfraNodeAgeHours must be between ${R.min} and ${R.max} hours (0 = never expire)`);
+      }
+    }
+
+    // Likely-aircraft detection thresholds (#5364/#5365 spec §4.5). Both are
+    // required integers within range — no "0 = unlimited" escape hatch here,
+    // unlike the age windows above.
+    if ('aircraftAglThresholdMeters' in filteredSettings) {
+      const meters = parseInt(filteredSettings.aircraftAglThresholdMeters, 10);
+      const R = AIRCRAFT_AGL_RANGE;
+      if (isNaN(meters) || meters < R.min || meters > R.max) {
+        return fail(res, 400, 'INVALID_AIRCRAFT_AGL_THRESHOLD',
+          `aircraftAglThresholdMeters must be between ${R.min} and ${R.max} meters`);
+      }
+    }
+    if ('aircraftMslThresholdMeters' in filteredSettings) {
+      const meters = parseInt(filteredSettings.aircraftMslThresholdMeters, 10);
+      const R = AIRCRAFT_MSL_RANGE;
+      if (isNaN(meters) || meters < R.min || meters > R.max) {
+        return fail(res, 400, 'INVALID_AIRCRAFT_MSL_THRESHOLD',
+          `aircraftMslThresholdMeters must be between ${R.min} and ${R.max} meters`);
+      }
+    }
+
+    // Aircraft age-out (#5364/#5365 Phase 2). Whole hours in 6–168, and an
+    // explicit 'ignore' | 'delete' — 'delete' is destructive, so a typo must
+    // 400 rather than fall back silently.
+    if ('aircraftAgeOutHours' in filteredSettings) {
+      const raw = String(filteredSettings.aircraftAgeOutHours).trim();
+      const hours = raw === '' ? NaN : Number(raw);
+      const R = AIRCRAFT_AGE_OUT_HOURS_RANGE;
+      if (!Number.isInteger(hours) || hours < R.min || hours > R.max) {
+        return fail(res, 400, 'INVALID_AIRCRAFT_AGE_OUT_HOURS',
+          `aircraftAgeOutHours must be a whole number between ${R.min} and ${R.max}`);
+      }
+    }
+    // ADS-B flight matching (#5374): only the feeds the client knows.
+    if ('adsbFeed' in filteredSettings && !isAdsbFeed(filteredSettings.adsbFeed)) {
+      return fail(res, 400, 'INVALID_ADSB_FEED',
+        `adsbFeed must be one of: ${ADSB_FEED_IDS.join(', ')}`);
+    }
+    if ('aircraftAgeOutAction' in filteredSettings
+      && !isAircraftAgeOutAction(filteredSettings.aircraftAgeOutAction)) {
+      return fail(res, 400, 'INVALID_AIRCRAFT_AGE_OUT_ACTION',
+        `aircraftAgeOutAction must be 'ignore' or 'delete'`);
+    }
+
+    // #5376: TX-target window used when maxNodeAgeHours is 0 ("unlimited").
+    // It bounds which nodes auto-traceroute / remote-admin / remote LocalStats
+    // may transmit to, so 0 ("no bound") is rejected here.
+    if ('txTargetMaxAgeHoursWhenUnlimited' in filteredSettings) {
+      const raw = filteredSettings.txTargetMaxAgeHoursWhenUnlimited;
+      const hours = Number(raw);
+      const R = TX_TARGET_MAX_AGE_HOURS_WHEN_UNLIMITED_RANGE;
+      if (raw.trim() === '' || !Number.isInteger(hours) || hours < R.min || hours > R.max) {
+        return fail(res, 400, 'INVALID_TX_TARGET_MAX_AGE_HOURS',
+          `txTargetMaxAgeHoursWhenUnlimited must be a whole number between ${R.min} and ${R.max} hours`);
       }
     }
 
@@ -630,6 +754,7 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
     if ('geofenceTriggers' in filteredSettings) {
       try {
         const triggers = JSON.parse(filteredSettings.geofenceTriggers);
+        let geofenceTriggersClamped = false;
 
         if (!Array.isArray(triggers)) {
           return res.status(400).json({ error: 'geofenceTriggers must be an array' });
@@ -671,6 +796,14 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
             if (typeof trigger.shape.radiusKm !== 'number' || trigger.shape.radiusKm <= 0) {
               return res.status(400).json({ error: 'Circle geofence must have a positive radiusKm' });
             }
+            // Rejected like the lat/lng checks above, not clamped: this is shape
+            // data with no timer or mesh-traffic risk, and the UI already clamps
+            // to the same ceiling, so only a direct API caller can hit this.
+            if (trigger.shape.radiusKm > GEOFENCE_RADIUS_KM_MAX) {
+              return res
+                .status(400)
+                .json({ error: `Circle geofence radiusKm must be at most ${GEOFENCE_RADIUS_KM_MAX}` });
+            }
           } else if (trigger.shape.type === 'polygon') {
             if (!Array.isArray(trigger.shape.vertices) || trigger.shape.vertices.length < 3) {
               return res.status(400).json({ error: 'Polygon geofence must have at least 3 vertices' });
@@ -692,10 +825,22 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
           }
 
           if (trigger.event === 'while_inside') {
-            if (typeof trigger.whileInsideIntervalMinutes !== 'number' || trigger.whileInsideIntervalMinutes < 1) {
+            if (typeof trigger.whileInsideIntervalMinutes !== 'number' || !Number.isFinite(trigger.whileInsideIntervalMinutes)) {
               return res
                 .status(400)
-                .json({ error: 'whileInsideIntervalMinutes must be >= 1 when event is "while_inside"' });
+                .json({ error: 'whileInsideIntervalMinutes must be a number when event is "while_inside"' });
+            }
+            // Clamp rather than reject: above ~35,791 minutes the scheduler's
+            // setInterval delay overflows and fires every 1 ms. The manager
+            // clamps again when it arms the timer, for rows already stored.
+            const clamped = clampIntervalSetting(
+              trigger.whileInsideIntervalMinutes,
+              GEOFENCE_WHILE_INSIDE_MINUTES,
+              `Geofence "${trigger.name}" whileInsideIntervalMinutes (save)`,
+            );
+            if (clamped !== trigger.whileInsideIntervalMinutes) {
+              trigger.whileInsideIntervalMinutes = clamped;
+              geofenceTriggersClamped = true;
             }
           }
 
@@ -749,6 +894,9 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
               }
             }
           }
+        }
+        if (geofenceTriggersClamped) {
+          filteredSettings.geofenceTriggers = JSON.stringify(triggers);
         }
       } catch (error) {
         return res.status(400).json({ error: 'Invalid JSON format for geofenceTriggers' });
@@ -938,6 +1086,38 @@ router.post('/', requirePermission('settings', 'write', { sourceIdFrom: 'query' 
       // rather than waiting for the source to reconnect.
       if ('meshcoreReceiveOnly' in filteredSettings) {
         callbacks.refreshMeshcoreReceiveOnly?.(sourceId);
+      }
+
+      // Coverage Report MQTT gateway-reception recording (#5277 P2): the
+      // ingest hook reads this flag through a 30s TTL cache
+      // (coverageMqttSettings.ts) so a busy MQTT feed doesn't hit the
+      // settings table per packet — invalidate it here so a scoped save
+      // takes effect immediately rather than waiting out the TTL.
+      // Sign-flip correction (#5363): the MQTT ingest gates read the
+      // per-source context through a 60s cache; drop it so a save applies now.
+      if (Object.values(SIGN_FLIP_SETTING_KEYS).some((key) => key in filteredSettings)) {
+        invalidateSignFlipContext(sourceId);
+      }
+
+      if (COVERAGE_MQTT_ENABLED_SETTING in filteredSettings) {
+        invalidateCoverageMqttEnabled(sourceId);
+      }
+
+      // Likely-aircraft detection (#5364/#5365 D6/D7): a threshold or
+      // enable/disable change gets a silent, no-network recompute from
+      // stored values so the map/badge reflect the new setting immediately,
+      // without waiting for the next position packet. Not awaited — the
+      // response must not wait on a (possibly large) per-source recompute.
+      // `autoFavoriteExcludeAircraft` alone triggers nothing here: the
+      // Auto-Favorite sweep reads it directly on its own schedule.
+      const aircraftDetectionKeys = [
+        'aircraftDetectionEnabled',
+        'aircraftAglThresholdMeters',
+        'aircraftMslThresholdMeters',
+      ];
+      if (aircraftDetectionKeys.some((key) => key in filteredSettings)) {
+        void aircraftClassificationService.reclassifySource(sourceId).catch((err) =>
+          logger.warn(`Aircraft reclassify failed for source ${sourceId}:`, err));
       }
 
       await auditSettingsWrite(req, currentSettings, filteredSettings, sourceId);
@@ -1312,8 +1492,9 @@ router.post('/traceroute-interval', requirePermission('settings', 'write'), (req
       return res.status(400).json({ error: 'Invalid interval. Must be between 0 and 60 minutes (0 = disabled).' });
     }
 
-    const traceIntervalManager = (resolveSourceManager(traceIntervalSourceId));
-    traceIntervalManager.setTracerouteInterval(intervalMinutes);
+    // Apply only to THIS source's own radio. A non-Meshtastic source has none;
+    // re-arming the primary's scheduler would change its airtime (#5375).
+    resolveOwnMeshtasticManager(traceIntervalSourceId)?.setTracerouteInterval(intervalMinutes);
     res.json({ success: true, intervalMinutes });
   } catch (error) {
     logger.error('Error setting traceroute interval:', error);
@@ -1327,8 +1508,8 @@ router.post('/remote-localstats-interval', requirePermission('settings', 'write'
     if (typeof intervalMinutes !== 'number' || intervalMinutes < 0 || intervalMinutes > 1440) {
       return res.status(400).json({ error: 'Invalid interval. Must be between 0 and 1440 minutes (0 = disabled).' });
     }
-    const rlsIntervalManager = (resolveSourceManager(rlsIntervalSourceId));
-    rlsIntervalManager.setRemoteLocalStatsInterval(intervalMinutes);
+    // Own radio only; never the primary's scheduler (#5375).
+    resolveOwnMeshtasticManager(rlsIntervalSourceId)?.setRemoteLocalStatsInterval(intervalMinutes);
     res.json({ success: true, intervalMinutes });
   } catch (error) {
     logger.error('Error setting remote LocalStats interval:', error);
@@ -1780,8 +1961,12 @@ router.post('/time-sync-nodes', requirePermission('settings', 'write'), async (r
 
     // Update the meshtastic manager interval if connected
     const timeSyncSourceId = sourceId;
-    const timeSyncManager = resolveSourceManager(timeSyncSourceId);
-    if (intervalMinutes !== undefined) {
+    // Own radio only; a non-Meshtastic source never re-arms the primary's
+    // time-sync scheduler (#5375).
+    const timeSyncManager = resolveOwnMeshtasticManager(timeSyncSourceId);
+    if (!timeSyncManager) {
+      // Settings are saved above; there is no local radio to apply them to.
+    } else if (intervalMinutes !== undefined) {
       timeSyncManager.setTimeSyncInterval(enabled ? Number(intervalMinutes) : 0);
     } else if (enabled !== undefined) {
       // If only enabled/disabled changed, use existing interval (per-source with global fallback)
@@ -1807,7 +1992,9 @@ router.post('/time-sync-nodes', requirePermission('settings', 'write'), async (r
 router.get('/auto-ping', requirePermission('settings', 'read'), async (req, res) => {
   try {
     const autoPingSourceId = req.query.sourceId as string | undefined;
-    const autoPingManager = resolveSourceManager(autoPingSourceId);
+    // Sessions come from THIS source's own radio; a source with none (MQTT
+    // broker/bridge, disconnected TCP) has no sessions, not the primary's (#5375).
+    const autoPingManager = resolveOwnMeshtasticManager(autoPingSourceId);
     // Per-source settings layered on top of globals (source override wins)
     const sourceOverrides = autoPingSourceId
       ? await databaseService.settings.getSourceSettings(autoPingSourceId)
@@ -1822,7 +2009,7 @@ router.get('/auto-ping', requirePermission('settings', 'read'), async (req, res)
       autoPingMaxPings: parseInt((await readSetting('autoPingMaxPings')) || '20', 10),
       autoPingTimeoutSeconds: parseInt((await readSetting('autoPingTimeoutSeconds')) || '60', 10),
     };
-    const sessions = await autoPingManager.getAutoPingSessions();
+    const sessions = autoPingManager ? await autoPingManager.getAutoPingSessions() : [];
     res.json({ settings, sessions });
   } catch (error) {
     logger.error('Error fetching auto-ping settings:', error);
@@ -1960,6 +2147,47 @@ router.post('/position-estimation/run-now', requirePermission('settings', 'write
       ? 'Position estimation already in progress'
       : 'Failed to run position estimation';
     res.status(message.includes('in progress') ? 409 : 500).json({ error: message });
+  }
+});
+
+/**
+ * Auto-Enrichment (#5287): scheduled NodeInfo Enrichment "Fix All".
+ * Settings themselves save through POST /api/settings; these report status
+ * and trigger a run outside the schedule.
+ */
+router.get('/auto-enrichment/status', requirePermission('settings', 'read'), async (_req, res) => {
+  try {
+    return ok(res, await autoEnrichmentScheduler.getStatus());
+  } catch (error) {
+    logger.error('Error fetching auto-enrichment status:', error);
+    return fail(res, 500, 'AUTO_ENRICHMENT_STATUS_FAILED', 'Failed to fetch auto-enrichment status');
+  }
+});
+
+/**
+ * Run now. Resolves after the database pass; any NodeInfo pushes follow in the
+ * background under the same per-run cap and spacing as a scheduled run.
+ * Counts as a run, so it also resets the schedule's clock.
+ */
+router.post('/auto-enrichment/run-now', requirePermission('settings', 'write'), async (req, res) => {
+  try {
+    const summary = await autoEnrichmentScheduler.runNow('manual');
+    void databaseService.auditLogAsync(
+      req.user!.id,
+      'auto_enrichment_run',
+      'settings',
+      `Ran auto-enrichment: ${summary.nodesFilled} node(s) filled, ${summary.pushesPending} push(es) queued`,
+      req.ip || null,
+      null,
+      JSON.stringify(summary),
+    );
+    return ok(res, summary);
+  } catch (error) {
+    if (error instanceof AutoEnrichmentInProgressError) {
+      return fail(res, 409, 'AUTO_ENRICHMENT_IN_PROGRESS', 'Auto-enrichment is already running');
+    }
+    logger.error('Error running auto-enrichment:', error);
+    return fail(res, 500, 'AUTO_ENRICHMENT_RUN_FAILED', 'Failed to run auto-enrichment');
   }
 });
 

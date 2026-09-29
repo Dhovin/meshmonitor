@@ -16,9 +16,10 @@ vi.mock('react-leaflet', () => ({
     <div
       data-testid="map-container"
       data-scrollwheel={String(props.scrollWheelZoom)}
-      data-own-option-keys={['scrollWheelZoom', 'doubleClickZoom', 'zoomControl', 'attributionControl']
+      data-own-option-keys={['scrollWheelZoom', 'doubleClickZoom', 'zoomControl', 'attributionControl', 'preferCanvas']
         .filter((k) => k in props)
         .join(',')}
+      data-prefer-canvas={String((props as { preferCanvas?: boolean }).preferCanvas)}
     >
       {children}
     </div>
@@ -39,7 +40,14 @@ vi.mock('react-leaflet', () => ({
 }));
 
 vi.mock('../VectorTileLayer', () => ({
-  VectorTileLayer: (p: { url?: string }) => <div data-testid="vector-tile" data-url={p.url} />,
+  VectorTileLayer: (p: { url?: string; styleUrl?: string; cartoApiKey?: string | null }) => (
+    <div
+      data-testid="vector-tile"
+      data-url={p.url}
+      data-style-url={p.styleUrl ?? ''}
+      data-carto-key={p.cartoApiKey ?? ''}
+    />
+  ),
 }));
 
 vi.mock('../TilesetSelector', () => ({
@@ -116,6 +124,25 @@ describe('BaseMap', () => {
   it('leaves a non-Carto raster URL untouched even when a Carto key is set', () => {
     render(<BaseMap center={[0, 0]} zoom={3} cartoApiKey="KEY123" />);
     expect(screen.getByTestId('raster-tile').getAttribute('data-url')).toBe(OSM_URL);
+  });
+
+  // 2c. CARTO vector presets (#5448): the style URL and key go to MapLibre;
+  // the raster twin in `url` is NOT rendered as a TileLayer.
+  it('hands a CARTO style preset to VectorTileLayer with its styleUrl and the key', () => {
+    render(<BaseMap center={[0, 0]} zoom={3} tilesetId="cartoVoyager" cartoApiKey="KEY123" />);
+    const vectorTile = screen.getByTestId('vector-tile');
+    expect(vectorTile.getAttribute('data-style-url')).toBe(
+      'https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json',
+    );
+    expect(vectorTile.getAttribute('data-carto-key')).toBe('KEY123');
+    expect(screen.queryByTestId('raster-tile')).not.toBeInTheDocument();
+  });
+
+  it('hands the bundled Voyager Dark style to VectorTileLayer', () => {
+    render(<BaseMap center={[0, 0]} zoom={3} tilesetId="cartoVoyagerDark" />);
+    expect(screen.getByTestId('vector-tile').getAttribute('data-style-url')).toBe(
+      'map-styles/carto-voyager-dark.json',
+    );
   });
 
   // 3. Unknown-id fallback
@@ -312,6 +339,31 @@ describe('BaseMap', () => {
   it('includes only the interaction options that were explicitly passed', () => {
     render(<BaseMap center={[0, 0]} zoom={3} scrollWheelZoom={false} zoomControl />);
     expect(screen.getByTestId('map-container').getAttribute('data-own-option-keys')).toBe('scrollWheelZoom,zoomControl');
+  });
+
+  // preferCanvas passthrough (#5277 Coverage Report P4a WP2, decision A6):
+  // a mount-only Leaflet Map option, so it follows the same
+  // omit-when-undefined rule as the other interaction options above — an
+  // explicit `preferCanvas: undefined` would override Leaflet's own default.
+  it('omits preferCanvas by default', () => {
+    render(<BaseMap center={[0, 0]} zoom={3} />);
+    const container = screen.getByTestId('map-container');
+    expect(container.getAttribute('data-own-option-keys')).toBe('');
+    expect(container.getAttribute('data-prefer-canvas')).toBe('undefined');
+  });
+
+  it('forwards preferCanvas to MapContainer when explicitly set', () => {
+    render(<BaseMap center={[0, 0]} zoom={3} preferCanvas />);
+    const container = screen.getByTestId('map-container');
+    expect(container.getAttribute('data-own-option-keys')).toBe('preferCanvas');
+    expect(container.getAttribute('data-prefer-canvas')).toBe('true');
+  });
+
+  it('forwards an explicit preferCanvas={false} distinctly from omitting it', () => {
+    render(<BaseMap center={[0, 0]} zoom={3} preferCanvas={false} />);
+    const container = screen.getByTestId('map-container');
+    expect(container.getAttribute('data-own-option-keys')).toBe('preferCanvas');
+    expect(container.getAttribute('data-prefer-canvas')).toBe('false');
   });
 
   // 8. Icon fix applied (unmocked icon module, real leaflet)

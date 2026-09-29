@@ -8,7 +8,10 @@ import { eq, desc, sql, isNull, isNotNull, and, or, lt, gte, inArray, type SQL }
 import { BaseRepository, DrizzleDatabase } from './base.js';
 import { DatabaseType } from '../types.js';
 import { shouldDiscardPosition } from '../../utils/nullIsland.js';
+import { sanitizeMeshCoreName } from '../../utils/meshcoreName.js';
 import { getDiscardInvalidPositions } from '../../utils/positionIngestConfig.js';
+import { isFutureDriftedMeshCoreTimeMs } from '../../utils/meshcoreTimestamp.js';
+import { resolveFirstHeard } from '../../utils/firstHeard.js';
 
 /**
  * meshcore_nodes columns where an incoming `null` in upsertNode means "clear
@@ -47,6 +50,8 @@ export interface DbMeshCoreNode {
   rssi?: number | null;
   snr?: number | null;
   lastHeard?: number | null;
+  /** #5390: earliest reception on this source, epoch MILLISECONDS (like lastHeard). Set once. */
+  firstHeard?: number | null;
   hasAdminAccess?: boolean | null;
   lastAdminCheck?: number | null;
   isLocalNode?: boolean | null;
@@ -199,6 +204,7 @@ export interface MeshCoreGroupedPacket {
   observerCount: number;
   /** Total rows in the group — receptions, not distinct observers. */
   receptionCount: number;
+  /** MIN(timestamp) over this group's receptions. Not `meshcore_nodes.firstHeard` (#5390). */
   firstHeard: number;
   lastHeard: number;
 }
@@ -304,6 +310,20 @@ export class MeshCoreRepository extends BaseRepository {
   // ============ Node Operations ============
 
   /**
+   * Normalize node rows for callers, scrubbing the name down to printable
+   * text. Rows written before the ingest guard in meshcoreManager (or by a
+   * corrupt serial frame it could not catch) may hold binary junk; a null
+   * name makes the UI fall back to the public key instead.
+   */
+  private toNodeRows(result: unknown[]): DbMeshCoreNode[] {
+    const rows = this.normalizeBigInts(result) as unknown as DbMeshCoreNode[];
+    for (const row of rows) {
+      if (row.name != null) row.name = sanitizeMeshCoreName(row.name);
+    }
+    return rows;
+  }
+
+  /**
    * Get all MeshCore nodes
    */
   async getAllNodes(): Promise<DbMeshCoreNode[]> {
@@ -312,7 +332,7 @@ export class MeshCoreRepository extends BaseRepository {
       .select()
       .from(meshcoreNodes)
       .orderBy(desc(meshcoreNodes.lastHeard));
-    return this.normalizeBigInts(result) as unknown as DbMeshCoreNode[];
+    return this.toNodeRows(result);
   }
 
   /**
@@ -329,7 +349,7 @@ export class MeshCoreRepository extends BaseRepository {
       .from(meshcoreNodes)
       .where(eq(meshcoreNodes.sourceId, sourceId))
       .orderBy(desc(meshcoreNodes.lastHeard));
-    return this.normalizeBigInts(result) as unknown as DbMeshCoreNode[];
+    return this.toNodeRows(result);
   }
 
   /**
@@ -345,7 +365,7 @@ export class MeshCoreRepository extends BaseRepository {
       .from(meshcoreNodes)
       .where(eq(meshcoreNodes.publicKey, publicKey))
       .limit(1);
-    return result[0] ? this.normalizeBigInts(result[0]) as unknown as DbMeshCoreNode : null;
+    return result[0] ? this.toNodeRows([result[0]])[0] : null;
   }
 
   /**
@@ -364,7 +384,7 @@ export class MeshCoreRepository extends BaseRepository {
       .from(meshcoreNodes)
       .where(and(eq(meshcoreNodes.publicKey, publicKey), eq(meshcoreNodes.sourceId, sourceId)))
       .limit(1);
-    return result[0] ? this.normalizeBigInts(result[0]) as unknown as DbMeshCoreNode : null;
+    return result[0] ? this.toNodeRows([result[0]])[0] : null;
   }
 
   /**
@@ -377,7 +397,7 @@ export class MeshCoreRepository extends BaseRepository {
       .from(meshcoreNodes)
       .where(eq(meshcoreNodes.isLocalNode, true))
       .limit(1);
-    return result[0] ? this.normalizeBigInts(result[0]) as unknown as DbMeshCoreNode : null;
+    return result[0] ? this.toNodeRows([result[0]])[0] : null;
   }
 
   /**
@@ -405,6 +425,18 @@ export class MeshCoreRepository extends BaseRepository {
     // clobbering it on a transient bad report (#3763 follow-up).
     // The (0,0) discard honors the global `discardInvalidPositions` setting;
     // out-of-range junk (e.g. lat 1853 from advert corruption) is always dropped.
+    // Store only printable names. A name with nothing printable left counts as
+    // "not observed" so the merge below keeps the stored name.
+    if (typeof node.name === 'string') {
+      const clean = sanitizeMeshCoreName(node.name);
+      if (clean === null) {
+        const { name: _name, ...rest } = node;
+        node = rest as typeof node;
+      } else if (clean !== node.name) {
+        node = { ...node, name: clean };
+      }
+    }
+
     if (shouldDiscardPosition(node.latitude ?? null, node.longitude ?? null, undefined, getDiscardInvalidPositions())) {
       const { latitude: _blat, longitude: _blon, ...rest } = node;
       node = rest as typeof node;
@@ -474,10 +506,23 @@ export class MeshCoreRepository extends BaseRepository {
       // A lower incoming value is therefore never news: it is a staler
       // observer's opinion, not evidence the node went away. Drop it and keep
       // what we have. (Null/undefined was already dropped by the merge above.)
+      //
+      // Except when the stored value is itself implausible (#5339): a drifted
+      // sender RTC wrote year 2087 here before ingest checked it, and "only
+      // forward" would then freeze that value until 2087. Any real
+      // observation replaces it.
+      // #5390: `firstHeard` is stamped once and never overwritten. Resolve
+      // it before the forward-only guard below drops a stale lastHeard: an
+      // older reading is still evidence of an earlier reception.
+      delete updateSet.firstHeard;
+      const firstHeard = resolveFirstHeard(existing.firstHeard, existing.lastHeard, effectiveNode.lastHeard, 'ms', now);
+      if (firstHeard !== undefined) updateSet.firstHeard = firstHeard;
+
       if (
         typeof updateSet.lastHeard === 'number' &&
         typeof existing.lastHeard === 'number' &&
-        updateSet.lastHeard <= existing.lastHeard
+        updateSet.lastHeard <= existing.lastHeard &&
+        !isFutureDriftedMeshCoreTimeMs(Number(existing.lastHeard), now)
       ) {
         delete updateSet.lastHeard;
       }
@@ -490,6 +535,8 @@ export class MeshCoreRepository extends BaseRepository {
         .insert(meshcoreNodes)
         .values({
           ...node,
+          // #5390: first reception, epoch ms; null until a plausible lastHeard.
+          firstHeard: resolveFirstHeard(null, null, node.lastHeard, 'ms', now) ?? null,
           sourceId,
           createdAt: now,
           updatedAt: now,
@@ -1047,7 +1094,7 @@ export class MeshCoreRepository extends BaseRepository {
       .select()
       .from(meshcoreNodes)
       .where(and(eq(meshcoreNodes.sourceId, sourceId), eq(meshcoreNodes.telemetryEnabled, true)));
-    return this.normalizeBigInts(result) as unknown as DbMeshCoreNode[];
+    return this.toNodeRows(result);
   }
 
   /**
@@ -1062,7 +1109,7 @@ export class MeshCoreRepository extends BaseRepository {
       .select()
       .from(meshcoreNodes)
       .where(and(eq(meshcoreNodes.sourceId, sourceId), eq(meshcoreNodes.neighborsEnabled, true)));
-    return this.normalizeBigInts(result) as unknown as DbMeshCoreNode[];
+    return this.toNodeRows(result);
   }
 
   /**
@@ -1082,7 +1129,7 @@ export class MeshCoreRepository extends BaseRepository {
       .select()
       .from(meshcoreNodes)
       .where(and(eq(meshcoreNodes.sourceId, sourceId), eq(meshcoreNodes.timeSyncEnabled, true)));
-    return this.normalizeBigInts(result) as unknown as DbMeshCoreNode[];
+    return this.toNodeRows(result);
   }
 
   /**
@@ -1105,7 +1152,7 @@ export class MeshCoreRepository extends BaseRepository {
         gte(meshcoreNodes.batteryMv, 1),
         lt(meshcoreNodes.batteryMv, thresholdMv),
       ));
-    return this.normalizeBigInts(result) as unknown as DbMeshCoreNode[];
+    return this.toNodeRows(result);
   }
 
   /**
@@ -1130,7 +1177,7 @@ export class MeshCoreRepository extends BaseRepository {
         isNotNull(meshcoreNodes.lastHeard),
         lt(meshcoreNodes.lastHeard, cutoffMs),
       ));
-    return this.normalizeBigInts(result) as unknown as DbMeshCoreNode[];
+    return this.toNodeRows(result);
   }
 
   async getRoomSyncEnabledNodes(sourceId: string): Promise<DbMeshCoreNode[]> {
@@ -1142,7 +1189,7 @@ export class MeshCoreRepository extends BaseRepository {
         eq(meshcoreNodes.sourceId, sourceId),
         eq(meshcoreNodes.roomSyncEnabled, true),
       ));
-    return this.normalizeBigInts(result) as unknown as DbMeshCoreNode[];
+    return this.toNodeRows(result);
   }
 
   /**
@@ -1705,6 +1752,36 @@ export class MeshCoreRepository extends BaseRepository {
         createdAt: nowMs,
       })),
     );
+  }
+
+  /**
+   * The stored neighbour set one repeater reported on one source (#5413).
+   * Read before a partial neighbour fetch is written, so it can be merged
+   * instead of replacing a fuller set.
+   */
+  async getNeighborsForReporter(
+    sourceId: string,
+    publicKey: string,
+  ): Promise<Array<{ neighborPublicKey: string; snr: number | null; lastHeardSecs: number | null; timestamp: number }>> {
+    if (!sourceId) {
+      throw new Error('MeshCoreRepository.getNeighborsForReporter requires a sourceId');
+    }
+    const { meshcoreNeighbors } = this.tables;
+    const rows = await this.db
+      .select({
+        neighborPublicKey: meshcoreNeighbors.neighborPublicKey,
+        snr: meshcoreNeighbors.snr,
+        lastHeardSecs: meshcoreNeighbors.lastHeardSecs,
+        timestamp: meshcoreNeighbors.timestamp,
+      })
+      .from(meshcoreNeighbors)
+      .where(and(eq(meshcoreNeighbors.sourceId, sourceId), eq(meshcoreNeighbors.publicKey, publicKey)));
+    return rows.map((r: { neighborPublicKey: string; snr: number | null; lastHeardSecs: number | null; timestamp: number }) => ({
+      neighborPublicKey: r.neighborPublicKey,
+      snr: r.snr,
+      lastHeardSecs: r.lastHeardSecs,
+      timestamp: Number(r.timestamp),
+    }));
   }
 
   async getNeighbors(

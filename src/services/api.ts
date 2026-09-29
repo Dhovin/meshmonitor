@@ -22,6 +22,21 @@ import {
 } from '../utils/validation.js';
 import { logger } from '../utils/logger.js';
 import { parseJsonResponse } from '../utils/parseJsonResponse.js';
+import type { NodeTransportClass } from '../utils/nodeTransport.js';
+import type { OutlierPreview, OutlierPurgeResult } from '../utils/telemetryOutliers.js';
+import type { FlightMatch } from '../types/flightMatch.js';
+
+/** Body of the telemetry outlier preview/purge requests (#5333). */
+export interface TelemetryOutlierRequest {
+  sourceId: string;
+  telemetryType: string;
+  /** Omit to sweep every node on the source. */
+  nodeId?: string;
+  auto: boolean;
+  k: number;
+  min: number | null;
+  max: number | null;
+}
 
 export type SignalTrend = 'improving' | 'stable' | 'degrading' | 'insufficient';
 
@@ -43,6 +58,40 @@ export interface SignalTrendResult {
   snr: SignalTrendMetric | null;
   noiseFloor: SignalTrendMetric | null;
   noiseFloorRising: boolean;
+}
+
+/** `GET /api/messages/counts` response body (#5101). `total === byTransport.rf + byTransport.udp + byTransport.mqtt` always. */
+export interface MessageCounts {
+  sourceId: string;
+  total: number;
+  byTransport: { rf: number; udp: number; mqtt: number };
+}
+
+/** One labelled route-segment record (#5101 WP1 contract; WP4 fills the route). */
+export interface RouteSegmentView {
+  id: number;
+  fromNodeNum: number;
+  toNodeNum: number;
+  fromNodeId: string;
+  toNodeId: string;
+  fromNodeName: string;
+  toNodeName: string;
+  distanceKm: number;
+  timestamp: number;
+  isRecordHolder: boolean | null;
+  /** null = pre-#5101 row (reads as RF via `transport`). */
+  transportMechanism: number | null;
+  transport: NodeTransportClass;
+}
+
+/**
+ * `GET /api/route-segments/longest-active` and `.../record-holder` response
+ * body (#5101). The top-level fields are the LEGACY shape — the longest of
+ * the three `byTransport` entries, unchanged from pre-Phase-2 consumers —
+ * with `byTransport` added alongside for the per-transport UI.
+ */
+export interface RouteSegmentRecords extends RouteSegmentView {
+  byTransport: Record<NodeTransportClass, RouteSegmentView | null>;
 }
 
 export interface MeshtasticContactUrl {
@@ -870,6 +919,35 @@ class ApiService {
     return result.url;
   }
 
+  /**
+   * Likely-aircraft flight trails (#5364/#5365 Phase 3). `sourceIds` narrows
+   * to those sources; the server intersects it with what the caller may read.
+   * Unwraps the `ok()` envelope.
+   */
+  async getAircraftTrails(
+    hours: number,
+    sourceIds?: string[] | null,
+  ): Promise<Array<{ sourceId: string; nodeNum: number; points: Array<{ lat: number; lon: number; alt: number | null; ts: number }> }>> {
+    const params = new URLSearchParams({ hours: String(hours) });
+    if (sourceIds && sourceIds.length > 0) params.set('sources', sourceIds.join(','));
+    const body = await this.get<{
+      success: boolean;
+      data?: { trails?: Array<{ sourceId: string; nodeNum: number; points: Array<{ lat: number; lon: number; alt: number | null; ts: number }> }> };
+    }>(`/api/aircraft/trails?${params}`);
+    return body?.data?.trails ?? [];
+  }
+
+  /**
+   * ADS-B flight match for a likely-aircraft node on one source (#5374).
+   * Unwraps the `ok()` envelope; null when there is nothing to show.
+   */
+  async getFlightMatch(sourceId: string, nodeNum: number): Promise<FlightMatch | null> {
+    const body = await this.get<{ success: boolean; data?: FlightMatch | null }>(
+      `/api/sources/${encodeURIComponent(sourceId)}/nodes/${nodeNum >>> 0}/flight-match`,
+    );
+    return body?.data ?? null;
+  }
+
   async getMessages(limit: number = 100, sourceId?: string | null): Promise<MeshMessage[]> {
     await this.ensureBaseUrl();
     const params = new URLSearchParams({ limit: String(limit) });
@@ -962,6 +1040,23 @@ class ApiService {
     );
     if (!response.ok) throw new Error('Failed to search messages');
     return response.json();
+  }
+
+  /**
+   * Total message count for one source, split RF/MQTT (#5101), for the Info
+   * tab's Total Messages breakdown. The server wraps the payload as
+   * `{ success, data }`; ApiService.request does not unwrap, so this reads
+   * `res.data` explicitly. `get()` does not check `response.ok` (see
+   * parseJsonResponse) — it just parses whatever JSON came back — so a 403 or
+   * 400 `fail()` body parses fine but carries no `data`, and this resolves to
+   * `null` rather than throwing. A malformed/HTML response still throws out
+   * of `get()` itself.
+   */
+  async getMessageCounts(sourceId: string): Promise<MessageCounts | null> {
+    const res = await this.get<{ success: boolean; data?: MessageCounts }>(
+      `/api/messages/counts?sourceId=${encodeURIComponent(sourceId)}`,
+    );
+    return res?.data ?? null;
   }
 
   async sendMessage(payload: {
@@ -1252,6 +1347,22 @@ class ApiService {
     return body.data.url;
   }
 
+  /**
+   * Import a Meshtastic contact URL into a source (#5317) — the decode side of
+   * `getMeshtasticContactUrl`, which is how a node that has never been heard
+   * gets a row to message.
+   */
+  async importMeshtasticContactUrl(
+    url: string,
+    sourceId: string,
+  ): Promise<{ node: DeviceInfo | null; alreadyKnown: boolean }> {
+    const body = await this.post<{
+      success: boolean;
+      data: { node: DeviceInfo | null; alreadyKnown: boolean };
+    }>('/api/nodes/import-contact-url', { url, sourceId });
+    return body.data;
+  }
+
   async updateTracerouteInterval(minutes: number) {
     // Validate interval minutes
     const validatedMinutes = validateIntervalMinutes(minutes);
@@ -1349,6 +1460,29 @@ class ApiService {
     return response.json();
   }
 
+  // ── Telemetry outlier purge (#5333) ──
+  // request() returns the raw `{ success, data }` body; unwrap `data` here.
+
+  async getTelemetryOutlierTypes(sourceId: string): Promise<string[]> {
+    const body = await this.request<{ data: { types: string[] } }>(
+      'GET',
+      `/api/purge/telemetry/outliers/types?sourceId=${encodeURIComponent(sourceId)}`,
+    );
+    return body.data.types;
+  }
+
+  async previewTelemetryOutliers(req: TelemetryOutlierRequest): Promise<OutlierPreview> {
+    const body = await this.request<{ data: OutlierPreview }>('POST', '/api/purge/telemetry/outliers/preview', req);
+    return body.data;
+  }
+
+  async purgeTelemetryOutliers(
+    req: TelemetryOutlierRequest & { cutoffId: number; fingerprint: string },
+  ): Promise<OutlierPurgeResult> {
+    const body = await this.request<{ data: OutlierPurgeResult }>('POST', '/api/purge/telemetry/outliers', req);
+    return body.data;
+  }
+
   async purgeNeighborInfo(nodeId: string) {
     await this.ensureBaseUrl();
     const response = await fetch(`${this.baseUrl}/api/nodes/${nodeId}/neighbors`, {
@@ -1365,7 +1499,7 @@ class ApiService {
     return response.json();
   }
 
-  async getLongestActiveRouteSegment(sourceId?: string | null) {
+  async getLongestActiveRouteSegment(sourceId?: string | null): Promise<RouteSegmentRecords | null> {
     await this.ensureBaseUrl();
     const qs = sourceId ? `?sourceId=${encodeURIComponent(sourceId)}` : '';
     const response = await fetch(`${this.baseUrl}/api/route-segments/longest-active${qs}`);
@@ -1377,7 +1511,7 @@ class ApiService {
     return response.json();
   }
 
-  async getRecordHolderRouteSegment(sourceId?: string | null) {
+  async getRecordHolderRouteSegment(sourceId?: string | null): Promise<RouteSegmentRecords | null> {
     await this.ensureBaseUrl();
     const qs = sourceId ? `?sourceId=${encodeURIComponent(sourceId)}` : '';
     const response = await fetch(`${this.baseUrl}/api/route-segments/record-holder${qs}`);
@@ -1389,9 +1523,17 @@ class ApiService {
     return response.json();
   }
 
-  async clearRecordHolderSegment(sourceId?: string | null) {
+  /**
+   * Clears a source's record holder (#5101). `transport` omitted clears every
+   * class (legacy behaviour); passing one clears only that class, leaving the
+   * others intact.
+   */
+  async clearRecordHolderSegment(sourceId?: string | null, transport?: NodeTransportClass): Promise<unknown> {
     await this.ensureBaseUrl();
-    const qs = sourceId ? `?sourceId=${encodeURIComponent(sourceId)}` : '';
+    const params = new URLSearchParams();
+    if (sourceId) params.set('sourceId', sourceId);
+    if (transport) params.set('transport', transport);
+    const qs = params.toString() ? `?${params.toString()}` : '';
     const response = await fetch(`${this.baseUrl}/api/route-segments/record-holder${qs}`, {
       method: 'DELETE',
       headers: this.getHeadersWithCsrf(),

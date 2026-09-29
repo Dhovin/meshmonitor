@@ -71,6 +71,11 @@ export const TABLE_ORDER = [
   'packet_log',
   // 4124: MQTT packet monitor reception log (per-gateway rows; sourceId, no FKs)
   'mqtt_packet_log',
+  // 5277 P1: Coverage Report RF-reception log (per-path rows; sourceId, no FKs).
+  // Ephemeral/regenerable like mqtt_packet_log above (not in BACKUP_TABLES,
+  // per COVERAGE_P1_SPEC.md Decision D9), but migrated rather than skipped so
+  // a backend move doesn't silently blank out an in-progress survey.
+  'coverage_receptions',
   // 4114: durable ok_to_mqtt violation history (sourceId, no FKs). Deliberately
   // migrated — unlike the transient packet logs above, this table is long-retention
   // history (90d) that the Analysis report reads, so dropping it on a backend
@@ -83,6 +88,13 @@ export const TABLE_ORDER = [
   // dropping it on a backend migration would resurrect every invitation the
   // user had already declined.
   'mesh_beacon_offers',
+  // 5374: per-source ADS-B flight matches (composite PK sourceId+nodeNum, FK to
+  // sources). Migrated so the per-flagging lookup cap survives a backend move.
+  'aircraft_flight_matches',
+  // 5408: per-source MeshCore Ignore / Block lists (FK to sources). Migrated
+  // so an operator's block list survives a backend move.
+  'meshcore_ignored_nodes',
+  'meshcore_message_filters',
   // 3960 Phase 1a WP1: per-source Reticulum destinations + interfaces. Unique
   // on (sourceId, destinationHash) / (sourceId, interfaceName), no FKs.
   'reticulum_destinations',
@@ -143,12 +155,18 @@ export const TABLE_ORDER = [
   'automation_home_anchors',
   // 3770: global MeshCore saved-regions catalog. No sourceId / no FK.
   'meshcore_saved_regions',
+  // 5277 P4b: global saved Coverage surveys (UUID PK, no sourceId, no FK).
+  // User data, so migrated like the other global catalogs above.
+  'coverage_surveys',
   // 5156: global operator-hosted privacy documents. No sourceId / no FK — the
   // policy describes the deployment, not a source.
   'privacy_documents',
   // 3195: global manual solar classification per physical node. No sourceId /
   // no FK — a solar panel belongs to the hardware, not a source.
   'solar_node_overrides',
+  // 5354: global tracked-asset flag + retention per physical node. No sourceId /
+  // no FK — the flag belongs to the hardware, not a source.
+  'asset_nodes',
 ];
 
 // Tables in the 4.0 schema that carry a `sourceId` column. When the source
@@ -169,8 +187,9 @@ export const SOURCE_SCOPED_TABLES = new Set([
   'embed_profiles', 'meshcore_nodes', 'meshcore_messages',
   'meshcore_neighbor_info', 'meshcore_packet_log',
   'meshcore_heard_repeaters', 'message_events', 'meshtastic_heard_repeaters',
-  'mqtt_packet_log', 'mqtt_ok_to_mqtt_violations',
-  'atak_contacts', 'mesh_beacon_offers',
+  'mqtt_packet_log', 'mqtt_ok_to_mqtt_violations', 'coverage_receptions',
+  'atak_contacts', 'mesh_beacon_offers', 'aircraft_flight_matches',
+  'meshcore_ignored_nodes', 'meshcore_message_filters',
   'auto_favorite_targets', 'auto_favorite_assignments',
   'dead_drop_messages',
   // 3960 Phase 1a WP1: per-source Reticulum destinations + interfaces.

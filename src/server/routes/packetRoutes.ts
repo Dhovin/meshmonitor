@@ -4,6 +4,8 @@ import databaseService from '../../services/database.js';
 import { logger } from '../../utils/logger.js';
 import { RequestHandler } from 'express';
 import { filterPacketsByPermissions, getAllowedChannels } from './packetPermissions.js';
+import { fail } from '../utils/apiResponse.js';
+import type { NodeTransportClass } from '../../utils/nodeTransport.js';
 
 /** Normalize a `since` timestamp to milliseconds (auto-detect seconds vs ms) */
 function normalizeSinceToMs(value: string): number {
@@ -192,9 +194,22 @@ router.get('/stats', requirePacketPermissions, async (req, res) => {
  * Get packet distribution by device and by type
  * Query params:
  *   - since: Unix timestamp (seconds or milliseconds, auto-detected) to filter packets from
+ *   - transport: 'all' | 'rf' | 'udp' | 'mqtt' (#5101) — filters all three
+ *     aggregates to one transport class. 'all' (or omitted) applies no filter.
+ *     NOTE: the success body stays bare (no ok() envelope) — InfoTab and
+ *     MessagesTab read `byDevice`/`byType`/`total` at the top level.
  */
 router.get('/stats/distribution', requirePacketPermissions, async (req, res) => {
   try {
+    const rawTransport = typeof req.query.transport === 'string' ? req.query.transport : undefined;
+    let transportClass: NodeTransportClass | undefined;
+    if (rawTransport !== undefined && rawTransport !== '' && rawTransport !== 'all') {
+      if (rawTransport !== 'rf' && rawTransport !== 'udp' && rawTransport !== 'mqtt') {
+        return fail(res, 400, 'INVALID_TRANSPORT', 'transport must be one of all, rf, udp, mqtt');
+      }
+      transportClass = rawTransport as NodeTransportClass;
+    }
+
     const enabled = await packetLogService.isEnabled();
 
     // If not enabled, return empty data
@@ -212,11 +227,21 @@ router.get('/stats/distribution', requirePacketPermissions, async (req, res) => 
     const portnum = req.query.portnum ? parseInt(req.query.portnum as string, 10) : undefined;
     const sourceId = (req as any).scopedSourceId as string | undefined;
 
+    // Non-admins only count packets they could see in the packet list: the
+    // same channel/DM rule as filterPacketsByPermissions, applied in SQL.
+    const permReq = req as typeof req & { isAdmin?: boolean; allowedChannels?: Set<number>; canReadMessages?: boolean };
+    const visibility = permReq.isAdmin
+      ? undefined
+      : {
+          allowedChannels: [...(permReq.allowedChannels ?? [])],
+          canReadMessages: permReq.canReadMessages === true,
+        };
+
     // Fetch distribution data - limit to top 10 devices
     const [byDevice, byType, total] = await Promise.all([
-      packetLogService.getPacketCountsByNodeAsync({ since, limit: 10, portnum, sourceId }),
-      packetLogService.getPacketCountsByPortnumAsync({ since, from_node, sourceId }),
-      packetLogService.getPacketCountAsync({ since, from_node, portnum, sourceId })
+      packetLogService.getPacketCountsByNodeAsync({ since, limit: 10, portnum, sourceId, transportClass, visibility }),
+      packetLogService.getPacketCountsByPortnumAsync({ since, from_node, sourceId, transportClass, visibility }),
+      packetLogService.getPacketCountAsync({ since, from_node, portnum, sourceId, transportClass, visibility })
     ]);
 
     res.json({

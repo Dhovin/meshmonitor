@@ -14,6 +14,11 @@ export interface MeshCoreContact {
   latitude?: number;
   longitude?: number;
   lastAdvert?: number;
+  /** #5363: the server moved latitude/longitude to the sign-flip corrected
+   *  point; the reported pair rides along. Display only. */
+  positionSignFlipCorrected?: boolean;
+  reportedLatitude?: number;
+  reportedLongitude?: number;
   /** Hop count of the cached forwarding route. `null` / undefined = unknown
    *  (next send floods). */
   pathLen?: number | null;
@@ -30,6 +35,18 @@ export interface MeshCoreContact {
    * it. `undefined` reads as falsy = "not local", the safe default.
    */
   isLocal?: boolean;
+  /**
+   * Whether this contact is in the companion radio's own contact table
+   * (#5349). `false` = known not to be (heard via an advert the radio chose
+   * not to store, or evicted by the radio): the radio cannot log in to,
+   * query, or message it until it is added. `undefined` = unknown.
+   */
+  onDevice?: boolean;
+  /**
+   * #5390: when this source first heard the node, epoch MILLISECONDS. Not on
+   * the wire contact record; views copy it in from the durable node row.
+   */
+  firstHeard?: number;
 }
 
 /**

@@ -8,7 +8,7 @@
  */
 import { logger } from '../../../utils/logger.js';
 import databaseService from '../../../services/database.js';
-import { dataEventEmitter, type DataEvent } from '../dataEventEmitter.js';
+import { dataEventEmitter, type DataEvent, type NodeAircraftData } from '../dataEventEmitter.js';
 import type { DbMessage, DbTelemetry } from '../../../services/database.js';
 import type { MeshCoreMessage } from '../../meshcoreManager.js';
 import type { ReticulumMessageRow } from '../../../db/repositories/reticulum.js';
@@ -103,6 +103,14 @@ function subscribe(): void {
   });
 }
 
+/**
+ * An ignored MeshCore message (#5408) is stored and shown collapsed, but it
+ * must not trigger automations. Its bus event carries `filtered: 'ignore'`.
+ */
+export function shouldRouteMeshCoreMessageToAutomations(message: Pick<MeshCoreMessage, 'filtered'>): boolean {
+  return !message.filtered;
+}
+
 async function handleEvent(event: DataEvent): Promise<void> {
   const e = engine;
   if (!e) return;
@@ -115,6 +123,9 @@ async function handleEvent(event: DataEvent): Promise<void> {
 
     case 'meshcore:message':
       // MeshCore received messages were previously ignored by the engine (#3833).
+      // An ignored message (#5408) is stored and shown collapsed, but must not
+      // trigger automations.
+      if (!shouldRouteMeshCoreMessageToAutomations(event.data as MeshCoreMessage)) break;
       await e.onMeshCoreMessage(event.data as MeshCoreMessage, sourceId);
       break;
 
@@ -158,6 +169,18 @@ async function handleEvent(event: DataEvent): Promise<void> {
       // batteryLevel row), not here, so this is a pure event forward.
       const data = event.data as { nodeNum: number | null; publicKey?: string | null; previousPowered: boolean; powered: boolean; batteryLevel: number };
       await e.onNodePowerChanged(data.nodeNum, data.publicKey ?? null, data.previousPowered, data.powered, data.batteryLevel, sourceId);
+      break;
+    }
+
+    case 'node:aircraft': {
+      // Likely-aircraft classification (#5364/#5365 Phase 1 WP3): the
+      // classification-queue seam detected a genuine transition into the
+      // flagged state (`previous !== true && current === true`, reason
+      // 'position' only). Fire trigger.becameLikelyAircraft. Detection state
+      // lives in the DB (the persisted `likelyAircraft` row), not here, so
+      // this is a pure event forward.
+      const data = event.data as NodeAircraftData;
+      await e.onBecameLikelyAircraft(data, sourceId);
       break;
     }
 

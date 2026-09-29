@@ -10,6 +10,7 @@ import { appBasename } from '../init';
 import { useAuth } from '../contexts/AuthContext';
 import { isBogusPosition, shouldDiscardPosition } from '../utils/nullIsland';
 import { getDiscardInvalidPositions } from '../utils/positionDisplayConfig';
+import { pickPositionRecord } from '../utils/positionSelection';
 import { getNodeTransportClasses, type NodeTransportClass } from '../utils/nodeTransport';
 import { unifiedNodeKey } from '../utils/nodeIdentity';
 import { isBlankMacAddr, isPlaceholderLongName, isPlaceholderShortName } from '../utils/nodeFieldBlanks';
@@ -306,9 +307,33 @@ function mergeNodeRecords(records: any[]): any {
         k === 'latitude' ||
         k === 'longitude' ||
         k === 'positionPrecisionBits' ||
+        // Excluded for the same reason as the rest (#5292): carried only from
+        // the record whose fix was chosen. Left in the generic loop it could
+        // be back-filled from a record whose own position was rejected, so the
+        // row would claim a fix time it has no fix for.
+        k === 'positionTimestamp' ||
         k === 'isFavorite' ||
         k === 'isIgnored' ||
-        k === 'lastHeard'
+        k === 'lastHeard' ||
+        // Aircraft classification + the altitude it was computed from
+        // (#5364/#5365 Phase 1 WP4): carried only from the SAME record as the
+        // chosen position (below), like `positionTimestamp` — a flag spliced
+        // in from another source's row would describe a fix that isn't the
+        // one being rendered.
+        k === 'altitude' ||
+        k === 'likelyAircraft' ||
+        k === 'aircraftBasis' ||
+        k === 'groundElevation' ||
+        k === 'heightAboveGround' ||
+        // Phase 2 (#5364/#5365): the age-out and fixed marks belong to the
+        // same classification, so they come from the same record too.
+        k === 'aircraftAgedOutAt' ||
+        k === 'aircraftFixedAt' ||
+        // #5363: the sign-flip flag and reported pair describe one record's
+        // fix, so they travel with the chosen position too.
+        k === 'positionSignFlipCorrected' ||
+        k === 'reportedLatitude' ||
+        k === 'reportedLongitude'
       ) {
         continue;
       }
@@ -317,6 +342,14 @@ function mergeNodeRecords(records: any[]): any {
         merged[k] = v;
       }
     }
+  }
+
+  // Mobility (#5354): OR across sources, not newest-wins — one source's
+  // heuristic can say stationary while another saw the node move, and a
+  // tracked asset is mobile on every source. `asset` itself is global per
+  // nodeNum, so the generic loop above already carried it from any record.
+  if (merged.asset != null || records.some((r) => r?.isMobile !== undefined)) {
+    merged.isMobile = records.some((r) => r?.isMobile === true || r?.mobile === 1) || merged.asset != null;
   }
 
   // #5231: when EVERY source held only a placeholder, the loop above skipped
@@ -329,35 +362,69 @@ function mergeNodeRecords(records: any[]): any {
     if (fallback) merged[k] = fallback[k];
   }
 
-  // Position: take the newest record with a REAL fix — both lat and lng present
+  // Position: take the best record with a REAL fix — both lat and lng present
   // on the same record and NOT at Null Island (#3763; e.g. Jupiter Dad !02ecd5e0
   // reporting the 2^15 garbage default 0.0032768 from an MQTT source while other
   // sources have the true position). Flat (API) and nested position shapes are
   // both supported; lat/lng/nested-position/precision are carried from the SAME
   // record so the marker and its accuracy cell stay consistent.
+  //
+  // "Best" is NOT "newest by lastHeard" (#5292): lastHeard moves on any
+  // traffic, so chatter on a source holding a coarse fix used to promote that
+  // fix and flip the unified marker to a coarser grid cell with no new
+  // position packet. `pickPositionRecord` orders by when the POSITION was
+  // observed and prefers finer precision among observations of the same event.
   const withPosition =
-    sortedNewestFirst.find((r) => {
-      const lat = r?.latitude ?? r?.position?.latitude;
-      const lng = r?.longitude ?? r?.position?.longitude;
-      return lat != null && lng != null && !isBogusPosition(lat, lng);
-    }) ??
+    pickPositionRecord(
+      sortedNewestFirst.filter((r) => {
+        const lat = r?.latitude ?? r?.position?.latitude;
+        const lng = r?.longitude ?? r?.position?.longitude;
+        return lat != null && lng != null && !isBogusPosition(lat, lng);
+      }),
+    ) ??
     // #4157: with the "Discard invalid positions" toggle OFF, a real fix above
     // still wins, but fall back to a Null-Island (0,0) fix when that's ALL any
     // source reported — so a node that only ever reports (0,0) is visible on the
     // map instead of positionless. Out-of-range / NaN junk is still rejected.
     (getDiscardInvalidPositions()
       ? undefined
-      : sortedNewestFirst.find((r) => {
-          const lat = r?.latitude ?? r?.position?.latitude;
-          const lng = r?.longitude ?? r?.position?.longitude;
-          return lat != null && lng != null && !shouldDiscardPosition(lat, lng, undefined, false);
-        }));
+      : pickPositionRecord(
+          sortedNewestFirst.filter((r) => {
+            const lat = r?.latitude ?? r?.position?.latitude;
+            const lng = r?.longitude ?? r?.position?.longitude;
+            return lat != null && lng != null && !shouldDiscardPosition(lat, lng, undefined, false);
+          }),
+        ));
   if (withPosition) {
     if (withPosition.latitude != null) merged.latitude = withPosition.latitude;
     if (withPosition.longitude != null) merged.longitude = withPosition.longitude;
     if (withPosition.position != null) merged.position = withPosition.position;
     if (withPosition.positionPrecisionBits != null) {
       merged.positionPrecisionBits = withPosition.positionPrecisionBits;
+    }
+    // Carried from the SAME record as the coordinates, for the same reason the
+    // precision is: a timestamp spliced from another source would describe a
+    // fix that isn't the one being rendered.
+    if (withPosition.positionTimestamp != null) {
+      merged.positionTimestamp = withPosition.positionTimestamp;
+    }
+    // Aircraft classification + the altitude it was computed from
+    // (#5364/#5365 Phase 1 WP4): assigned even when null (unlike the fields
+    // above) so a value spliced in from another source's row via the generic
+    // loop can't leak through — the client twin of the server's
+    // `mergeNodesAcrossSources.ts` unconditional copy from `bestPosition`.
+    merged.altitude = withPosition.altitude ?? null;
+    merged.likelyAircraft = withPosition.likelyAircraft ?? null;
+    merged.aircraftBasis = withPosition.aircraftBasis ?? null;
+    merged.groundElevation = withPosition.groundElevation ?? null;
+    merged.heightAboveGround = withPosition.heightAboveGround ?? null;
+    merged.aircraftAgedOutAt = withPosition.aircraftAgedOutAt ?? null;
+    merged.aircraftFixedAt = withPosition.aircraftFixedAt ?? null;
+    // #5363: from the same record, or absent, never spliced from another.
+    if (withPosition.positionSignFlipCorrected === true) {
+      merged.positionSignFlipCorrected = true;
+      merged.reportedLatitude = withPosition.reportedLatitude;
+      merged.reportedLongitude = withPosition.reportedLongitude;
     }
   }
 

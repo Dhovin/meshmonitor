@@ -32,32 +32,10 @@ import { DEFAULT_TERRARIUM_URL } from '../types/elevation';
 // interpolated copy, so override locally to produce the real English text —
 // mirrors MapAnalysisCanvas.test.tsx's override for the same reason.
 // ---------------------------------------------------------------------------
-vi.mock('react-i18next', () => ({
-  useTranslation: () => ({
-    t: (
-      key: string,
-      arg2?: string | Record<string, unknown>,
-      arg3?: Record<string, unknown>,
-    ) => {
-      let options: Record<string, unknown> | undefined;
-      let defaultValue: string | undefined;
-      if (typeof arg2 === 'string') {
-        defaultValue = arg2;
-        options = arg3;
-      } else {
-        options = arg2;
-        defaultValue = typeof options?.defaultValue === 'string' ? options.defaultValue : undefined;
-      }
-      let out = defaultValue ?? key;
-      if (options) {
-        for (const [k, v] of Object.entries(options)) {
-          out = out.replace(new RegExp(`{{${k}}}`, 'g'), String(v));
-        }
-      }
-      return out;
-    },
-  }),
-}));
+vi.mock('react-i18next', async () => {
+  const { createReactI18nextMock } = await import('../test/mockI18n');
+  return createReactI18nextMock();
+});
 
 // ---------------------------------------------------------------------------
 // Contexts / hooks
@@ -152,8 +130,10 @@ vi.mock('../contexts/SettingsContext', () => {
     setDefaultMapCenterZoom: vi.fn(),
     mapCenterTargetZoom: 10,
     mapZoomGateThreshold: 13,
+    mapClusteringEnabled: true,
     setMapCenterTargetZoom: vi.fn(),
     setMapZoomGateThreshold: vi.fn(),
+    setMapClusteringEnabled: vi.fn(),
     defaultLandingPage: 'dashboard',
     setDefaultLandingPage: vi.fn(),
     appearanceMode: 'system',
@@ -512,5 +492,52 @@ describe('SettingsTab — Elevation / Terrain section (#4111 Phase 3 WP-3)', () 
     fireEvent.click(await screen.findByRole('button', { name: 'Test' }));
 
     expect(await screen.findByText('network down')).toBeInTheDocument();
+  });
+});
+
+// ADS-B flight matching (#5374) lives next to the elevation block and reuses
+// this suite's mocks.
+describe('SettingsTab — Flight matching (ADS-B) section (#5374)', () => {
+  beforeEach(() => {
+    csrfFetchMock.mockClear();
+    csrfFetchMock.mockResolvedValue({ ok: true, json: async () => ({}) });
+    saveBarCapture.current = null;
+    installFetchMock();
+  });
+
+  it('is off by default with adsb.lol selected and its ODbL terms shown', async () => {
+    serverSettings = {};
+    renderSettings();
+    await screen.findByRole('heading', { name: 'Flight matching (ADS-B)' });
+    const feed = document.getElementById('adsbFeed') as HTMLSelectElement;
+    const enabled = document.getElementById('adsbMatchEnabled') as HTMLInputElement;
+    expect(enabled.checked).toBe(false);
+    expect(feed.value).toBe('adsb.lol');
+    expect(feed.disabled).toBe(true);
+    expect(screen.getByText(/adsb\.lol: open data under the ODbL/)).toBeTruthy();
+    // airplanes.live is not offered in v1.
+    expect(Array.from(feed.options).map((o) => o.value)).toEqual(['adsb.lol', 'adsb.fi']);
+  });
+
+  it('loads stored values and saves edits (enable, feed, key)', async () => {
+    serverSettings = { adsbMatchEnabled: 'true', adsbFeed: 'adsb.fi', adsb_api_token: 'old-key' };
+    renderSettings();
+    await screen.findByRole('heading', { name: 'Flight matching (ADS-B)' });
+    const feed = document.getElementById('adsbFeed') as HTMLSelectElement;
+    const key = document.getElementById('adsbApiToken') as HTMLInputElement;
+    await waitFor(() => expect(feed.value).toBe('adsb.fi'));
+    await waitFor(() => expect(key.value).toBe('old-key'));
+    expect(screen.getByText(/adsb\.fi: for personal, non-commercial use only/)).toBeTruthy();
+
+    fireEvent.change(feed, { target: { value: 'adsb.lol' } });
+    fireEvent.change(key, { target: { value: ' new-key ' } });
+    await waitFor(() => expect(key.value).toBe(' new-key '));
+
+    await saveBarCapture.current!.onSave();
+    const [, options] = csrfFetchMock.mock.calls[csrfFetchMock.mock.calls.length - 1];
+    const body = JSON.parse((options as RequestInit).body as string);
+    expect(body.adsbMatchEnabled).toBe('true');
+    expect(body.adsbFeed).toBe('adsb.lol');
+    expect(body.adsb_api_token).toBe('new-key');
   });
 });

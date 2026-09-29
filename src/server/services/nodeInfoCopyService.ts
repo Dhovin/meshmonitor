@@ -4,6 +4,7 @@ import { sourceManagerRegistry } from '../sourceManagerRegistry.js';
 import { logger } from '../../utils/logger.js';
 import { CHANNEL_DB_OFFSET } from '../constants/meshtastic.js';
 import { isBlankMacAddr } from '../../utils/nodeFieldBlanks.js';
+import type { SendOrigin } from '../utils/automationPacketTracker.js';
 
 const NODE_INFO_FIELDS = [
   'longName', 'shortName', 'hwModel', 'role', 'macaddr',
@@ -271,6 +272,7 @@ async function pushNodeInfoToDevice(
   nodeNum: number,
   targetSourceId: string,
   targetNode: DbNode,
+  origin: SendOrigin = 'manual',
 ): Promise<boolean> {
   const manager = sourceManagerRegistry.getManager(targetSourceId) as any;
   if (!manager || typeof manager.sendNodeInfoRequest !== 'function') {
@@ -282,7 +284,7 @@ async function pushNodeInfoToDevice(
 
   try {
     const channel = resolvePushChannel(targetNode);
-    await manager.sendNodeInfoRequest(nodeNum, channel);
+    await manager.sendNodeInfoRequest(nodeNum, channel, { origin });
     logger.info(
       `Pushed NodeInfo request for node ${nodeNum} to device on source ${targetSourceId} (channel ${channel})`,
     );
@@ -291,4 +293,24 @@ async function pushNodeInfoToDevice(
     logger.error(`Failed to push NodeInfo to device for node ${nodeNum}:`, error);
     return false;
   }
+}
+
+/**
+ * Send one NodeInfo request for a node, on the channel its row says it lives
+ * on (#5287). Exposed for the Auto-Enrichment scheduler, which fills the
+ * database in one pass and then pushes to the radio separately — capped and
+ * spaced — rather than letting `copyNodeInfo` push inline for every node.
+ *
+ * Returns false (never throws) when the row is gone, the source cannot send,
+ * or the send fails, so a scheduler can drop the entry instead of retrying it
+ * forever.
+ */
+export async function pushNodeInfoRequestForNode(
+  nodeNum: number,
+  targetSourceId: string,
+): Promise<boolean> {
+  const targetNode = await databaseService.nodes.getNode(nodeNum, targetSourceId);
+  if (!targetNode) return false;
+  // Only the auto-enrichment scheduler calls this — automation traffic (#5414).
+  return pushNodeInfoToDevice(nodeNum, targetSourceId, targetNode, 'automation');
 }

@@ -79,17 +79,24 @@ export interface DeviceInfo {
   transportLastUdp?: number | null;
   isStoreForwardServer?: boolean;
   lastHeard?: number;
+  /** #5390: earliest reception on this source, Unix SECONDS (like lastHeard). Absent = unknown. */
+  firstHeard?: number;
   snr?: number;
   rssi?: number;
   firmwareVersion?: string;
+  /** Effective mobility: the heuristic `mobile` column OR the asset flag (#5354). */
   isMobile?: boolean;
   mobile?: number; // Database field: 0 = not mobile, 1 = mobile (moved >100m)
+  /** Tracked asset (#5354): present when the operator flagged this physical node. */
+  asset?: { retentionDays: number };
   isFavorite?: boolean;
   favoriteLocked?: boolean;
   isIgnored?: boolean;
   hideFromMap?: boolean; // #3549: suppress this node's marker on maps only
   notes?: string; // #3921: free-text per-node MeshMonitor-local annotation
   isUnmessagable?: boolean; // #3684: User.is_unmessagable — node won't receive DMs
+  /** #5317: set when the row came from an imported contact URL and the node has not been heard yet. */
+  importedAt?: number | null;
   isLicensed?: boolean; // #3684: User.is_licensed — amateur-radio licensed operator
   keyIsLowEntropy?: boolean;
   duplicateKeyDetected?: boolean;
@@ -125,10 +132,36 @@ export interface DeviceInfo {
   positionIsEstimated?: boolean;
   /** Radius of the estimate in km, when known. Only set with `positionIsEstimated`. */
   positionEstimateUncertaintyKm?: number;
+  /**
+   * #5363: `position` was moved to the mirror point because the reported fix
+   * looks sign-flipped (display only; the stored fix is unchanged). The
+   * reported coordinates ride along so the UI can show them.
+   */
+  positionSignFlipCorrected?: boolean;
+  reportedLatitude?: number;
+  reportedLongitude?: number;
   // Remote admin discovery
   hasRemoteAdmin?: boolean;
   lastRemoteAdminCheck?: number;
   remoteAdminMetadata?: string;
+  /**
+   * Likely-aircraft classification (#5364/#5365). Absent = never classified
+   * / unknown / detection off for this source.
+   */
+  likelyAircraft?: boolean;
+  /** `'agl' | 'msl' | 'unknown'`. */
+  aircraftBasis?: 'agl' | 'msl' | 'unknown';
+  /** DEM metres at the classified point. */
+  groundElevation?: number;
+  /** `altitude − groundElevation`, signed. Only set when `aircraftBasis === 'agl'`. */
+  heightAboveGround?: number;
+  /**
+   * ms epoch when the aircraft age-out sweep ignored this node (#5364/#5365
+   * Phase 2). Set only while that ignore stands; null/absent otherwise.
+   */
+  aircraftAgedOutAt?: number | null;
+  /** ms epoch when the node was reclassified as fixed (sticky mark); null/absent = no mark. */
+  aircraftFixedAt?: number | null;
 }
 
 export interface Channel {
@@ -190,6 +223,8 @@ export interface NodeUser {
 export interface BasicNodeInfo {
   nodeNum: number;
   user?: NodeUser;
+  /** Tracked asset (#5354); drives the delete warning. */
+  asset?: { retentionDays: number };
 }
 
 /**

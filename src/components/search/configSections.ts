@@ -22,6 +22,7 @@
  */
 import type { TFunction } from 'i18next';
 import type { NavItem } from '../SectionNav';
+import { isCoverageMqttSourceType } from '../../utils/coverage';
 
 /**
  * i18next's `t`, exactly as the tabs already hold it.
@@ -40,11 +41,23 @@ export type Translate = TFunction;
  * section lives on without importing that 3,000-line component.
  */
 export const GLOBAL_SETTINGS_SECTIONS = new Set([
-  'settings-language', 'settings-units', 'settings-appearance', 'settings-link-previews',
+  'settings-language', 'settings-units',
+  // Sorting preferences (#5368) — `preferredSortField`/`preferredSortDirection`/
+  // `preferredDashboardSortOption` are plain global settings keys with no
+  // per-source scoping (no sourceId column backs any of them), so the section
+  // belongs here, not in SOURCE_SETTINGS_SECTIONS. It was misfiled into the
+  // per-source set during the Settings split (#5182), which made it
+  // unreachable from the Global Settings page even though its backing
+  // props/context were already wired up there.
+  'settings-sorting',
+  'settings-appearance', 'settings-link-previews',
   'settings-privacy', 'settings-meshcore-messaging', 'settings-map',
   'settings-security',
   'settings-remote-admin',
-  'settings-apprise-server', 'settings-elevation', 'settings-atak-cot', 'settings-backup',
+  'settings-apprise-server', 'settings-elevation',
+  // ADS-B flight matching (#5374): one global outbound service, like elevation.
+  'settings-adsb',
+  'settings-atak-cot', 'settings-backup',
   'settings-channel-database',
   'settings-scripts',
   'settings-maintenance', 'settings-analytics',
@@ -54,13 +67,23 @@ export const GLOBAL_SETTINGS_SECTIONS = new Set([
   // Mesh Issues Analysis is a single global, cross-source batch job (#4964)
   // — same reasoning as position estimation above.
   'settings-mesh-issues',
+  // Auto-Enrichment runs one cross-source scheduler for the install (#5287).
+  'settings-auto-enrichment',
+  // Coverage Report retention is a single global setting (#5277 P1 WP2) —
+  // same reasoning as position estimation/mesh issues above.
+  'settings-coverage',
 ]);
 
 /** Settings sections that belong to a source's own Settings tab. */
 export const SOURCE_SETTINGS_SECTIONS = new Set([
-  'settings-sorting', 'settings-node-display', 'settings-telemetry',
+  'settings-node-display', 'settings-telemetry',
   'settings-notifications', 'settings-packet-monitor', 'settings-solar',
   'settings-firmware', 'settings-reset-ui',
+  // Coverage Report reception recording (#5277 P2 WP3 MQTT gateways, P3 WP4
+  // MeshCore observers) — shown only on MQTT-shaped sources (see the
+  // isCoverageMqttSourceType filter below), so it lives in the source, not
+  // global, section set.
+  'settings-coverage-mqtt',
   'settings-management', 'settings-danger',
 ]);
 
@@ -75,6 +98,14 @@ export interface SettingsNavOptions {
   /** Database Maintenance is SQLite-only (it uses VACUUM). */
   databaseType?: 'sqlite' | 'postgres' | 'mysql' | null;
   firmwareOtaEnabled?: boolean;
+  /**
+   * The active source's `type` (e.g. `mqtt_broker`, `mqtt_bridge`,
+   * `meshcore_mqtt`, `meshtastic_tcp`). Gates `settings-coverage-mqtt` to
+   * MQTT-shaped sources (#5277 P2 WP3, widened P3 WP4) via
+   * `isCoverageMqttSourceType`. `undefined`/`null` hides it, matching the
+   * global-settings surface where no single source applies.
+   */
+  sourceType?: string | null;
 }
 
 /**
@@ -85,7 +116,7 @@ export interface SettingsNavOptions {
  * out deep links that land on nothing.
  */
 export function settingsNavItems(t: Translate, options: SettingsNavOptions): NavItem[] {
-  const { mode, isAdmin, canWriteSettings, databaseType, firmwareOtaEnabled } = options;
+  const { mode, isAdmin, canWriteSettings, databaseType, firmwareOtaEnabled, sourceType } = options;
   const inMode = (id: string) =>
     !mode || (mode === 'global' ? GLOBAL_SETTINGS_SECTIONS.has(id) : SOURCE_SETTINGS_SECTIONS.has(id));
 
@@ -98,7 +129,7 @@ export function settingsNavItems(t: Translate, options: SettingsNavOptions): Nav
     { id: 'settings-privacy', label: t('settings.privacy', 'Privacy'), keywords: ['terms', 'policy', 'gdpr', 'contact'] },
     { id: 'settings-meshcore-messaging', label: t('settings.meshcore_messaging', 'MeshCore Messaging'), keywords: ['meshcore', 'chat'] },
     { id: 'settings-map', label: t('settings.map'), keywords: ['tiles', 'tileset', 'basemap', 'markers', 'pins', 'zoom'] },
-    { id: 'settings-node-display', label: t('settings.node_display'), keywords: ['nodes', 'list', 'columns', 'age', 'inactive'] },
+    { id: 'settings-node-display', label: t('settings.node_display'), keywords: ['nodes', 'list', 'columns', 'age', 'inactive', 'aircraft', 'plane', 'altitude', 'AGL', 'balloon', 'drone'] },
     { id: 'settings-telemetry', label: t('settings.telemetry'), keywords: ['battery', 'voltage', 'charts', 'graphs', 'sensors'] },
     { id: 'settings-notifications', label: t('settings.notifications_and_security'), keywords: ['alerts', 'sounds', 'audio', 'desktop'] },
     { id: 'settings-security', label: t('settings.security', 'Security'), keywords: ['pki', 'keys', 'encryption'] },
@@ -107,6 +138,7 @@ export function settingsNavItems(t: Translate, options: SettingsNavOptions): Nav
     { id: 'settings-remote-admin', label: t('settings.remote_admin_section', 'Remote Administration'), keywords: ['admin', 'password', 'credentials'] },
     { id: 'settings-apprise-server', label: t('settings.apprise_server_section', 'Apprise API Server'), keywords: ['notifications', 'email', 'push', 'webhook'] },
     { id: 'settings-elevation', label: t('settings.elevation_section', 'Elevation / Terrain'), keywords: ['dem', 'terrain', 'altitude', 'height'] },
+    { id: 'settings-adsb', label: t('settings.adsb_section', 'Flight matching (ADS-B)'), keywords: ['adsb', 'ads-b', 'aircraft', 'flight', 'plane', 'callsign', 'adsb.lol', 'adsb.fi'] },
     { id: 'settings-backup', label: t('settings.system_backup', 'System Backup'), keywords: ['restore', 'export', 'import', 'archive'] },
     { id: 'settings-channel-database', label: t('channel_database.title', 'Channel Database'), keywords: ['psk', 'decrypt', 'channels', 'keys'] },
     { id: 'settings-scripts', label: t('settings.scripts_section', 'Scripts'), keywords: ['javascript', 'automation', 'code'] },
@@ -116,15 +148,18 @@ export function settingsNavItems(t: Translate, options: SettingsNavOptions): Nav
     { id: 'settings-analytics', label: t('settings.analytics'), keywords: ['telemetry', 'usage', 'stats'] },
     { id: 'settings-position-estimation', label: t('automation.position_estimation.title', 'Position Estimation'), keywords: ['gps', 'location', 'estimate', 'triangulation'] },
     { id: 'settings-mesh-issues', label: t('automation.mesh_issues.title', 'Mesh Issues Analysis'), keywords: ['diagnostics', 'health', 'problems'] },
+    { id: 'settings-auto-enrichment', label: t('automation.auto_enrichment.title', 'Auto-Enrichment'), keywords: ['nodeinfo', 'enrichment', 'fix all', 'schedule', 'cron'] },
+    { id: 'settings-coverage', label: t('settings.coverage_section', 'Coverage Report'), keywords: ['coverage', 'range test', 'retention', 'survey'] },
+    { id: 'settings-coverage-mqtt', label: t('settings.coverage_mqtt_section', 'Coverage recording'), keywords: ['coverage', 'gateway', 'mqtt', 'survey', 'range test', 'observer', 'meshcore'] },
     { id: 'settings-management', label: t('settings.settings_management'), keywords: ['export', 'import', 'reset'] },
     { id: 'settings-danger', label: t('settings.danger_zone'), keywords: ['delete', 'purge', 'wipe', 'reset'] },
   ];
 
   const adminOnly = new Set([
-    'settings-remote-admin', 'settings-apprise-server', 'settings-elevation',
+    'settings-remote-admin', 'settings-apprise-server', 'settings-elevation', 'settings-adsb',
     'settings-channel-database', 'settings-scripts', 'settings-analytics',
   ]);
-  const settingsWriteOnly = new Set(['settings-position-estimation', 'settings-mesh-issues']);
+  const settingsWriteOnly = new Set(['settings-position-estimation', 'settings-mesh-issues', 'settings-auto-enrichment', 'settings-coverage', 'settings-coverage-mqtt']);
 
   return items.filter((item) => {
     if (!inMode(item.id)) return false;
@@ -133,6 +168,10 @@ export function settingsNavItems(t: Translate, options: SettingsNavOptions): Nav
     // Database Maintenance uses SQLite-specific features like VACUUM.
     if (item.id === 'settings-maintenance' && databaseType !== 'sqlite') return false;
     if (item.id === 'settings-firmware' && !(isAdmin && firmwareOtaEnabled)) return false;
+    // Coverage recording only means anything on an MQTT-shaped source
+    // (mqtt_broker/mqtt_bridge/meshcore_mqtt) — see isCoverageMqttSourceType
+    // (#5277 P2 WP3, widened P3 WP4).
+    if (item.id === 'settings-coverage-mqtt' && !isCoverageMqttSourceType(sourceType)) return false;
     return true;
   });
 }
@@ -186,6 +225,7 @@ export function automationNavItems(t: Translate): NavItem[] {
     { id: 'auto-acknowledge', label: t('automation.acknowledge.title', 'Auto Acknowledge'), keywords: ['ack', 'reply'] },
     { id: 'auto-announce', label: t('automation.announce.title', 'Auto Announce'), keywords: ['broadcast', 'scheduled', 'message'] },
     { id: 'auto-responder', label: t('automation.auto_responder.title', 'Auto Responder'), keywords: ['reply', 'bot', 'keyword'] },
+    { id: 'forwarding', label: t('forwarding.title', 'Forwarding'), keywords: ['forward', 'relay', 'bridge', 'copy', 'phone'] },
     { id: 'auto-key-management', label: t('automation.auto_key_management.title', 'Auto Key Management'), keywords: ['pki', 'key mismatch', 'nodeinfo'] },
     { id: 'timer-triggers', label: t('automation.timer_triggers.title', 'Timer Triggers'), keywords: ['schedule', 'cron', 'timed events'] },
     { id: 'geofence-triggers', label: t('automation.geofence_triggers.title', 'Geofence Triggers'), keywords: ['location', 'area', 'boundary'] },

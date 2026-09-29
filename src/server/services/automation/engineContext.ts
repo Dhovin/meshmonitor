@@ -81,6 +81,17 @@ export interface NodeDataProvider {
    */
   getWaypoint?(sourceId: string, waypointId: number): Promise<{ latitude: number; longitude: number } | null>;
   /**
+   * #5363 — the point to judge a geofence against: the node's position moved
+   * to its sign-flip corrected point when correction is on for `sourceId`
+   * and applies, otherwise the input. Optional; absent = the reported point.
+   */
+  correctPosition?(
+    sourceId: string | null,
+    latitude: number,
+    longitude: number,
+    precisionBits?: number | null,
+  ): Promise<{ latitude: number; longitude: number }>;
+  /**
    * All channels for a source as {slot, name, psk, role}, for resolving a
    * unified channel (by name) to its local slot when sending. Optional.
    */
@@ -173,6 +184,13 @@ export interface EngineEvalContext {
   data: NodeDataProvider;
   varCtx: VarContext;
   now: number;
+  /** Id of the automation this run belongs to. Absent in the simulator / tests (#5445). */
+  automationId?: string;
+  /**
+   * Set by an action to stop the rest of this run (#5445: the automation just
+   * disabled itself). The engine's `haltReason` hook reads it after each action.
+   */
+  halt?: { reason: string };
   /** internal memo for the hydrated subject node (do not set directly). */
   __nodeP?: Promise<NodeFacts | null>;
 }

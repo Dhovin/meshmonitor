@@ -86,6 +86,69 @@ The login replay-protection check is a timestamp in the request, so
 clocks must be roughly aligned. The companion firmware doesn't sync
 clocks automatically — that's what `clock sync` is for.
 
+### Login wait, retry, progress and cancel (#5400)
+
+Every login path (admin console, room server, `ensureSavedLogin`, the
+room-sync scheduler) goes through `MeshCoreManager.loginToNodeWithRetry`.
+The numbers live in one file, `src/server/constants/meshcoreLogin.ts`:
+
+- **Per-attempt wait = max(estTimeout × 2, 10 s)**, capped at 90 s against a
+  garbage estimate. meshcore.js `login()` waited only estTimeout + 1 s, which
+  multi-hop replies routinely missed, so every retry repeated the miss. The
+  native backend now runs the exchange itself (`runLoginExchange`: send
+  CMD_SEND_LOGIN, wait for Sent, then LoginSuccess 0x85 / LoginFail 0x86) and
+  removes every listener and timer on every exit path.
+- **Up to 3 attempts, retry only on `no_reply`**, 2 s pause between. A
+  refusal (`rejected`), a contact missing from the radio (`not_on_device`) or
+  TX disabled stops at once.
+- **Cancel** is an `AbortSignal`. It stops further attempts and makes the
+  backend stop listening, so a reply that lands afterwards is ignored; an
+  `ok` that raced the cancel still reads `cancelled`. A packet already sent
+  cannot be recalled.
+- **Progress** for the UI: the login POST carries a client-chosen
+  `requestId`; `GET /admin/login-progress/:requestId` returns attempt n of N
+  and the time left in the current wait, and `POST /admin/login-cancel`
+  aborts. Both are private to the user and source that started the login
+  (`src/server/services/meshcoreLoginProgress.ts`, in memory). A cancelled
+  login answers 409 `LOGIN_CANCELLED` and saves no password. The room login
+  routes use the same two endpoints.
+- The Virtual Node relay (`handleSendLogin`) keeps ONE attempt: the phone app
+  runs its own retries, as it would against real firmware. It does get the
+  longer wait, so a slow reply is still relayed as LoginSuccess.
+
+### Neighbour table paging (#5413)
+
+`REQ_TYPE_GET_NEIGHBOURS` (firmware `simple_repeater/MyMesh.cpp`) packs its
+reply into a 130-byte buffer, prefix_len + 5 bytes an entry, and stops when
+it is full. With our 8-byte prefix one reply holds **at most 10 entries
+whatever `count` says**. The reply also carries the full table size, so a
+larger table (up to MAX_NEIGHBOURS, 50) is read with `offset`. Code:
+`src/server/services/meshcoreNeighboursPaging.ts`.
+
+- **Manual** fetches (Contact Details "Neighbours", "Poll Neighbours") read up
+  to 5 pages, newest first. **Automated** ones (the autopoll scheduler, one
+  page strongest first; auto-pathfinding, one page) stay at one exchange.
+- **Every page waits the shared 60 s `lastMeshTxAt` floor** and stamps it
+  before it sends, so a full manual read takes about 5 minutes and never
+  crowds out the other schedulers.
+- **One login per fetch.** The repeater keeps a logged-in client in its ACL
+  until the table fills and evicts the least-recently-active non-admin
+  (`helpers/ClientACL.cpp`); there is no idle timeout. Pages after the first
+  pass `skipLogin`.
+- The repeater re-sorts per request, so pages are **merged by prefix**, and
+  the walk stops once the offset passes the table size, a page is empty, the
+  cap is hit, the user cancels, or a page gets no reply.
+- **Storage:** a complete read replaces the stored set. Anything less (one
+  scheduler page, cap, cancel, failure) merges: fresh rows win, other stored
+  rows stay with their heard age moved forward, trimmed to the reported table
+  size. A partial read never shrinks a fuller set.
+- **Progress** mirrors the login: `POST /nodes/:pk/neighbours/fetch` with a
+  client `requestId` answers at once and runs in the background;
+  `GET .../fetch/:requestId` returns the page, the table size, the neighbours
+  so far and the time to the next page; `POST .../fetch/:requestId/cancel`
+  stops further pages. Private to the user and source
+  (`meshcoreNeighboursFetchProgress.ts`), one running fetch per source.
+
 ### Scheduled clock pushes (#4916)
 
 `MeshCoreTimeSyncScheduler` (`src/server/services/meshcoreTimeSyncScheduler.ts`)
@@ -353,6 +416,9 @@ glance whether something needs attention.
 | `src/components/MeshCore/MeshCoreLocalConsole.tsx` | Local wrapper: device-type-aware catalog, no auth layer. |
 | `src/components/MeshCore/MeshCoreAclManager.tsx` | Setperm form, mounted alongside the body for Repeater / RoomServer targets. |
 | `src/components/MeshCore/MeshCoreRemoteStatsPanel.tsx` | Structured status panel for the remote console. |
+| `src/server/constants/meshcoreLogin.ts` | Login attempt count, retry pause, per-attempt wait (#5400). |
+| `src/server/services/meshcoreLoginProgress.ts` | In-memory progress + cancel for tracked logins (#5400). |
+| `src/components/MeshCore/MeshCoreLoginProgress.tsx` + `hooks/useMeshCoreLoginProgress.ts` | "Attempt n of 3" line with countdown and Cancel (#5400). |
 
 ## PR history
 

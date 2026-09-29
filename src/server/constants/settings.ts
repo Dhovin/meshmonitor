@@ -9,6 +9,7 @@
 export const VALID_SETTINGS_KEYS = [
   'maxNodeAgeHours',
   'maxInfraNodeAgeHours', // #4899 — separate age window for MeshCore repeaters/room servers
+  'txTargetMaxAgeHoursWhenUnlimited', // #5376 — TX-target window when maxNodeAgeHours is 0
   'tracerouteIntervalMinutes',
   'temperatureUnit',
   'distanceUnit',
@@ -124,6 +125,15 @@ export const VALID_SETTINGS_KEYS = [
   'mqtt_oktomqtt_violation_max_count',
   // Rolling retention window (days) for the MeshCore position-history trail (#3852).
   'meshcore_position_history_retention_days',
+  // Rolling retention window (days) for coverage_receptions, the Coverage
+  // Report RF-reception log (#5277 P1 WP2). Global, default 7, clamped 1-90
+  // (see clampCoverageRetentionDays in src/utils/coverage.ts).
+  'coverage_retention_days',
+  // Opt-in MQTT gateway-reception recording for the Coverage Report (#5277
+  // P2, per-source, MQTT sources only, default off). Read via
+  // getSettingForSource, never the bare key (#5080) — see
+  // src/server/services/coverageMqttSettings.ts.
+  'coverage_mqtt_enabled',
   'solarMonitoringEnabled',
   'solarMonitoringLatitude',
   'solarMonitoringLongitude',
@@ -157,6 +167,14 @@ export const VALID_SETTINGS_KEYS = [
   // Max acceptable uncertainty (km). Estimates whose computed radius exceeds
   // this are discarded rather than stored (issue #3271 follow-up). 0 = no limit.
   'position_estimation_max_uncertainty_km',
+  // Auto-Enrichment: scheduled NodeInfo Enrichment "Fix All" (global — #5287).
+  // Its run-state keys (last run, pending pushes) are server-owned and written
+  // directly by autoEnrichmentScheduler, so they are deliberately absent here.
+  'autoEnrichmentEnabled',
+  'autoEnrichmentScheduleType',
+  'autoEnrichmentIntervalMinutes',
+  'autoEnrichmentCron',
+  'autoEnrichmentPushToNodeDb',
   // Mesh Issues Analysis (global, batch, passive — issue #4964)
   'mesh_issues_enabled',
   'mesh_issues_frequency_hours',
@@ -211,6 +229,25 @@ export const VALID_SETTINGS_KEYS = [
   'autoPingTimeoutSeconds',
   'autoFavoriteEnabled',
   'autoFavoriteStaleHours',
+  // Likely-aircraft detection (#5364/#5365), Settings -> Node Display. Master
+  // switch + AGL/MSL thresholds; join NODE_DISPLAY_SETTING_KEYS in WP5.
+  'aircraftDetectionEnabled',
+  'aircraftAglThresholdMeters',
+  'aircraftMslThresholdMeters',
+  // Aircraft age-out (#5364/#5365 Phase 2). LastRunAt/LastResult are
+  // server-written and live only in PER_SOURCE_SETTINGS_KEYS.
+  'aircraftAgeOutEnabled',
+  'aircraftAgeOutHours',
+  'aircraftAgeOutAction',
+  // Sign-flipped position correction (#5363), Settings -> Node Display.
+  // Per source: the reference is the source's own node. Display only.
+  'signFlipCorrectionEnabled',
+  'signFlipCorrectionRangeKm',
+  'signFlipReferenceLatitude',
+  'signFlipReferenceLongitude',
+  // Auto-Favorite exclusion for likely aircraft (#5364/#5365 D14), Automation
+  // -> Auto Favorite section.
+  'autoFavoriteExcludeAircraft',
   'homoglyphEnabled',
   // Global privacy toggle (issue #3416): when '0'/'false', the /api/link-preview
   // endpoint refuses to fetch external URLs and the UI renders no preview cards.
@@ -270,6 +307,9 @@ export const VALID_SETTINGS_KEYS = [
   // opening the popup. `0` disables the gate entirely. Isolated markers are
   // never gated at any zoom (issue #4551).
   'mapZoomGateThreshold',
+  // Whether overlapping markers collapse into numbered cluster bubbles below
+  // `mapZoomGateThreshold`. Independent of the click zoom gate (issue #5404).
+  'mapClusteringEnabled',
   'securityDigestEnabled',
   'securityDigestAppriseUrl',
   'securityDigestTime',
@@ -350,6 +390,8 @@ export const VALID_SETTINGS_KEYS = [
   'meshcoreAutoAnnounceSchedule',
   'meshcoreAutoAnnounceAdvertEnabled',
   'meshcoreAutoAnnounceAdvertDelaySeconds',
+  // 'zero_hop' | 'flood'; absent = flood (pre-existing burst configs)
+  'meshcoreAutoAnnounceAdvertMode',
   'meshcoreAutoAnnounceLastRunAt',
   // MeshCore auto-responder
   'meshcoreAutoResponderEnabled',
@@ -376,6 +418,12 @@ export const VALID_SETTINGS_KEYS = [
   // every elevation fetch is server-proxied.
   'elevationEnabled',
   'elevationSourceUrl',
+  // ADS-B flight matching for likely aircraft (#5374). Global (not per-source):
+  // it configures one outbound service, like elevation. `adsb_api_token` is
+  // server-only via SECRET_SETTINGS_KEY_PATTERN (`_token` suffix).
+  'adsbMatchEnabled',
+  'adsbFeed',
+  'adsb_api_token',
   // ATAK/CoT Phase 3 (issue #3691): plaintext TCP CoT feed for ATAK/WinTAK.
   // Default OFF. When enabled, streams CoT <event> XML on cotFeedPort.
   'cotFeedEnabled',
@@ -471,6 +519,26 @@ export const PER_SOURCE_SETTINGS_KEYS = [
   'autoFavoriteEnabled',
   'autoFavoriteNodes',
   'autoFavoriteStaleHours',
+  // Likely-aircraft exclusion for Auto-Favorite (#5364/#5365 D14) + the
+  // server-managed two-strike sweep state (D19, PER_SOURCE_KEYS_NOT_POSTABLE).
+  'autoFavoriteExcludeAircraft',
+  'autoFavoriteAircraftStrikes',
+  // Likely-aircraft detection (#5364/#5365), Settings -> Node Display.
+  'aircraftDetectionEnabled',
+  'aircraftAglThresholdMeters',
+  'aircraftMslThresholdMeters',
+  // Aircraft age-out (#5364/#5365 Phase 2). The last two are written only by
+  // aircraftAgeOutService (PER_SOURCE_KEYS_NOT_POSTABLE).
+  'aircraftAgeOutEnabled',
+  'aircraftAgeOutHours',
+  'aircraftAgeOutAction',
+  'aircraftAgeOutLastRunAt',
+  'aircraftAgeOutLastResult',
+  // Sign-flipped position correction (#5363), Settings -> Node Display.
+  'signFlipCorrectionEnabled',
+  'signFlipCorrectionRangeKm',
+  'signFlipReferenceLatitude',
+  'signFlipReferenceLongitude',
   // Auto-heap-management
   'autoHeapManagementEnabled',
   'autoHeapManagementThresholdBytes',
@@ -540,12 +608,22 @@ export const PER_SOURCE_SETTINGS_KEYS = [
   'meshcoreAutoAnnounceSchedule',
   'meshcoreAutoAnnounceAdvertEnabled',
   'meshcoreAutoAnnounceAdvertDelaySeconds',
+  // 'zero_hop' | 'flood'; absent = flood (pre-existing burst configs)
+  'meshcoreAutoAnnounceAdvertMode',
   'meshcoreAutoAnnounceLastRunAt',
+  // Last flood advert sent from this source (ms). Server-managed floor for
+  // automated flood adverts; see PER_SOURCE_KEYS_NOT_POSTABLE.
+  'meshcoreLastFloodAdvertAt',
   // MeshCore auto-responder
   'meshcoreAutoResponderEnabled',
   'meshcoreAutoResponderTriggers',
   // MeshCore timer triggers
   'meshcoreTimerTriggers',
+  // Message Forwarding rules (#5446) — per source, JSON array, both protocols.
+  // Written ONLY by POST /api/sources/:id/forwarding (per-source `automation`
+  // write), so it is deliberately absent from VALID_SETTINGS_KEYS and listed in
+  // PER_SOURCE_KEYS_NOT_POSTABLE. The managers still re-validate on read.
+  'forwardingRules',
   // MeshCore default region/scope (#3667) — per source (per node)
   'meshcoreDefaultScope',
   // MeshCore default path hash size (#4945) — per source (per node)
@@ -560,6 +638,9 @@ export const PER_SOURCE_SETTINGS_KEYS = [
   // #4899 — standalone per-source Infrastructure age cutoff (advType 2/3),
   // NOT one of the frozen ten Node Display keys / migration-131 seed.
   'maxInfraNodeAgeHours',
+  // #5376 — per-source TX-target window used when maxNodeAgeHours is 0
+  // ("unlimited"); bounds auto-traceroute / remote-admin / remote LocalStats.
+  'txTargetMaxAgeHoursWhenUnlimited',
   'inactiveNodeThresholdHours',
   'inactiveNodeCheckIntervalMinutes',
   'inactiveNodeCooldownHours',
@@ -580,6 +661,7 @@ export const PER_SOURCE_SETTINGS_KEYS = [
   'localNodeNum',
   'localStatsIntervalMinutes',
   'timerTriggers',
+  'transportTrafficCheckpoint',
   // Remote admin
   'remoteAdminScannerIntervalMinutes',
   'remoteAdminScheduleEnabled',
@@ -634,6 +716,9 @@ export const PER_SOURCE_SETTINGS_KEYS = [
   'remoteLocalStatsFilterRegexEnabled',
   'remoteLocalStatsFilterLastHeardEnabled',
   'remoteLocalStatsFilterLastHeardHours',
+  // Coverage Report MQTT gateway-reception recording (#5277 P2). Per-source,
+  // MQTT sources only, default off. Read via coverageMqttSettings.ts.
+  'coverage_mqtt_enabled',
 ] as const;
 
 export type PerSourceSettingKey = typeof PER_SOURCE_SETTINGS_KEYS[number];
@@ -673,6 +758,11 @@ export const GLOBAL_ONLY_SETTINGS_KEYS = new Set<string>([
   'position_estimation_frequency_hours',    // :141
   'position_estimation_lookback_hours',     // :141
   'position_estimation_max_uncertainty_km', // :145
+  'autoEnrichmentEnabled',                  // global scheduler (#5287)
+  'autoEnrichmentScheduleType',             // "
+  'autoEnrichmentIntervalMinutes',          // "
+  'autoEnrichmentCron',                     // "
+  'autoEnrichmentPushToNodeDb',             // "
   'mesh_issues_enabled',                    // global batch job (#4964)
   'mesh_issues_frequency_hours',            // "
   'mesh_issues_lookback_hours',             // "
@@ -701,6 +791,9 @@ export const GLOBAL_ONLY_SETTINGS_KEYS = new Set<string>([
   'adminRetryAttempts',                     // :201 global admin retry count (#4487)
   'elevationEnabled',                       // :305 "Global (not per-source)" (#4111)
   'elevationSourceUrl',                     // :305, also SECRET_SETTINGS_KEYS
+  'adsbMatchEnabled',                       // global outbound service (#5374), read via getSetting
+  'adsbFeed',                               // "
+  'adsb_api_token',                         // ", secret via the _token pattern
   // Global singletons driven only by the global POST branch:
   'cotFeedEnabled',                         // settingsRoutes.ts:900-911 — "global singleton"
   'cotFeedPort',                            // "
@@ -708,6 +801,9 @@ export const GLOBAL_ONLY_SETTINGS_KEYS = new Set<string>([
   'analyticsProvider',                      // :730-733 invalidateHtmlCache (global HTML)
   'analyticsConfig',                        // "
   'appriseApiServerUrl',                    // :632-647 "(global; #3012)"
+  // Global retention sweep (#5277), read via getSettingAsync by
+  // coverageRetentionService — no per-source variant to read.
+  'coverage_retention_days',
 ]);
 
 /**
@@ -753,6 +849,15 @@ export const PER_SOURCE_KEYS_NOT_POSTABLE = new Set<string>([
   'autoFavoriteNodes',      // favoritesService.ts:301,342,419; nodesRoutes.ts:443,569
   'lastAnnouncementTime',   // announceRoutes.ts:15,17; autoAnnounceService.ts:242,244
   'localNodeNum',           // meshtasticManager.ts:4688,4748
+  'transportTrafficCheckpoint', // transportTrafficService.ts checkpointAll/restoreAndRecover (#5101 P3 WP3)
+  'meshcoreLastFloodAdvertAt', // meshcoreManager.ts recordFloodAdvert (automated flood-advert floor)
+  'autoFavoriteAircraftStrikes', // favoritesService.ts autoFavoriteSweep (#5364/#5365 D19 two-strike rule)
+  'aircraftAgeOutLastRunAt',  // aircraftAgeOutService.ts runSweep (#5364/#5365 Phase 2; persisted so a restart is not a run)
+  'aircraftAgeOutLastResult', // aircraftAgeOutService.ts runSweep (#5364/#5365 Phase 2; JSON counts for the settings status line)
+  // POST /api/sources/:id/forwarding (forwardingRoutes.ts, #5446) — gated on
+  // per-source `automation` write, so the generic `settings` POST must not
+  // reach it.
+  'forwardingRules',
 ]);
 
 /**
@@ -771,6 +876,11 @@ export const SECRET_SETTINGS_KEYS = new Set<string>([
   // May embed an API key; server-only (all elevation fetches are
   // server-proxied, so no frontend consumer ever needs the raw URL).
   'elevationSourceUrl',
+  // Message Forwarding rules (#5446). Not a secret, but readable only with
+  // per-source `automation` read via GET /api/sources/:id/forwarding. The
+  // generic GET /api/settings is public (optionalAuth), so keep the rules out
+  // of it for non-admins; admins already hold every permission.
+  'forwardingRules',
 ]);
 
 /**
@@ -779,6 +889,11 @@ export const SECRET_SETTINGS_KEYS = new Set<string>([
  * `*_private_key`, `*_secret`, or `*_token` (case-insensitive) is dropped.
  */
 export const SECRET_SETTINGS_KEY_PATTERN = /(_private_key|_secret|_token)$/i;
+
+/** True for a key `stripSecretSettings` hides from non-admins. */
+export function isSecretSettingKey(key: string): boolean {
+  return SECRET_SETTINGS_KEYS.has(key) || SECRET_SETTINGS_KEY_PATTERN.test(key);
+}
 
 /**
  * Strip secret-bearing keys from a settings map. Admins receive the
@@ -792,8 +907,7 @@ export function stripSecretSettings<T extends Record<string, unknown>>(
   if (isAdmin) return settings;
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(settings)) {
-    if (SECRET_SETTINGS_KEYS.has(k)) continue;
-    if (SECRET_SETTINGS_KEY_PATTERN.test(k)) continue;
+    if (isSecretSettingKey(k)) continue;
     out[k] = v;
   }
   return out as Partial<T>;

@@ -33,6 +33,8 @@ import {
 import { modemPresetChannelName, TransportMechanism } from '../constants/meshtastic.js';
 import { transformChannel } from '../utils/channelView.js';
 import { getMaxNodeAgeHours } from './nodeDisplaySettings.js';
+import { effectiveIsMobile } from '../../utils/assetTracking.js';
+import { loadSignFlipContext, applySignFlipCorrection, getDisplayDbNodePosition, applySignFlipToTraceroute } from './signFlipCorrection.js';
 import type { ResourceType } from '../../types/permission.js';
 import type { User } from '../../types/auth.js';
 
@@ -67,6 +69,8 @@ export async function buildSourceNodes(source: SourceRow, user: ReqUser): Promis
     // Narrowing device-only meant those never reached the map.
     const mcManager = _raw && isAnyMeshCoreManager(_raw) ? _raw : null;
     const mcNodes: any[] = [];
+    // #5363: display-only sign-flip correction against this source's reference.
+    const mcSignFlipCtx = mcManager ? await loadSignFlipContext(source.id) : null;
     if (mcManager) {
       for (const n of await mcManager.getAllNodes()) {
         if (n.latitude == null || n.longitude == null) continue;
@@ -76,7 +80,7 @@ export async function buildSourceNodes(source: SourceRow, user: ReqUser): Promis
           : Math.floor(Date.now() / 1000);
         const pubKey = n.publicKey || '';
         const nodeId = `mc:${mcManager.sourceId}:${pubKey.substring(0, 12)}`;
-        mcNodes.push({
+        mcNodes.push(applySignFlipCorrection({
           nodeId,
           nodeNum: 0,
           sourceId: mcManager.sourceId,
@@ -102,7 +106,7 @@ export async function buildSourceNodes(source: SourceRow, user: ReqUser): Promis
           hopsAway: 0,
           role: 0,
           advType: typeof n.advType === 'number' ? n.advType : 0,
-        });
+        }, mcSignFlipCtx));
       }
     }
     return mcNodes;
@@ -159,6 +163,9 @@ export async function buildSourceNodes(source: SourceRow, user: ReqUser): Promis
       delete stripped.latitudeOverride;
       delete stripped.longitudeOverride;
       delete stripped.altitudeOverride;
+      // The aircraft "fixed" anchor may be the private override itself (#5364/#5365 P2).
+      delete stripped.aircraftFixedLatitude;
+      delete stripped.aircraftFixedLongitude;
       return stripped;
     }
 
@@ -174,7 +181,23 @@ export async function buildSourceNodes(source: SourceRow, user: ReqUser): Promis
     }
     return n;
   });
-  return withOverride;
+
+  // #5363: display-only sign-flip correction. Runs after the override step so
+  // an override (positionIsOverride) is never touched. Meshtastic only: the
+  // MeshCore branch above returns early.
+  const signFlipCtx = await loadSignFlipContext(source.id);
+
+  // Tracked-asset overlay (#5354): these rows skip enhanceNodeForClient, so
+  // attach `asset` and the effective `isMobile` here. Keep in step with the
+  // overlay in enhanceNodeForClient. Computed only: the raw `mobile` column is
+  // passed through untouched.
+  const assets = await databaseService.getAssetNodesMapAsync();
+  return withOverride.map((node) => {
+    const n = applySignFlipCorrection(node, signFlipCtx) as typeof node & { nodeNum?: unknown; mobile?: unknown };
+    const entry = assets.get(Number(n.nodeNum));
+    const asset = entry ? { retentionDays: entry.retentionDays } : undefined;
+    return { ...n, asset, isMobile: effectiveIsMobile(n.mobile, asset) };
+  });
 }
 
 /** Channels for a source, per-channel read-gated, PSK projected (mirrors GET /:id/channels). */
@@ -228,7 +251,10 @@ export async function buildSourceTraceroutes(
   const traceroutes = await databaseService.traceroutes.getAllTraceroutes(clamped, source.id);
   // Channel-gate traceroutes the same way nodes are gated so their embedded
   // routePositions don't draw segments for routes the user can't view (#3092).
-  return maskTraceroutesByChannel(traceroutes, user, source.id);
+  const masked = await maskTraceroutesByChannel(traceroutes, user, source.id);
+  // #5363: stored routePositions snapshots drawn at the corrected point.
+  const signFlipCtx = await loadSignFlipContext(source.id);
+  return masked.map(tr => applySignFlipToTraceroute(tr, signFlipCtx));
 }
 
 /**
@@ -246,7 +272,10 @@ export async function buildSourceNeighborInfo(
   const neighborInfo = await databaseService.neighbors.getAllNeighborInfo(source.id);
 
   const resolvedMaxAge = maxNodeAgeHours ?? await getMaxNodeAgeHours(databaseService.settings, source.id);
-  const cutoffTime = Math.floor(Date.now() / 1000) - resolvedMaxAge * 60 * 60;
+  // maxNodeAgeHours of 0 = "never / show all" (#4947, #5338): no cutoff.
+  const cutoffTime = resolvedMaxAge <= 0
+    ? -Infinity
+    : Math.floor(Date.now() / 1000) - resolvedMaxAge * 60 * 60;
 
   const linkKeys = new Set(neighborInfo.map(ni => `${ni.nodeNum}-${ni.neighborNodeNum}`));
 
@@ -282,6 +311,9 @@ export async function buildSourceNeighborInfo(
     byDirected.set(`${ni.nodeNum}-${ni.neighborNodeNum}`, ni);
   }
 
+  // #5363: draw neighbor links to the same (corrected) point as the marker.
+  const signFlipCtx = await loadSignFlipContext(source.id);
+
   const enrichedNeighborInfo = neighborInfo
     .filter(ni =>
       visibleNodeNums.has(Number(ni.nodeNum)) &&
@@ -299,8 +331,8 @@ export async function buildSourceNeighborInfo(
     .map(ni => {
       const node = nodeMap.get(ni.nodeNum) ?? null;
       const neighbor = nodeMap.get(ni.neighborNodeNum) ?? null;
-      const nodePos = getEffectiveDbNodePosition(node);
-      const neighborPos = getEffectiveDbNodePosition(neighbor);
+      const nodePos = getDisplayDbNodePosition(node, signFlipCtx);
+      const neighborPos = getDisplayDbNodePosition(neighbor, signFlipCtx);
 
       const nTx = (node as any)?.transportMechanism;
       const nbTx = (neighbor as any)?.transportMechanism;

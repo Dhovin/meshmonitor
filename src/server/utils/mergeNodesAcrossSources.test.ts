@@ -209,6 +209,202 @@ describe('mergeNodesAcrossSources (issue #3135)', () => {
   // least as large as the biggest single source. A unified view showing fewer
   // nodes than one of its sources is dropping rows somewhere else — for the
   // real cause see unifiedNodeKey / mergeUnifiedSourceData on the client.
+  describe('position selection is independent of lastHeard (#5292)', () => {
+    it('keeps the finer fix when the coarse row merely heard other traffic', () => {
+      const rows = [
+        makeNode(300, {
+          sourceId: 'coarse',
+          lastHeard: 9000,
+          latitude: 44.2761216,
+          longitude: -78.3024128,
+          positionPrecisionBits: 13,
+          positionTimestamp: 1_760_000_000_000 - 5_000,
+        }),
+        makeNode(300, {
+          sourceId: 'fine',
+          lastHeard: 1000,
+          latitude: 44.28923,
+          longitude: -78.31552,
+          positionPrecisionBits: 14,
+          positionTimestamp: 1_760_000_000_000,
+        }),
+      ];
+      const [merged] = mergeNodesAcrossSources(rows);
+      expect(merged.latitude).toBe(44.28923);
+      expect(merged.positionPrecisionBits).toBe(14);
+      // The row itself is still the newest-lastHeard one for every other field.
+      expect(merged.lastHeard).toBe(9000);
+    });
+
+    it('takes a newer coarse fix over an older fine one', () => {
+      const rows = [
+        makeNode(301, {
+          sourceId: 'fine',
+          lastHeard: 5000,
+          latitude: 35,
+          longitude: -80,
+          positionPrecisionBits: 16,
+          positionTimestamp: 1_760_000_000_000,
+        }),
+        makeNode(301, {
+          sourceId: 'coarse',
+          lastHeard: 1000,
+          latitude: 36,
+          longitude: -81,
+          positionPrecisionBits: 13,
+          positionTimestamp: 1_760_000_000_000 + 3_600_000,
+        }),
+      ];
+      const [merged] = mergeNodesAcrossSources(rows);
+      expect(merged.latitude).toBe(36);
+      expect(merged.positionPrecisionBits).toBe(13);
+    });
+
+    it('ignores a Null-Island fix on the newest row and keeps a real one', () => {
+      const rows = [
+        makeNode(302, { sourceId: 'junk', lastHeard: 9000, latitude: 0, longitude: 0, positionTimestamp: 2000 }),
+        makeNode(302, { sourceId: 'real', lastHeard: 1000, latitude: 35, longitude: -80, positionTimestamp: 1000 }),
+      ];
+      const [merged] = mergeNodesAcrossSources(rows);
+      expect(merged.latitude).toBe(35);
+    });
+  });
+
+  /**
+   * #5364/#5365: the aircraft classification describes a specific point, so
+   * it must travel with the SAME row the coordinates came from — never the
+   * newest-lastHeard winner, and never back-filled from a different source's
+   * row by the generic empty-field loop.
+   */
+  describe('likely-aircraft fields follow the position row (#5364/#5365)', () => {
+    // #5401: a source whose radio replays its NodeDB holds a STALE high fix.
+    // With the replay stamped at its original rx_time (not now), the newer
+    // low fix from the other source wins, and so does its aircraft verdict.
+    it('a replayed stale high fix does not keep the aircraft badge over a newer low fix (#5401)', () => {
+      const now = 1_790_000_000_000;
+      const rows = [
+        makeNode(401, {
+          sourceId: 'stale-radio',
+          lastHeard: now / 1000,
+          latitude: 27.5,
+          longitude: -82.2,
+          altitude: 800,
+          positionTimestamp: now - 3 * 3_600_000, // replay keeps its original rx_time
+          likelyAircraft: true,
+          aircraftBasis: 'agl',
+        }),
+        makeNode(401, {
+          sourceId: 'fresh-radio',
+          lastHeard: now / 1000 - 600,
+          latitude: 27.5,
+          longitude: -82.2,
+          altitude: 250,
+          positionTimestamp: now - 20 * 60_000,
+          likelyAircraft: false,
+          aircraftBasis: 'agl',
+        }),
+      ];
+      const [merged] = mergeNodesAcrossSources(rows);
+      expect(merged.altitude).toBe(250);
+      expect(merged.likelyAircraft).toBe(false);
+    });
+
+    it('takes the aircraft fields from the finer (bestPosition) fix, not the newest-lastHeard row', () => {
+      const rows = [
+        makeNode(400, {
+          sourceId: 'coarse',
+          lastHeard: 9000,
+          latitude: 44.2761216,
+          longitude: -78.3024128,
+          positionPrecisionBits: 13,
+          positionTimestamp: 1_760_000_000_000 - 5_000,
+          likelyAircraft: false,
+          aircraftBasis: 'msl',
+        }),
+        makeNode(400, {
+          sourceId: 'fine',
+          lastHeard: 1000,
+          latitude: 44.28923,
+          longitude: -78.31552,
+          positionPrecisionBits: 14,
+          positionTimestamp: 1_760_000_000_000,
+          likelyAircraft: true,
+          aircraftBasis: 'agl',
+          groundElevation: 200,
+          heightAboveGround: 3000,
+        }),
+      ];
+      const [merged] = mergeNodesAcrossSources(rows);
+      expect(merged.latitude).toBe(44.28923);
+      expect(merged.likelyAircraft).toBe(true);
+      expect(merged.aircraftBasis).toBe('agl');
+      expect(merged.groundElevation).toBe(200);
+      expect(merged.heightAboveGround).toBe(3000);
+    });
+
+    it('a null flag on the position row is not back-filled from another row', () => {
+      const rows = [
+        // Newest by lastHeard AND the bestPosition winner (positionTimestamp
+        // is ~33 minutes ahead of the other row, well outside the "same
+        // observation" window, so it wins outright on recency). Its own
+        // aircraft flag is null (source B hasn't classified it yet).
+        makeNode(401, {
+          sourceId: 'newer-unclassified',
+          lastHeard: 9000,
+          latitude: 35,
+          longitude: -80,
+          positionTimestamp: 2_000_000,
+          likelyAircraft: null,
+          aircraftBasis: null,
+        }),
+        // Older row, already classified true. Without the explicit
+        // bestPosition copy, the generic empty-field backfill loop would see
+        // winner.likelyAircraft (null) as "empty" and splice this in.
+        makeNode(401, {
+          sourceId: 'older-classified',
+          lastHeard: 1000,
+          latitude: 36,
+          longitude: -81,
+          positionTimestamp: 1000,
+          likelyAircraft: true,
+          aircraftBasis: 'agl',
+        }),
+      ];
+      const [merged] = mergeNodesAcrossSources(rows);
+      expect(merged.latitude).toBe(35);
+      expect(merged.likelyAircraft).toBeNull();
+      expect(merged.aircraftBasis).toBeNull();
+    });
+
+    // #5364/#5365 Phase 2: the aged-out and fixed marks ride with the same row.
+    it('takes aircraftAgedOutAt/aircraftFixedAt from the position row, never back-filled', () => {
+      const rows = [
+        makeNode(402, {
+          sourceId: 'best',
+          lastHeard: 1000,
+          latitude: 35,
+          longitude: -80,
+          positionTimestamp: 2_000_000,
+          aircraftAgedOutAt: 1_700_000_000_000,
+          aircraftFixedAt: null,
+        }),
+        makeNode(402, {
+          sourceId: 'other',
+          lastHeard: 9000,
+          latitude: 36,
+          longitude: -81,
+          positionTimestamp: 1000,
+          aircraftAgedOutAt: null,
+          aircraftFixedAt: 1_700_000_000_500,
+        }),
+      ];
+      const [merged] = mergeNodesAcrossSources(rows);
+      expect(merged.latitude).toBe(35);
+      expect(merged.aircraftAgedOutAt).toBe(1_700_000_000_000);
+      expect(merged.aircraftFixedAt).toBeNull();
+    });
+  });
+
   describe('cannot undercount relative to a single source (#4573)', () => {
     it('returns at least as many nodes as the largest contributing source', () => {
       const sourceA = [makeNode(1), makeNode(2), makeNode(3)].map((n) => ({

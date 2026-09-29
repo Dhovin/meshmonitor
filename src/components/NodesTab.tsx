@@ -11,8 +11,17 @@ import { getNodeTypeCategory, categoryGlyphFamily, NODE_TYPE_CATEGORY_META, Node
 import { buildGroupedNodeItems, countNodesByCategory, GroupedNodeListItem, RoleGroupCount } from '../utils/nodeGrouping';
 import { effectiveMapMaxAgeHours } from '../utils/mapAge';
 import { resolveClusterZoomThreshold, resolveClusteredMapCenterTargetZoom } from '../utils/mapZoomAnimation';
-import { ageFilterStops, nearestAgeStopIndex, formatAgeStop } from '../utils/mapAgeSteps';
-import { downsamplePositionHistory, MAX_RENDERED_POSITION_POINTS } from '../utils/positionHistoryDownsample';
+import MapAgeFilterControl from './map/MapAgeFilterControl';
+import MapAircraftDisplayControl from './map/MapAircraftDisplayControl';
+import AircraftTrailsLayer from './map/layers/AircraftTrailsLayer';
+import { useAircraftTrailLayer } from './map/useAircraftTrailLayer';
+import { isAgedOutAircraft, AGED_OUT_AIRCRAFT_OPACITY } from './map/agedOutAircraft';
+import NodeQuickAgeFilter from './NodeQuickAgeFilter';
+import { useNodeQuickAgeFilter } from '../hooks/useNodeQuickAgeFilter';
+import { resolveNodeListAgeHours } from '../utils/nodeQuickAgeFilter';
+import { downsamplePositionHistory, segmentBreaks, MAX_RENDERED_POSITION_POINTS, MAX_RENDERED_ASSET_POSITION_POINTS } from '../utils/positionHistoryDownsample';
+import { indexAtOrBefore, shouldShowAssetPlayback } from '../utils/trackPlayback';
+import { AssetPlaybackBar } from './map/AssetPlaybackBar';
 import { createNodeIcon, getHopColor } from '../utils/mapIcons';
 import { getPositionHistoryColor, generateHeadingAwarePath, generatePositionHistoryArrows, snrToColor } from '../utils/mapHelpers.tsx';
 import { convertSpeed } from '../utils/speedConversion';
@@ -29,6 +38,7 @@ import { buildNodeExportRows, nodesToCsv, nodesToHtml, downloadTextFile } from '
 import { useMapContext } from '../contexts/MapContext';
 import { useTelemetryNodes, useDeviceConfig, useNodes, useChannels, setNodeFieldInCache } from '../hooks/useServerData';
 import { useQueryClient } from '@tanstack/react-query';
+import { sourcePollQueryKey } from '../hooks/usePoll';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useUI } from '../contexts/UIContext';
 import { useSettings } from '../contexts/SettingsContext';
@@ -41,13 +51,15 @@ import WaypointEditorModal from './WaypointEditorModal';
 import { useWaypoints } from '../hooks/useWaypoints';
 import type { Waypoint, WaypointInput } from '../types/waypoint';
 import { useResizable } from '../hooks/useResizable';
-import { resolveNodeSidebarMaxWidth, isMobileLayout, NODE_SIDEBAR_MIN_WIDTH_PX } from '../utils/sidebarWidth';
+import { resolveNodeSidebarMaxWidth, resolveNodeSidebarRenderWidth, isMobileLayout, NODE_SIDEBAR_MIN_WIDTH_PX } from '../utils/sidebarWidth';
 import ZoomHandler from './ZoomHandler';
 import MapPositionHandler from './MapPositionHandler';
 import PolarGridOverlay from './PolarGridOverlay.js';
 import GeoJsonOverlay from './GeoJsonOverlay';
 import { NodeMarkersLayer, type NodeMarkerDescriptor } from './map/layers/NodeMarkersLayer';
 import { NodeMarkerCluster } from './map/layers/NodeMarkerCluster';
+import { ImportContactUrlModal } from './nodes/ImportContactUrlModal';
+import importContactStyles from './nodes/ImportContactUrlModal.module.css';
 import MeasureDistanceController from './MeasureDistanceController';
 import type { MeasurePoint } from '../utils/measureDistance';
 import { MapCenterController } from './MapCenterController';
@@ -73,6 +85,7 @@ import { NodeDetailsButton } from './NodeDetailsButton';
 import nodeRowStyles from './NodeRowActions.module.css';
 import nodeStatusStyles from './NodeStatusLine.module.css';
 import roleGroupingStyles from './NodeRoleGrouping.module.css';
+import listHeaderStyles from './NodesListHeader.module.css';
 import { NeighborLinksLayer, type NeighborLinkDescriptor } from './map/layers/NeighborLinksLayer';
 import { AccuracyRegionsLayer, type AccuracyRegionDescriptor } from './map/layers/AccuracyRegionsLayer';
 import { NodeCard } from './map/popups/NodeCard';
@@ -88,6 +101,12 @@ import { logger } from '../utils/logger';
 
 interface NodesTabProps {
   processedNodes: DeviceInfo[];
+  /**
+   * Aged-out likely aircraft (#5364/#5365 Phase 2) that pass every node filter
+   * except the ignored one, from useSourceView. Drawn on the map only when the
+   * Map Features "Show aged-out" checkbox is on.
+   */
+  agedOutAircraftNodes?: DeviceInfo[];
   shouldShowData: () => boolean;
   centerMapOnNode: (node: DeviceInfo) => void;
   toggleFavorite: (node: DeviceInfo, event: React.MouseEvent) => Promise<void>;
@@ -347,6 +366,20 @@ export function isTracerouteRunDisabled(
 }
 
 /**
+ * Hands the Leaflet map instance out of BaseMap (#5354 Phase 3). The asset
+ * playback bar is a sibling of the map (so it can sit over it as a DOM
+ * overlay) but moves its marker imperatively on the map.
+ */
+const MapInstanceBridge: React.FC<{ onMap: (map: L.Map | null) => void }> = ({ onMap }) => {
+  const map = useMap();
+  useEffect(() => {
+    onMap(map);
+    return () => onMap(null);
+  }, [map, onMap]);
+  return null;
+};
+
+/**
  * Controller that applies the configured default map center once server settings load.
  * Only acts when there was no saved localStorage position at mount time (new session / anonymous).
  * The configured default takes priority over auto-calculated node positions.
@@ -514,6 +547,7 @@ const WaypointMapEventBridge: React.FC<{
 
 const NodesTabComponent: React.FC<NodesTabProps> = ({
   processedNodes,
+  agedOutAircraftNodes,
   shouldShowData,
   centerMapOnNode,
   toggleFavorite,
@@ -566,6 +600,14 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     setShowAccuracyRegions,
     spreadNodes,
     setSpreadNodes,
+    aircraftDisplayMode,
+    setAircraftDisplayMode,
+    showAgedOutAircraft,
+    setShowAgedOutAircraft,
+    showAircraftTrails,
+    setShowAircraftTrails,
+    aircraftTrailHours,
+    setAircraftTrailHours,
     pendingCenterNodeNum,
     setPendingCenterNodeNum,
     showPolarGrid,
@@ -581,6 +623,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     setSelectedNodeId,
     neighborInfo,
     positionHistory,
+    positionHistoryTotalFixes,
     traceroutes,
     positionHistoryHours,
     setPositionHistoryHours,
@@ -682,16 +725,24 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     defaultMapCenterZoom,
     mapCenterTargetZoom,
     mapZoomGateThreshold,
+    mapClusteringEnabled,
     mapStyles,
     activeStyleId,
     activeStyleJson,
     setActiveMapStyleId,
   } = useSettings();
 
+  // Nodes tab quick age filter (#5387): a view-only override of the Settings
+  // window for this tab's list AND map. null = follow the setting. The list
+  // side is applied in useSourceView; the map cap below uses the same window.
+  const [quickAgeHours] = useNodeQuickAgeFilter();
+  const listAgeHours = resolveNodeListAgeHours(quickAgeHours, maxNodeAgeHours);
+
   // Effective map age cap from the Map Features age slider (#3322), clamped to
-  // [1, maxNodeAgeHours]. null = follow the setting, so default behavior is
-  // unchanged. Used to hide stale node markers on the map (favorites bypass).
-  const effectiveMapMaxAge = effectiveMapMaxAgeHours(mapMaxAgeHours, maxNodeAgeHours);
+  // [1, listAgeHours] (the Settings window, or the quick filter when one is
+  // picked). null = follow that window, so default behavior is unchanged.
+  // Used to hide stale node markers on the map (favorites bypass).
+  const effectiveMapMaxAge = effectiveMapMaxAgeHours(mapMaxAgeHours, listAgeHours);
   // #4240: single clock read per render for transport decay (see
   // transportCutoffSec) — a per-node call would drift across the filter pass.
   const transportCutoff = transportCutoffSec(effectiveMapMaxAge);
@@ -715,7 +766,11 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   // either. Every other setting (including the DEFAULT_ZOOM_GATE_THRESHOLD
   // fallback used when the setting is unset) gets the full clustering perf
   // fix.
-  const resolvedClusterZoomThreshold = resolveClusterZoomThreshold(mapZoomGateThreshold);
+  //
+  // Issue #5404: `mapClusteringEnabled` turns the cluster layer off on its
+  // own, without touching the click zoom gate (the spiderfier keeps reading
+  // `mapZoomGateThreshold` in `NodeMarkersLayer`).
+  const resolvedClusterZoomThreshold = resolveClusterZoomThreshold(mapZoomGateThreshold, mapClusteringEnabled);
 
   // Review item 3 (PR #5284) — see resolveClusteredMapCenterTargetZoom's own
   // doc comment for the full "why" and why this beats zoomToShowLayer().
@@ -869,13 +924,72 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
    * span, so the reported oldest/newest remain exact while the drawing is
    * capped.
    */
-  const renderedPositionHistory = useMemo(
-    () => downsamplePositionHistory(filteredPositionHistory, MAX_RENDERED_POSITION_POINTS),
-    [filteredPositionHistory],
+  // A tracked asset's trail (#5354 Phase 2) arrives already thinned by the
+  // server to at most 2,000 points, so draw up to that many rather than
+  // resampling it down to the regular 500.
+  const isAssetTrail = positionHistoryTotalFixes !== null;
+
+  /**
+   * Timeline playback (#5354 Phase 3): shown for a selected asset whose own
+   * track is loaded (not a previous node's) with Show Position History on and
+   * more than one fix after the hours filter. 2D only.
+   */
+  const selectedMapNode = useMemo(
+    () => (selectedNodeId ? nodes.find(n => n.user?.id === selectedNodeId) : undefined),
+    [nodes, selectedNodeId],
+  );
+  const showAssetPlayback = shouldShowAssetPlayback({
+    isAsset: Boolean(selectedMapNode?.asset),
+    assetTrackLoaded: isAssetTrail,
+    showPositionHistory: showMotion,
+    fixCount: filteredPositionHistory.length,
+  });
+  // Cursor time from the playback bar while "trail up to cursor" is on (null = whole trail).
+  const [playbackTrailCursor, setPlaybackTrailCursor] = useState<number | null>(null);
+  // Leaflet map instance, captured inside BaseMap for the playback marker.
+  const [playbackMap, setPlaybackMap] = useState<L.Map | null>(null);
+  // Cut the trail by fix INDEX, not time, so the ~5 Hz cursor only rebuilds
+  // the polylines when it crosses a fix.
+  const trailCutIndex = showAssetPlayback && playbackTrailCursor !== null
+    ? indexAtOrBefore(filteredPositionHistory, playbackTrailCursor)
+    : null;
+  const trailPositionHistory = useMemo(
+    () => (trailCutIndex === null ? filteredPositionHistory : filteredPositionHistory.slice(0, trailCutIndex + 1)),
+    [filteredPositionHistory, trailCutIndex],
   );
 
-  /** True when the drawn trail omits intermediate fixes — surfaced in the popup. */
-  const positionHistoryDownsampled = renderedPositionHistory.length < filteredPositionHistory.length;
+  const renderedPositionHistory = useMemo(
+    () => downsamplePositionHistory(
+      trailPositionHistory,
+      isAssetTrail ? MAX_RENDERED_ASSET_POSITION_POINTS : MAX_RENDERED_POSITION_POINTS,
+    ),
+    [trailPositionHistory, isAssetTrail],
+  );
+
+  /** Per drawn pair: true when it spans a gap segment (#5354), so no line is drawn. */
+  const positionHistorySegmentBreaks = useMemo(
+    () => segmentBreaks(trailPositionHistory, renderedPositionHistory),
+    [trailPositionHistory, renderedPositionHistory],
+  );
+
+  /**
+   * "Showing N of M fixes (thinned)" for an asset whose server-side track
+   * holds fewer points than the fixes it stands for.
+   */
+  const assetTrailThinnedHint = isAssetTrail && positionHistoryTotalFixes > positionHistory.length
+    ? t('map.assetTrailThinned', {
+        shown: renderedPositionHistory.length.toLocaleString(),
+        total: positionHistoryTotalFixes.toLocaleString(),
+        defaultValue: 'Showing {{shown}} of {{total}} fixes (thinned)',
+      })
+    : null;
+
+  /**
+   * True when the drawn trail omits intermediate fixes — surfaced in the popup.
+   * An asset trail thinned on the server counts too (#5354).
+   */
+  const positionHistoryDownsampled = renderedPositionHistory.length < trailPositionHistory.length
+    || assetTrailThinnedHint !== null;
 
   // Memoize position history legend data for MapLegend
   const positionHistoryLegendData = useMemo(() => {
@@ -904,6 +1018,9 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
       // Points-only mode (#3492): skip the connecting line; keep the per-fix dots.
       if (positionHistoryPointsOnly) continue;
+
+      // Gap between two asset drives (#5354): never join across it.
+      if (positionHistorySegmentBreaks[i]) continue;
 
       const segmentPath = positionHistoryLineStyle === 'spline' && startPos.groundTrack !== undefined
         ? generateHeadingAwarePath(
@@ -974,7 +1091,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
     elements.push(...historyArrows);
 
     return elements;
-  }, [renderedPositionHistory, positionHistoryDownsampled, t, overlayColors.positionHistoryOld, overlayColors.positionHistoryNew, positionHistoryLineStyle, positionHistoryPointsOnly, timeFormat, dateFormat, distanceUnit]);
+  }, [renderedPositionHistory, positionHistorySegmentBreaks, positionHistoryDownsampled, t, overlayColors.positionHistoryOld, overlayColors.positionHistoryNew, positionHistoryLineStyle, positionHistoryPointsOnly, timeFormat, dateFormat, distanceUnit]);
 
   // Detect touch device to disable hover tooltips on mobile
   const [isTouchDevice, setIsTouchDevice] = useState(false);
@@ -1583,6 +1700,10 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   // On, nodes are bucketed by device-role/MeshCore-type category
   // (getNodeTypeCategory — the same categorization the map/legend/filter
   // already use) with favorites-first + field sort applied within each group.
+  // "Add node from URL" (#5317): importing a contact link is the only way to
+  // message a node this source has never heard.
+  const [showImportContactModal, setShowImportContactModal] = useState(false);
+
   const [collapsedRoleGroups, setCollapsedRoleGroups] = useState<Set<NodeTypeCategory>>(() => new Set());
   const toggleRoleGroupCollapsed = useCallback((category: NodeTypeCategory) => {
     setCollapsedRoleGroups(prev => {
@@ -1677,7 +1798,26 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
 
   // Calculate nodes with position - uses effective position (respects position overrides, Issue #1526)
   // #3549: per-node "Hide from Map" suppresses the marker only; the node remains in the list above.
-  const nodesWithPosition = processedNodes.filter(node => !node.hideFromMap && hasValidEffectivePosition(node));
+  const processedWithPosition = processedNodes.filter(node => !node.hideFromMap && hasValidEffectivePosition(node));
+  // #5364/#5365 Phase 2: aged-out aircraft join the map set only while "Show
+  // aged-out" is on, so they never shift other markers' precision offsets
+  // when the checkbox is off.
+  const agedOutWithPosition = (agedOutAircraftNodes ?? []).filter(
+    node => !node.hideFromMap && hasValidEffectivePosition(node),
+  );
+  const nodesWithPosition = showAgedOutAircraft && agedOutWithPosition.length > 0
+    ? [...processedWithPosition, ...agedOutWithPosition]
+    : processedWithPosition;
+
+  // Likely-aircraft count for the Map Features hint line (#5364/#5365 Phase 1
+  // WP4) — counted pre-Hide, so the number reflects everything classified,
+  // not just what the current display mode happens to show. Aged-out
+  // aircraft have their own count (below).
+  // Plain filter, not useMemo: `nodesWithPosition` is a fresh array every
+  // render, so a memo keyed on it never hit anyway.
+  const aircraftCountOnMap = nodesWithPosition.filter(
+    (n) => n.likelyAircraft === true && !isAgedOutAircraft(n),
+  ).length;
 
   // Memoize node positions to prevent React-Leaflet from resetting marker positions
   // Creating new [lat, lng] arrays causes React-Leaflet to move markers, destroying spiderfier state
@@ -1774,20 +1914,32 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   // marker-key fallback convention).
   // The visible+positioned node set — the shared source of truth for both the
   // 2D marker descriptors below and the #4704 3D node features.
-  const visibleMapNodes = nodesWithPosition
-    .filter(node => {
-      // Apply standard filters
-      if (!nodePassesTransportFilter(node, { showRfNodes, showUdpNodes, showMqttNodes }, transportCutoff)) return false;
-      if (!showIncompleteNodes && !isNodeComplete(node)) return false;
-      if (!showEstimatedPositions && node.user?.id && nodesWithEstimatedPosition.has(node.user.id)) return false;
-      // When traceroute is active, only show nodes involved in the traceroute
-      if (tracerouteNodeNums && !tracerouteNodeNums.has(node.nodeNum)) return false;
-      // Map Features age slider (#3322): hide markers older than the
-      // chosen age. Favorites are always shown, matching the standard
-      // node age filter. Default (slider at max) is a no-op.
-      if (!node.isFavorite && node.lastHeard && node.lastHeard < mapAgeCutoffSeconds) return false;
-      return true;
-    });
+  const passesMapFilters = (node: DeviceInfo): boolean => {
+    // Apply standard filters
+    if (!nodePassesTransportFilter(node, { showRfNodes, showUdpNodes, showMqttNodes }, transportCutoff)) return false;
+    if (!showIncompleteNodes && !isNodeComplete(node)) return false;
+    if (!showEstimatedPositions && node.user?.id && nodesWithEstimatedPosition.has(node.user.id)) return false;
+    // When traceroute is active, only show nodes involved in the traceroute
+    if (tracerouteNodeNums && !tracerouteNodeNums.has(node.nodeNum)) return false;
+    // #5364/#5365 Phase 2: an aged-out aircraft is older than any useful
+    // age window by definition, and "Show aged-out" is its own switch, so
+    // neither the age slider nor Hide applies to it.
+    if (isAgedOutAircraft(node)) return true;
+    // Map Features age slider (#3322): hide markers older than the
+    // chosen age. Favorites are always shown, matching the standard
+    // node age filter. Default (slider at max) is a no-op.
+    if (!node.isFavorite && node.lastHeard && node.lastHeard < mapAgeCutoffSeconds) return false;
+    // Likely-aircraft Hide (#5364/#5365 Phase 1 WP4): suppress the marker,
+    // except a favourite is never hidden by this toggle.
+    if (aircraftDisplayMode === 'hide' && node.likelyAircraft === true && !node.isFavorite) return false;
+    return true;
+  };
+  const visibleMapNodes = nodesWithPosition.filter(passesMapFilters);
+  // "N aged out" hint (#5364/#5365 Phase 2): counted from the SAME filtered
+  // set the map draws with the checkbox on — never from every node (the
+  // Phase 1 count bug) — and independent of the checkbox itself.
+  const agedOutCountOnMap = [...processedWithPosition, ...agedOutWithPosition]
+    .filter(node => isAgedOutAircraft(node) && passesMapFilters(node)).length;
   // #4704: node features for the 3D surface — the same visible+positioned set
   // the 2D markers use, at the same (precision-offset) positions from
   // `nodePositions`. Computed unconditionally (no hooks); only consumed in 3D.
@@ -1860,15 +2012,23 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
       const hops = isLocalNode ? 0 : getEffectiveHops(node, nodeHopsCalculation, traceroutes, currentNodeNum);
       const shouldAnimate = showAnimations && animatedNodes.has(node.user?.id || '');
       const position = nodePositions.get(node.nodeNum)!;
+      // Likely-aircraft badge (#5364/#5365 Phase 1 WP4): 'show' never marks;
+      // 'mark'/'hide' both badge a flagged node still on the map (Hide already
+      // removed non-favourites above, so a badged node here is a favourite).
+      // An aged-out aircraft (Phase 2) is always badged and dimmed.
+      const agedOut = isAgedOutAircraft(node);
+      const markAircraft = agedOut || (aircraftDisplayMode !== 'show' && node.likelyAircraft === true);
 
       // Calculate opacity based on last heard time
-      const markerOpacity = calculateNodeOpacity(
-        node.lastHeard,
-        nodeDimmingEnabled,
-        nodeDimmingStartHours,
-        nodeDimmingMinOpacity,
-        maxNodeAgeHours
-      );
+      const markerOpacity = agedOut
+        ? AGED_OUT_AIRCRAFT_OPACITY
+        : calculateNodeOpacity(
+            node.lastHeard,
+            nodeDimmingEnabled,
+            nodeDimmingStartHours,
+            nodeDimmingMinOpacity,
+            maxNodeAgeHours
+          );
 
       // Hide popup when showRoute is enabled and node has a valid traceroute,
       // since TracerouteBoundsController zooms to fit the route.
@@ -1882,7 +2042,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
       return {
         key: markerKey,
         position,
-        iconSig: `${node.nodeNum}-${hops}-${isSelected}-${node.user?.role}-${node.isUnmessagable ? 1 : 0}-${node.user?.shortName}-${showLabel}-${shouldAnimate}-${showRoute && isSelected}-${mapPinStyle}-${mapPinColorMode}`,
+        iconSig: `${node.nodeNum}-${hops}-${isSelected}-${node.user?.role}-${node.isUnmessagable ? 1 : 0}-${markAircraft ? 1 : 0}-${node.user?.shortName}-${showLabel}-${shouldAnimate}-${showRoute && isSelected}-${mapPinStyle}-${mapPinColorMode}`,
         buildIcon: () =>
           createNodeIcon({
             variant: 'meshtastic',
@@ -1891,6 +2051,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
             isRouter,
             roleCategory,
             isUnmessagable: !!node.isUnmessagable,
+            isLikelyAircraft: markAircraft,
             shortName: node.user?.shortName,
             showLabel: showLabel || shouldAnimate,
             animate: shouldAnimate,
@@ -2037,6 +2198,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                           </div>
                           <LastHeardFooter
                             lastHeard={cardModel.lastHeard}
+                            firstHeard={cardModel.firstHeard}
                             mode="absolute"
                             timeFormat={timeFormat}
                             dateFormat={dateFormat}
@@ -2258,15 +2420,26 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
   const effective3D = viewMode === '3d' && canUse3D;
   const unavailableIn3DTitle = effective3D ? 'Not available in 3D' : undefined;
 
+  // Flight trails (#5364/#5365 Phase 3): one per aircraft this map draws a
+  // marker for. `visibleMapNodes` is already past Hide / age / transport /
+  // "Show aged-out", so trails follow every one of those filters. Outside a
+  // SourceProvider (no source id) the nodes can come from any source, so the
+  // trails merge like the Unified map's.
+  const aircraftTrailLayer = useAircraftTrailLayer({
+    drawnNodes: visibleMapNodes,
+    mode: currentSourceId ? { kind: 'source', sourceId: currentSourceId } : { kind: 'unified' },
+    available: !effective3D,
+  });
+
   return (
     <div ref={splitViewRef} className="nodes-split-view nodes-anchored-view">
       {/* Anchored Node List Sidebar */}
       <div
         ref={sidebarRef}
         className={`nodes-sidebar nodes-anchored-sidebar ${isNodeListCollapsed ? 'collapsed' : ''} ${isSidebarResizing ? 'resizing' : ''}`}
-        style={!isNodeListCollapsed ? { width: `${sidebarWidth}px` } : undefined}
+        style={!isNodeListCollapsed ? { width: resolveNodeSidebarRenderWidth(sidebarWidth, sidebarMetrics.availableWidth, sidebarMetrics.mobile) } : undefined}
       >
-        <div className="sidebar-header">
+        <div className={`sidebar-header ${listHeaderStyles.header}`}>
           <button
             className="collapse-nodes-btn"
             onClick={handleCollapseNodeList}
@@ -2275,7 +2448,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
             <UiIcon name={isNodeListCollapsed ? 'forward' : 'back'} size={18} />
           </button>
           {!isNodeListCollapsed && (
-          <div className="sidebar-header-content">
+          <div className={`sidebar-header-content ${listHeaderStyles.title}`}>
             <h3>Nodes ({(() => {
               const filteredCount = processedNodes.filter(node => {
                 // Security filter
@@ -2297,11 +2470,11 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               }).length;
               const isFiltered = securityFilter !== 'all' || !showIncompleteNodes || filterRemoteAdminOnly;
               return isFiltered ? `${filteredCount}/${processedNodes.length}` : processedNodes.length;
-            })()})</h3>
+            })()})<NodeQuickAgeFilter settingsHours={maxNodeAgeHours} /></h3>
           </div>
           )}
           {!isNodeListCollapsed && (
-          <div className="node-controls">
+          <div className={`node-controls ${listHeaderStyles.controls}`}>
             <div className="filter-input-wrapper">
               <input
                 type="text"
@@ -2321,9 +2494,9 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 </button>
               )}
             </div>
-            <div className="sort-controls">
+            <div className={`sort-controls ${listHeaderStyles.toolbar}`}>
               <button
-                className="filter-popup-btn"
+                className="sort-direction-btn"
                 onClick={(e) => {
                   e.stopPropagation();
                   e.nativeEvent.stopImmediatePropagation();
@@ -2334,11 +2507,12 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                   e.nativeEvent.stopImmediatePropagation();
                 }}
                 title={t('nodes.filter_title')}
+                aria-label={t('common.filter')}
               >
-                {t('common.filter')}
+                <UiIcon name="filter" />
               </button>
               <button
-                className={`filter-popup-btn${groupNodesByRole ? ` ${roleGroupingStyles.toggleActive}` : ''}`}
+                className={`sort-direction-btn${groupNodesByRole ? ` ${listHeaderStyles.active}` : ''}`}
                 onClick={(e) => {
                   e.stopPropagation();
                   e.nativeEvent.stopImmediatePropagation();
@@ -2350,9 +2524,28 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 }}
                 aria-pressed={groupNodesByRole}
                 title={t('nodes.group_by_role_title', 'Group nodes by role')}
+                aria-label={t('nodes.group_by_role', 'Group by Role')}
               >
-                {t('nodes.group_by_role', 'Group by Role')}
+                <UiIcon name="list" />
               </button>
+              {currentSourceId && (
+                <button
+                  className="sort-direction-btn"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    e.nativeEvent.stopImmediatePropagation();
+                    setShowImportContactModal(true);
+                  }}
+                  onMouseDown={(e) => {
+                    e.stopPropagation();
+                    e.nativeEvent.stopImmediatePropagation();
+                  }}
+                  title={t('nodes.import_contact_title', 'Add node from URL')}
+                  aria-label={t('nodes.import_contact_title', 'Add node from URL')}
+                >
+                  <UiIcon name="plus" />
+                </button>
+              )}
               <select
                 value={sortField}
                 onChange={(e) => setSortField(e.target.value as any)}
@@ -2440,6 +2633,24 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
         <>
         {groupNodesByRole && roleDistribution && roleDistribution.length > 0 && (
           <RoleDistributionSummary distribution={roleDistribution} t={t} />
+        )}
+        {showImportContactModal && currentSourceId && (
+          <ImportContactUrlModal
+            sourceId={currentSourceId}
+            onClose={() => setShowImportContactModal(false)}
+            onImported={(node, alreadyKnown) => {
+              // The row is written server-side; pull it into the list rather
+              // than reconstructing poll's node shape on the client.
+              void queryClient.invalidateQueries({ queryKey: sourcePollQueryKey(currentSourceId) });
+              const name = node?.user?.longName || node?.user?.shortName || t('nodes.import_contact_unnamed', 'node');
+              showToast(
+                alreadyKnown
+                  ? t('nodes.import_contact_updated', 'Updated {{name}} from the contact link', { name })
+                  : t('nodes.import_contact_added', 'Added {{name}}', { name }),
+                'success',
+              );
+            }}
+          />
         )}
         <div className="nodes-list" ref={nodesListRef}>
           {/* Meshtastic nodes section */}
@@ -2552,6 +2763,17 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       <div className="node-name-text">
                         <div className="node-longname">
                           {node.user?.longName || `Node ${node.nodeNum}`}
+                          {/* #5317: imported from a contact link and not yet heard.
+                              Drops away on its own once real traffic arrives, since
+                              that sets lastHeard. */}
+                          {node.importedAt && !node.lastHeard && (
+                            <span
+                              className={importContactStyles.importedBadge}
+                              title={t('nodes.imported_badge_title', 'Added from a contact link; not heard on the mesh yet')}
+                            >
+                              {t('nodes.imported_badge', 'Imported')}
+                            </span>
+                          )}
                         </div>
                         {node.user?.role !== undefined && node.user?.role !== null && getRoleName(node.user.role) && (
                           <div className="node-role" title={t('nodes.node_role')}>{getRoleName(node.user.role)}</div>
@@ -2595,6 +2817,11 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                           <span className="node-indicator-icon" title={t('nodes.has_remote_admin')}><UiIcon name="wrench" size={15} /></span>
                         )}
                         {node.isUnmessagable && <NodeUnmessageableBadge />}
+                        {node.likelyAircraft && (
+                          <span className="node-indicator-icon" title={t('nodes.likely_aircraft', 'Likely aircraft')}>
+                            <UiIcon name="aircraft" size={15} />
+                          </span>
+                        )}
                         {/* #4720: mark a node we have no NODEINFO for. The row is
                             otherwise indistinguishable from a synced one unless you
                             hold nodes:write, which reveals the Copy NodeInfo action
@@ -2824,51 +3051,30 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       <span>3D Terrain</span>
                     </label>
                   )}
-                  {/* Map Features age slider (#3322): hides node markers,
+                  {/* Map Features age filter (#3322, #5344): hides node markers,
                       traceroutes, and route segments older than the chosen age.
-                      Ranges 1h–maxNodeAgeHours (settings); default = max ("All"). */}
-                  {(() => {
-                    // Non-linear discrete stops (1h..30d) instead of a linear
-                    // per-hour tick — see mapAgeSteps (#4770). Bounded by the
-                    // per-source maxNodeAgeHours setting.
-                    // maxNodeAgeHours of 0 = "never / show all" (#4947): the
-                    // stops then include an unlimited ("All") top; keep it 0 so
-                    // ageFilterStops/formatAgeStop take their unlimited branch.
-                    const maxHours = maxNodeAgeHours <= 0 ? 0 : Math.max(1, Math.round(maxNodeAgeHours));
-                    const stops = ageFilterStops(maxHours);
-                    const topIndex = stops.length - 1;
-                    const currentIndex = !Number.isFinite(effectiveMapMaxAge)
-                      ? topIndex
-                      : nearestAgeStopIndex(stops, Math.max(1, Math.round(effectiveMapMaxAge)));
-                    const label = (idx: number) =>
-                      formatAgeStop(stops[idx], maxHours, t('map.maxAgeAll', 'All'));
-                    return (
-                      <div className="map-control-item" style={{ flexDirection: 'column', alignItems: 'stretch', gap: '0.25rem' }}>
-                        <span>{t('map.maximumAge', 'Maximum age')}</span>
-                        <div className="position-history-slider">
-                          <input
-                            type="range"
-                            min={0}
-                            max={topIndex}
-                            step={1}
-                            value={currentIndex}
-                            aria-label={t('map.maximumAge', 'Maximum age')}
-                            aria-valuemin={0}
-                            aria-valuemax={topIndex}
-                            aria-valuenow={currentIndex}
-                            aria-valuetext={label(currentIndex)}
-                            disabled={topIndex < 1}
-                            onChange={(e) => {
-                              const idx = parseInt(e.target.value, 10);
-                              // Top stop == the setting cap → store null so the map follows the setting.
-                              setMapMaxAgeHours(idx >= topIndex ? null : stops[idx]);
-                            }}
-                          />
-                          <span className="slider-value">{label(currentIndex)}</span>
-                        </div>
-                      </div>
-                    );
-                  })()}
+                      Shared with DashboardMap; can only narrow the list
+                      window (Settings, or the #5387 quick filter). */}
+                  <MapAgeFilterControl
+                    maxNodeAgeHours={listAgeHours}
+                    effectiveMaxAgeHours={effectiveMapMaxAge}
+                    onChange={setMapMaxAgeHours}
+                    capFromQuickFilter={quickAgeHours != null}
+                  />
+                  {/* Likely aircraft (#5364/#5365 Phase 1 WP4): shared with
+                      DashboardMap so Show/Mark/Hide can't drift between panels. */}
+                  <MapAircraftDisplayControl
+                    mode={aircraftDisplayMode}
+                    onChange={setAircraftDisplayMode}
+                    aircraftCount={aircraftCountOnMap}
+                    showAgedOut={showAgedOutAircraft}
+                    onShowAgedOutChange={setShowAgedOutAircraft}
+                    agedOutCount={agedOutCountOnMap}
+                    showTrails={showAircraftTrails}
+                    onShowTrailsChange={setShowAircraftTrails}
+                    trailHours={aircraftTrailHours}
+                    onTrailHoursChange={setAircraftTrailHours}
+                  />
                   <label className="map-control-item">
                     <input
                       type="checkbox"
@@ -3013,6 +3219,11 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       </div>
                     );
                   })()}
+                  {showMotion && assetTrailThinnedHint && (
+                    <div className="map-control-item" style={{ paddingLeft: '1.5rem', fontSize: '0.85em', opacity: 0.8 }}>
+                      {assetTrailThinnedHint}
+                    </div>
+                  )}
                   <label className="map-control-item">
                     <input
                       type="checkbox"
@@ -3115,7 +3326,9 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                       </span>
                     </label>
                   ))}
-                  {getTilesetById(activeTileset, customTilesets).isVector && mapStyles.length > 0 && (
+                  {/* Style-based presets (#5448, e.g. CARTO Voyager) bring their own GL
+                      style, so a custom style has nothing to apply to. */}
+                  {getTilesetById(activeTileset, customTilesets).isVector && !getTilesetById(activeTileset, customTilesets).styleUrl && mapStyles.length > 0 && (
                     <div className="map-control-item">
                       <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '0.85em' }}>
                         Map Style
@@ -3188,6 +3401,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
                 )}
                 onDisable={() => setShowRoute(false)}
                 disableLabel={t('map.tracerouteModeDisable', 'Turn off Show Traceroute')}
+                raised={!effective3D && showAssetPlayback}
               />
             )}
             {effective3D ? (
@@ -3241,6 +3455,7 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               <FitAllNodesController request={fitAllRequest} positions={fitAllPositions} />
               <ZoomHandler onZoomChange={setMapZoom} />
               <MapPositionHandler />
+              <MapInstanceBridge onMap={setPlaybackMap} />
               <WaypointMapEventBridge
                 placing={placingWaypoint}
                 canCreate={canWriteWaypoints}
@@ -3260,6 +3475,13 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               onExit={() => setMeasureActive(false)}
             />
           )}
+              {/* Flight trails (#5364/#5365 Phase 3), below the node markers. */}
+              {showAircraftTrails && (
+                <AircraftTrailsLayer
+                  trails={aircraftTrailLayer.trails}
+                  formatTooltip={aircraftTrailLayer.formatTooltip}
+                />
+              )}
               {resolvedClusterZoomThreshold != null ? (
                 <NodeMarkerCluster disableClusteringAtZoom={resolvedClusterZoomThreshold}>
                   <NodeMarkersLayer markers={nodeMarkers} onOmsClick={onOmsClick} />
@@ -3343,6 +3565,17 @@ const NodesTabComponent: React.FC<NodesTabProps> = ({
               {positionHistoryElements}
 
           </BaseMap>
+          )}
+          {shouldShowData() && !effective3D && showAssetPlayback && selectedNodeId && (
+            <AssetPlaybackBar
+              fixes={filteredPositionHistory}
+              map={playbackMap}
+              resetKey={selectedNodeId}
+              timeFormat={timeFormat}
+              dateFormat={dateFormat}
+              distanceUnit={distanceUnit}
+              onTrailCursorChange={setPlaybackTrailCursor}
+            />
           )}
           {shouldShowData() && nodesIsLoading && <MapLoadingOverlay />}
           {shouldShowData() && !nodesIsLoading && nodesWithPosition.length === 0 && (

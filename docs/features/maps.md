@@ -74,6 +74,10 @@ Both carry the node's public key, so the receiving device can send PKI-encrypted
 - **Zoom Limits**: Respects the max zoom level of your selected tileset
 - **Double-Click Zoom**: Double-click to zoom in on a location
 
+#### Marker Clustering
+
+When you zoom out past the **Map Click Zoom Gate** level, crowded markers group into one numbered circle. Click a circle to zoom in until its markers split apart. To show every marker at every zoom instead, turn off **Cluster overlapping markers** in **Settings → Map Settings**. The click zoom gate keeps working either way. See [Map Settings](/features/settings#map-settings).
+
 #### Layer Controls
 
 - **Tileset Selector**: Bottom-center visual picker to switch between map styles
@@ -193,15 +197,120 @@ page.
 
 ### Node Age Filter
 
-The **Maximum age** slider in the **Map Features** panel hides node markers
+The **Map age filter** slider in the **Map Features** panel hides node markers
 last heard before the window it defines. Rather than one linear hour-per-tick
-(unusable once you reach weeks), the slider snaps to human-scale stops — 1h,
-3h, 6h, 12h, 1d, 3d, 7d, 14d, and 30d/All — so it stays usable whether you're
-narrowing to the last hour or reaching out to a month. The top stop always
-matches your **Max Node Age** setting, so the slider can never select an age
-the setting would filter out anyway.
+(unusable once you reach weeks), the slider snaps to human-scale stops (1h,
+3h, 6h, 12h, 24h, 3d, 7d, 14d, and 30d) so it stays usable whether you're
+narrowing to the last hour or reaching out to a month. The line under the
+slider says what the map shows right now, such as `Showing: last 6h`.
 
-**Show all** (0) — the **Maximum Age of Active Nodes** setting in **Settings → Nodes** accepts `0` to mean "no age cap". At `0` the slider tops out at an unbounded "All" stop and MeshMonitor never hides a node for being stale. Useful for post-mortem review of a mesh you don't intend to prune.
+The slider can only **narrow** the **Node list & map window** setting
+(**Settings → Node Display**), never widen it. Its top stop follows that
+setting and says so: `All (24h from Settings)`. On the Nodes tab, when you pick a
+window in the Nodes list header's quick age filter, the slider narrows that window
+instead and reads `All (7d from Nodes filter)`.
+
+**Show all** (0): the **Node list & map window** setting accepts `0` to mean "no age cap". At `0` the slider's top stop reads `All (no limit in Settings)` and MeshMonitor never hides a node for being stale. Useful for post-mortem review of a mesh you don't intend to prune.
+
+The `active/total (last 2h)` badge on each source card in the sidebar is a separate, fixed 2-hour activity stat. It is informational only and does not filter the list or the map.
+
+### Likely Aircraft
+
+A node flagged by [likely-aircraft detection](/features/settings#likely-aircraft-detection) (Meshtastic sources only) gets an aircraft badge on its marker, so it's easy to tell an airborne node apart from a fixed one at a glance.
+
+The **Likely aircraft** control in the **Map Features** panel has three modes:
+
+- **Mark** *(default)* — the badge shows on flagged markers; the marker itself still behaves normally and can be clicked through to the node.
+- **Show** — no badge, no filtering; flagged nodes look like any other node.
+- **Hide** — flagged markers are removed from the map, except a node that is one of your own favorites, which always stays visible.
+
+The control appears in both the Nodes map and the Dashboard map, and the chosen mode is shared across them (saved per user, with a local fallback for anonymous viewers). [Map Analysis](/features/map-analysis) reads the same mode, so a marker hidden or marked here is hidden or marked there too.
+
+**Show aged-out** — a checkbox under the three modes. When [age-out](/features/settings#age-out-and-reclassify-as-fixed) ignores a likely aircraft, the node drops off the map like any ignored node. Tick **Show aged-out** to draw those nodes again, faded and with the aircraft badge. It only brings back aircraft ignored by age-out; manual and geo ignores stay hidden. The hint line shows how many aged-out nodes the map would draw with your other filters applied. The setting is saved in your browser and applies to both maps and Map Analysis.
+
+A node's popup and details say **Aged out (likely aircraft)** while it is aged out, and **Reclassified as fixed** once the sweep has decided it is a fixed node.
+
+#### Flight trails
+
+Tick **Flight trails** under the likely-aircraft modes to draw the recent path of each aircraft on the map. Each aircraft gets its own colour, with a dark outline and small arrows that point the way it was flying. Hover over a trail to see the node's name and the time of the nearest position.
+
+- A trail appears only for an aircraft whose marker the map draws, so it follows **Hide**, the age filter, the transport toggles, and **Show aged-out**.
+- The **Trail lookback** slider, shown while the box is ticked, sets how far back a trail reaches: 1 hour to 7 days, 6 hours by default. MeshMonitor keeps position history for 7 days, so older points don't exist.
+- On the Unified dashboard, an aircraft heard by more than one source draws as one trail.
+- You only see trails for nodes you can see on the map. Private positions and channels you can't view on the map stay hidden.
+- Both settings are saved per user and apply to the Nodes map and the Dashboard map. The 3D view doesn't show trails.
+
+Trails are drawn from positions MeshMonitor has already stored, so they send nothing over the mesh.
+
+MQTT sources store position history too, the same as a connected radio, so aircraft heard only over MQTT get trails. A position relayed by several gateways is stored once. History for an MQTT node starts from when you upgrade to this version.
+
+#### Flight matching (ADS-B) {#flight-matching-ads-b}
+
+MeshMonitor can check a likely aircraft against a free, public ADS-B feed and show which flight it is on. It is **off by default**: a stock install makes no calls to any outside service. An admin turns it on in [**Settings → Flight matching (ADS-B)**](/features/settings#flight-matching-ads-b) (global, not per source).
+
+When it finds a match, the node's popup and details show one line, for example:
+
+> Matched: UAL123 · B738 · N12345 · 450 kt 270° &nbsp; *Data: adsb.lol*
+
+The line links to the flight on the feed's own map. Parts the feed doesn't report are left out. The node keeps its own name; the marker and automations don't change.
+
+**How it looks up a flight**
+
+- A lookup happens only when a node **becomes** a likely aircraft, and at most **two lookups per flagging**.
+- Lookup 1 runs when the node is flagged. A hit shows as **Possible match**.
+- Lookup 2 runs on the node's next live position, 1 to 30 minutes later. If it names the same aircraft again, the line changes to **Matched**.
+- After that nothing more is looked up until the node is flagged again. The count is stored in the database, so a restart or a settings save doesn't reset it.
+- MeshMonitor picks the nearest aircraft within a radius that grows with the age of the node's fix (5 to 90 km) and within 300 m of the node's altitude. If two aircraft are about equally close, it shows nothing rather than guess.
+- **A match only confirms.** No match never clears the likely-aircraft flag: light aircraft, balloons and drones often carry no ADS-B.
+
+**Feeds**
+
+| Feed | Terms |
+|---|---|
+| **adsb.lol** *(default)* | Open data under the ODbL. |
+| **adsb.fi** | For personal, non-commercial use only. |
+
+airplanes.live is not offered: it refused anonymous requests when this feature was built. The optional **API key** field is for adsb.lol's announced future key; leave it empty unless adsb.lol asks for one. Only admins can see the key.
+
+**What it sends, and how often**
+
+Nothing goes over the mesh. MeshMonitor sends the node's approximate position (to about 10 m) to the chosen feed over HTTPS. Requests go out at least 1.1 seconds apart, and any rate limit, refusal, server error or timeout pauses all lookups for 10 minutes. A failed lookup doesn't use up the node's allowance. A node flagged on several sources at once shares one request.
+
+Only users who can read nodes on that source see the line. A node with a private position shows no match to users who can't see private positions.
+
+### Asset Tracking
+
+Mark a node as a tracked **asset**, for example a GPS node on a vehicle, and MeshMonitor:
+
+- **always draws its trail.** MeshMonitor flags a node as mobile once it has moved more than 100 m. A vehicle parked for a while can lose that flag and its trail. An asset always counts as mobile.
+- **keeps all of its telemetry** (position, battery, environment and the rest) for the number of days you choose, on every source that heard it. Other nodes keep 7 days.
+- **is skipped by cleanups that run on their own**: auto-delete by distance, the aircraft age-out, the MQTT geo filter purge, and the automation "delete node" action. The geo filter still ignores an asset outside its box, but no longer deletes its history.
+
+**To set it up:** open the node's details (Messages tab, then select the node) and find **Asset tracking** below Notes. Turn on the switch and set how many days to keep (1 to 365, default 90). The section shows about how many rows that keeps, based on the node's last 24 hours. It says "unknown" when there is no recent data.
+
+- The flag belongs to the physical node, not to a source, so it applies to every source that hears it. Changing it needs the **Settings: write** permission. Other users see the section read-only.
+- A manual **Delete Node** still works on an asset, and warns you that the retained history goes with it.
+- Turning the flag off returns the node to the normal 7-day window at the next hourly cleanup.
+
+**The full-history trail.** Select an asset on the Nodes map and its trail covers the whole window you chose, not just the newest few thousand fixes:
+
+- The server merges the fixes from every source you can see, drops copies of the same fix heard by more than one source, and thins the rest to at most 2,000 points. It keeps each stretch's start, end, and the point that strays farthest from the straight line between them, so turns and stops survive.
+- A gap of more than 30 minutes between fixes breaks the trail. Each drive draws on its own, with no line from where one ended to where the next began.
+- Under **Show Position History**, "Showing N of M fixes (thinned)" tells you how many of the stored fixes the map draws. The history slider still runs from the oldest fix to now.
+- Your permissions still apply: a source you can't read, a channel you can't view on the map, or a private position without the **Private Positions** permission on that source adds no points.
+
+**Playback.** With an asset selected and **Show Position History** on, a playback bar runs along the bottom of the Nodes map. Its timeline spans the trail the map shows (after the history slider), with a notch for each fix and shaded gaps.
+
+- The cursor starts at the end, so the map looks as it did until you use the bar. Press **Play** to replay the trail from the start; press it again to pause. Playback stops at the end, and **Play** there starts over.
+- Click or drag the timeline to jump. The step buttons move one fix back or forward.
+- Pick **60×, 600× or 3600×**: one minute, ten minutes, or an hour of track per second. The bar remembers your choice.
+- A marker with a time label slides between fixes. In a gap it waits at the last fix before the gap and fades, rather than cutting straight across.
+- The readout shows the date and time at the cursor, in your time and date format, and the speed of the nearest fix when it reported one.
+- **Trail up to cursor** (on by default) draws only the fixes up to the cursor, so the trail grows as it plays. **Follow** (off by default) pans the map when the marker nears the edge.
+- With the timeline focused: **Space** plays or pauses, **←**/**→** step one fix, **Home**/**End** jump to the start or end.
+- On a phone the bar fits one row: the step buttons hide (use the arrow keys or drag) and the two toggles show as icons.
+
+Nothing is sent over the mesh; this is storage and display only. Plan disk space for long windows: a node that reports often can keep hundreds of thousands of rows over a year.
 
 ### GNSS Satellite Overlay
 
@@ -288,6 +397,24 @@ MeshMonitor includes several pre-configured map styles:
 ::: tip Carto API key (New in 4.15.2)
 Both CartoDB tilesets accept a personal API key from a free [carto.com](https://carto.com/) account for higher rate limits than the anonymous public endpoint. Paste your **publishable** key into **Settings → Map → Carto API key**; MeshMonitor appends it as `?key=...` on every Carto tile request. The key is publishable by design (it lives in the browser), so treat it like any other public API token and rotate it if abused. Leave the field blank to keep using the anonymous endpoint.
 :::
+
+#### CARTO vector basemaps
+
+Four vector basemaps render in the browser with MapLibre GL, so labels and lines stay sharp at every zoom:
+
+| Tileset | Look |
+|---------|------|
+| **CARTO Voyager** | Colorful street map with land-use shading |
+| **CARTO Positron** | Light gray, minimal |
+| **CARTO Dark Matter** | Near-black, minimal |
+| **CARTO Voyager Dark** | Dark map that keeps land-use color: green parks and woodland, teal water, amber major roads, light labels |
+
+CARTO publishes Voyager, Positron and Dark Matter. It does not publish a dark Voyager, so MeshMonitor ships **CARTO Voyager Dark** itself: a recolor of CARTO's Voyager style, bundled with the app. It still reads CARTO's vector tiles.
+
+- **API key**: all four need the same CARTO API key as the raster CARTO tilesets. MeshMonitor adds the key to every CARTO request the map makes (style, tiles, fonts and icons). The picker warns you when a CARTO tileset is selected and no key is set. For a dark map with no key, pick **Dark Gray**.
+- **3D view**: the 3D map draws raster tiles only, so it shows each style's raster twin: CARTO's raster Voyager, Positron (Light Mode) or Dark Matter (Dark Mode). **CARTO Voyager Dark** has no raster twin and uses Dark Mode in 3D.
+- **Embeds**: embed profiles offer raster tilesets only, so these four do not appear there.
+- **Attribution**: © OpenStreetMap contributors, © CARTO. CARTO's style code is BSD-3-Clause; map data is ODbL.
 
 ### Custom Tile Servers
 
@@ -644,7 +771,6 @@ MeshMonitor validates tile URLs to prevent:
 
 - Use vector tiles for smaller file sizes and better performance
 - Set appropriate max node age to filter inactive nodes
-- Consider clustering markers at low zoom levels (future feature)
 - Use raster tiles with lower max zoom if vector rendering is slow
 
 ### For Limited Bandwidth

@@ -1984,7 +1984,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ nodes, channels = [
         <p>
           {t('config.warning_description')}
         </p>
-        <div style={{ marginTop: '1.5rem', display: 'flex', gap: '1rem' }}>
+        <div className={styles.dangerActions} style={{ marginTop: '1.5rem', display: 'flex', gap: '1rem' }}>
           <button
             onClick={handleRebootDevice}
             disabled={isSaving}
@@ -2153,7 +2153,7 @@ const ConfigurationTab: React.FC<ConfigurationTabProps> = ({ nodes, channels = [
         </div>
       )}
 
-      <div className="settings-content">
+      <div className={`settings-content ${styles.sectionStack}`}>
         <div id="config-node-identity">
           <NodeIdentitySection
             longName={longName}

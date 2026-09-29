@@ -21,7 +21,7 @@ import { readFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { VALID_SETTINGS_KEYS } from './constants/settings.js';
-import { NODE_DISPLAY_SETTING_KEYS } from '../constants/nodeDisplayDefaults.js';
+import { NODE_DISPLAY_SETTING_KEYS, SETTINGS_TAB_PER_SOURCE_KEYS } from '../constants/nodeDisplayDefaults.js';
 
 // ─── Database mock ────────────────────────────────────────────────────────
 // In-memory store that mimics setSetting / getAllSettings round-trip
@@ -130,6 +130,7 @@ function validTestValue(key: string, suffix = ''): string {
     autoAckIgnoredNodes: '!b29fa8d4,!a1b2c3d4',
     maxNodeAgeHours: '24',
     maxInfraNodeAgeHours: '168',
+    txTargetMaxAgeHoursWhenUnlimited: '48',
     inactiveNodeThresholdHours: '24',
     inactiveNodeCheckIntervalMinutes: '60',
     inactiveNodeCooldownHours: '24',
@@ -183,6 +184,30 @@ function validTestValue(key: string, suffix = ''): string {
     // STRICT_BOOLEAN_SETTINGS_KEYS here too, or this round-trip test breaks
     // the same way meshcoreReceiveOnly did.
     meshcoreReceiveOnly: 'true',
+
+    // Auto-Enrichment schedule (#5287): the interval is range-checked (1 hour
+    // to 7 days), the type is an enum, and a cron must fire at most hourly.
+    autoEnrichmentScheduleType: 'interval',
+    autoEnrichmentIntervalMinutes: '360',
+    autoEnrichmentCron: '0 */6 * * *',
+
+    // Likely-aircraft detection (#5364/#5365 Phase 1 WP5). The two enable
+    // switches are in settingsRoutes.ts's STRICT_BOOLEAN_SETTINGS_KEYS (only
+    // literal 'true'/'false' accepted); the thresholds are range-checked
+    // (50-20000 / 500-20000 respectively).
+    aircraftDetectionEnabled: 'true',
+    aircraftAglThresholdMeters: '500',
+    aircraftMslThresholdMeters: '5000',
+    autoFavoriteExcludeAircraft: 'true',
+    // Aircraft age-out (#5364/#5365 Phase 2): strict boolean, hours 6-168,
+    // action 'ignore' | 'delete'.
+    aircraftAgeOutEnabled: 'true',
+    aircraftAgeOutHours: '24',
+    aircraftAgeOutAction: 'ignore',
+    // ADS-B flight matching (#5374): strict boolean, and the feed must be a
+    // known one (INVALID_ADSB_FEED otherwise).
+    adsbMatchEnabled: 'true',
+    adsbFeed: 'adsb.fi',
   };
 
   if (key in VALID_VALUES) {
@@ -291,14 +316,14 @@ function extractSettingsTabPartition(): { nodeDisplayBody: Record<string, unknow
   // this test file (verified via lint:ci), so no disable directive is needed.
   const runPartition = new Function(
     'settings',
-    'NODE_DISPLAY_SETTING_KEYS',
+    'SETTINGS_TAB_PER_SOURCE_KEYS',
     `${runnableJs}\nreturn { nodeDisplayBody, globalBody };`
   ) as (settings: Record<string, string>, keys: readonly string[]) => {
     nodeDisplayBody: Record<string, unknown>;
     globalBody: Record<string, unknown>;
   };
 
-  return runPartition(settingsFixture, NODE_DISPLAY_SETTING_KEYS);
+  return runPartition(settingsFixture, SETTINGS_TAB_PER_SOURCE_KEYS);
 }
 
 /**
@@ -483,6 +508,9 @@ describe('Settings Persistence', () => {
         'homoglyphEnabled',
         // Local stats interval — backend reads directly
         'localStatsIntervalMinutes',
+        // TX-target window when maxNodeAgeHours is 0 (#5376) — SettingsTab loads
+        // it straight from the settings API; only the TX-selecting jobs read it.
+        'txTargetMaxAgeHoursWhenUnlimited',
         // MeshCore CLI console reply-timeout (#4027) — loaded directly by
         // SettingsTab and read server-side by the /cli routes, not via SettingsContext.
         'meshcoreCliTimeoutSeconds',
@@ -515,6 +543,29 @@ describe('Settings Persistence', () => {
         // at runtime by the public GET /api/privacy/links endpoint rather than
         // through SettingsContext.
         'privacyPolicyUrl', 'termsOfServiceUrl', 'contactUrl',
+        // Coverage Report retention window (#5277 P1 WP2) — loaded directly by
+        // SettingsTab into its own initial* snapshot (GLOBAL_ONLY_SETTINGS_KEYS,
+        // settings:write-gated field, no SettingsContext hook), same pattern as
+        // adminRetryAttempts above. Read server-side only by
+        // coverageRetentionService via the bare-key getSettingAsync.
+        'coverage_retention_days',
+        // Likely-aircraft detection (#5364/#5365 Phase 1 WP5) — loaded
+        // directly by SettingsTab into its own initial* snapshot (per-source,
+        // no SettingsContext hook), same Category C pattern as
+        // elevationEnabled/elevationSourceUrl above. Read server-side by
+        // aircraftClassificationService and the settings route's validation.
+        'aircraftDetectionEnabled', 'aircraftAglThresholdMeters', 'aircraftMslThresholdMeters',
+        // Aircraft age-out (#5364/#5365 Phase 2) — same Category C pattern;
+        // read server-side by aircraftAgeOutService.
+        'aircraftAgeOutEnabled', 'aircraftAgeOutHours', 'aircraftAgeOutAction',
+        // Sign-flipped position correction (#5363) — same Category C pattern;
+        // read server-side by signFlipCorrection.ts when node payloads are built.
+        'signFlipCorrectionEnabled', 'signFlipCorrectionRangeKm',
+        'signFlipReferenceLatitude', 'signFlipReferenceLongitude',
+        // ADS-B flight matching (#5374) — same Category C pattern as the
+        // elevation pair; read server-side by adsbMatchService. The flag is
+        // also read publicly by useAdsbMatchEnabled() via a direct fetch.
+        'adsbMatchEnabled', 'adsbFeed', 'adsb_api_token',
       ];
 
       const keysNotLoaded = SETTINGS_TAB_SENDS.filter(
@@ -533,18 +584,24 @@ describe('Settings Persistence', () => {
     // Executes the ACTUAL nodeDisplayBody/globalBody split extracted from
     // SettingsTab.tsx's handleSave (see extractSettingsTabPartition above),
     // not a re-implementation of it. Order of importance per the spec: (1)
-    // is the non-negotiable assertion — every one of the ten
-    // NODE_DISPLAY_SETTING_KEYS entries lands in the scoped body, by COUNT
-    // AND NAME against the constant itself, so this cannot degrade into a
-    // subset check or drift from the constant.
-    it('(1) every NODE_DISPLAY_SETTING_KEYS entry — and only those — lands in the scoped nodeDisplayBody', () => {
+    // is the non-negotiable assertion — every SETTINGS_TAB_PER_SOURCE_KEYS
+    // entry (the frozen ten Node Display keys, the three likely-aircraft keys
+    // from #5364/#5365, and the #5376 TX-target window) lands in the scoped
+    // body, by COUNT AND NAME against the constant itself, so this cannot
+    // degrade into a subset check or drift from the constant.
+    it('(1) every SETTINGS_TAB_PER_SOURCE_KEYS entry — and only those — lands in the scoped nodeDisplayBody', () => {
       const { nodeDisplayBody } = extractSettingsTabPartition();
-      expect(Object.keys(nodeDisplayBody).sort()).toEqual([...NODE_DISPLAY_SETTING_KEYS].sort());
+      expect(Object.keys(nodeDisplayBody).sort()).toEqual([...SETTINGS_TAB_PER_SOURCE_KEYS].sort());
+      // Every Node Display key (frozen ten + aircraft three) is there, plus the #5376 TX-target window.
+      for (const key of NODE_DISPLAY_SETTING_KEYS) {
+        expect(nodeDisplayBody).toHaveProperty(key);
+      }
+      expect(nodeDisplayBody).toHaveProperty('txTargetMaxAgeHoursWhenUnlimited');
     });
 
-    it('(2) none of the ten NODE_DISPLAY_SETTING_KEYS entries land in the unscoped globalBody', () => {
+    it('(2) none of the NODE_DISPLAY_SETTING_KEYS entries land in the unscoped globalBody', () => {
       const { globalBody } = extractSettingsTabPartition();
-      for (const key of NODE_DISPLAY_SETTING_KEYS) {
+      for (const key of SETTINGS_TAB_PER_SOURCE_KEYS) {
         expect(globalBody).not.toHaveProperty(key);
       }
     });
@@ -552,13 +609,32 @@ describe('Settings Persistence', () => {
     it('(3) every other key SettingsTab sends lands in the unscoped globalBody', () => {
       const { globalBody } = extractSettingsTabPartition();
       const nonNodeDisplayKeys = SETTINGS_TAB_SENDS.filter(
-        (key) => !(NODE_DISPLAY_SETTING_KEYS as readonly string[]).includes(key)
+        (key) => !(SETTINGS_TAB_PER_SOURCE_KEYS as readonly string[]).includes(key)
       );
       for (const key of nonNodeDisplayKeys) {
         expect(globalBody).toHaveProperty(key);
       }
       // And nothing extra leaked in — globalBody's key count matches exactly.
       expect(Object.keys(globalBody).sort()).toEqual([...nonNodeDisplayKeys].sort());
+    });
+  });
+
+  describe('mapClusteringEnabled (issue #5404)', () => {
+    it('SettingsTab sends it and SettingsContext loads it', () => {
+      expect(SETTINGS_TAB_SENDS).toContain('mapClusteringEnabled');
+      expect(SETTINGS_CONTEXT_LOADS).toContain('mapClusteringEnabled');
+      expect(ALL_VALID_KEYS).toContain('mapClusteringEnabled');
+    });
+
+    it('should persist mapClusteringEnabled=false independently of mapZoomGateThreshold', async () => {
+      await request(app)
+        .post('/api/settings')
+        .send({ mapClusteringEnabled: 'false', mapZoomGateThreshold: '13' })
+        .expect(200);
+
+      const getRes = await request(app).get('/api/settings').expect(200);
+      expect(getRes.body.mapClusteringEnabled).toBe('false');
+      expect(getRes.body.mapZoomGateThreshold).toBe('13');
     });
   });
 

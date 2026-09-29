@@ -31,6 +31,11 @@ import type { MeshtasticManager } from '../meshtasticManager.js';
 import databaseService from '../../services/database.js';
 import { CronOrIntervalScheduler, type ScheduleMode } from './cronOrIntervalScheduler.js';
 import { logger } from '../../utils/logger.js';
+import {
+  AUTO_ANNOUNCE_HOURS,
+  clampIntervalSetting,
+  NODEINFO_BROADCAST_DELAY_SECONDS,
+} from '../utils/schedulerInterval.js';
 
 export class AutoAnnounceService {
   private announceScheduler: CronOrIntervalScheduler | null = null;
@@ -66,7 +71,14 @@ export class AutoAnnounceService {
       logger.debug(`📢 Starting announce scheduler with cron expression: ${scheduleExpression}`);
       mode = { kind: 'cron', expression: scheduleExpression };
     } else {
-      const intervalHours = parseInt((await databaseService.settings.getSettingForSource(sourceId, 'autoAnnounceIntervalHours')) || '6');
+      // Clamp to the UI's 3–24 h: nothing upstream bounds the stored value, and
+      // above ~596 h the delay overflows so setInterval announces every 1 ms.
+      const intervalHours = clampIntervalSetting(
+        parseInt((await databaseService.settings.getSettingForSource(sourceId, 'autoAnnounceIntervalHours')) || '6'),
+        AUTO_ANNOUNCE_HOURS,
+        `Source ${sourceId} autoAnnounceIntervalHours`,
+        6,
+      );
       const intervalMs = intervalHours * 60 * 60 * 1000;
       logger.debug(`📢 Starting announce scheduler with ${intervalHours} hour interval`);
       mode = { kind: 'interval', intervalMs };
@@ -228,6 +240,10 @@ export class AutoAnnounceService {
 
       logger.debug(`📢 Sending auto-announcement to ${channelIndexes.length} channel(s) [${channelIndexes.join(',')}]: "${replacedMessage}"`);
 
+      // A scheduled/automation-triggered announcement is automation traffic
+      // (#5414); the manual "Send Announcement" button is not.
+      const origin = triggeredByAutomation ? 'automation' : 'manual';
+
       channelIndexes.forEach((channelIdx, i) => {
         this.mgr.messageQueue.enqueue(
           replacedMessage,
@@ -243,6 +259,7 @@ export class AutoAnnounceService {
           1, // single attempt, no retry for broadcasts
           undefined, // not a tapback
           hopLimitOverride,
+          origin,
         );
       });
 
@@ -260,12 +277,19 @@ export class AutoAnnounceService {
         try {
           const nodeInfoChannelsStr = await settings.getSettingForSource(sourceId, 'autoAnnounceNodeInfoChannels') || '[]';
           const nodeInfoChannels = JSON.parse(nodeInfoChannelsStr) as number[];
-          const nodeInfoDelaySeconds = parseInt(await settings.getSettingForSource(sourceId, 'autoAnnounceNodeInfoDelaySeconds') || '30');
+          // Clamp to the UI's 10–300 s. A 0/NaN/overflowed delay sent the
+          // per-channel NodeInfo broadcasts back to back.
+          const nodeInfoDelaySeconds = clampIntervalSetting(
+            parseInt(await settings.getSettingForSource(sourceId, 'autoAnnounceNodeInfoDelaySeconds') || '30'),
+            NODEINFO_BROADCAST_DELAY_SECONDS,
+            `Source ${sourceId} autoAnnounceNodeInfoDelaySeconds`,
+            30,
+          );
 
           if (nodeInfoChannels.length > 0) {
             logger.debug(`📢 NodeInfo broadcasting enabled - will broadcast to ${nodeInfoChannels.length} channel(s)`);
             // Run NodeInfo broadcasting asynchronously (don't block the announcement)
-            this.mgr.broadcastNodeInfoToChannels(nodeInfoChannels, nodeInfoDelaySeconds).catch(error => {
+            this.mgr.broadcastNodeInfoToChannels(nodeInfoChannels, nodeInfoDelaySeconds, { origin }).catch(error => {
               logger.error('❌ Error in NodeInfo broadcasting:', error);
             });
           }

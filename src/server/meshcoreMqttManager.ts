@@ -59,6 +59,14 @@ import { createHash } from 'node:crypto';
 import { ChannelCrypto } from '@michaelhart/meshcore-decoder';
 import { ALL_SOURCES } from '../db/repositories/base.js';
 import { dataEventEmitter } from './services/dataEventEmitter.js';
+import { meshcoreMessageFilter } from './services/meshcoreMessageFilter.js';
+import { meshCorePacketHashOrUndefined } from './services/meshcoreObserverPacket.js';
+import { MESHCORE_PAYLOAD_ADVERT } from '../utils/coverage.js';
+import {
+  maybeRecordMeshCoreCoverageReception,
+  getMeshCoreObserverReceiverPosition,
+} from './utils/coverageMeshCore.js';
+import { isCoverageMqttEnabled } from './services/coverageMqttSettings.js';
 import { logger } from '../utils/logger.js';
 
 /** Persisted `sources.config` shape for a `meshcore_mqtt` source. */
@@ -234,6 +242,8 @@ export class MeshCoreMqttManager extends EventEmitter implements ISourceManager 
   async start(): Promise<void> {
     if (this.started) return;
     this.started = true;
+    // Ignore / Block lists (#5408) are classified synchronously on ingest.
+    await meshcoreMessageFilter.loadSource(this.sourceId);
     try {
       await this.openBroker();
     } catch (err) {
@@ -352,6 +362,11 @@ export class MeshCoreMqttManager extends EventEmitter implements ISourceManager 
       void this.persistPacket(decoded);
       void this.ingestAdvert(decoded);
       void this.ingestChannelMessage(decoded);
+      // Coverage Report (#5277 P3): opt-in per source (U1), reusing P2's
+      // `coverage_mqtt_enabled` toggle. The advert-type check runs BEFORE the
+      // flag read so the (cached, but still a lookup) flag check only ever
+      // sees adverts, not every packet on the feed.
+      if (decoded.event.payload_type === MESHCORE_PAYLOAD_ADVERT) void this.recordCoverage(decoded);
     } catch (err) {
       this.stats.rejected++;
       logger.debug(`[MeshCoreMqtt:${this.sourceId}] failed to handle message:`, err);
@@ -469,6 +484,39 @@ export class MeshCoreMqttManager extends EventEmitter implements ISourceManager 
   }
 
   /**
+   * Coverage Report (#5277 P3, U1): record this Observer's reception of a
+   * positioned, signed ADVERT. Off by default — gated on the same per-source
+   * `coverage_mqtt_enabled` opt-in P2 uses for Meshtastic MQTT gateways, so
+   * the toggle, its cache/invalidation, and the `mqttSources` status row are
+   * all shared unchanged.
+   *
+   * The observer's own receiver position comes from THIS source's
+   * `meshcore_nodes` row for its pubkey (written by `ingestAdvert` above
+   * when the feed carries the observer's own advert) — an observer
+   * MeshMonitor has never seen a NodeInfo/advert for gets no marker, same as
+   * a Meshtastic gateway lacking a NodeInfo in P2.
+   *
+   * Never throws into the ingest path; never emits on `dataEventEmitter`.
+   */
+  private async recordCoverage(decoded: IngestedObserverPacket): Promise<void> {
+    try {
+      if (!(await isCoverageMqttEnabled(this.sourceId))) return;
+
+      const originIdLower = decoded.originId.toLowerCase();
+      await maybeRecordMeshCoreCoverageReception({
+        sourceId: this.sourceId,
+        receiverKind: 'mqtt_gateway',
+        receiverPubKey: originIdLower,
+        receiverPosition: () => getMeshCoreObserverReceiverPosition(this.sourceId, originIdLower),
+        event: decoded.event,
+        observerTimestampMs: decoded.timestamp ? Date.parse(decoded.timestamp) || null : null,
+      });
+    } catch (err) {
+      logger.debug(`[MeshCoreMqtt:${this.sourceId}] failed to record Coverage reception:`, err);
+    }
+  }
+
+  /**
    * Decrypt a GRP_TXT (channel) frame and store it as a message (#5040 Phase 4).
    *
    * ## Channel keys are read across ALL sources
@@ -543,13 +591,50 @@ export class MeshCoreMqttManager extends EventEmitter implements ISourceManager 
           createdAt: Date.now(),
       };
 
+      // Ignore / Block (#5408): block drops the message before it is stored;
+      // ignore stores it and flags the event so automations skip it.
+      const verdict = meshcoreMessageFilter.classify(this.sourceId, {
+        fromPublicKey: null,
+        fromName: plain.senderName,
+        text: plain.text,
+        kind: 'channel',
+      }, { countHit: false });
+      // Many observers relay one frame, so count a hit once per message id,
+      // not once per copy.
+      if (verdict.action === 'block') {
+        if (this.rememberBlockedId(id)) meshcoreMessageFilter.countHit(this.sourceId, verdict);
+        return;
+      }
+
       const inserted = await databaseService.meshcore.insertMessage(row, this.sourceId);
       if (!inserted) return; // A different observer's copy already landed.
+      meshcoreMessageFilter.countHit(this.sourceId, verdict);
       this.stats.channelMessages++;
-      dataEventEmitter.emitMeshCoreMessage(row, this.sourceId);
+      // The packet hash (#5357) rides the event only: added AFTER the insert so
+      // the DB row keeps its shape (meshcore_messages has no hash column). The
+      // raw frame came straight off the wire, so the hash is exact.
+      const packetHash = meshCorePacketHashOrUndefined(decoded.event.raw_hex);
+      dataEventEmitter.emitMeshCoreMessage(
+        verdict.action === 'ignore' ? { ...row, packetHash, filtered: 'ignore' as const } : { ...row, packetHash },
+        this.sourceId,
+      );
     } catch (err) {
       logger.debug(`[MeshCoreMqtt:${this.sourceId}] failed to ingest channel message:`, err);
     }
+  }
+
+  /** Recently blocked message ids (#5408), so N observer copies count one hit. */
+  private recentBlockedIds = new Set<string>();
+
+  /** Returns true the first time an id is seen. Bounded to the last 500 ids. */
+  private rememberBlockedId(id: string): boolean {
+    if (this.recentBlockedIds.has(id)) return false;
+    this.recentBlockedIds.add(id);
+    if (this.recentBlockedIds.size > 500) {
+      const oldest = this.recentBlockedIds.values().next().value;
+      if (oldest !== undefined) this.recentBlockedIds.delete(oldest);
+    }
+    return true;
   }
 
   /**

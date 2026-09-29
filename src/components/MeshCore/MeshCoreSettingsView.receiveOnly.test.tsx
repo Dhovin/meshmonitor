@@ -15,15 +15,10 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MeshCoreSettingsView } from './MeshCoreSettingsView';
 
-vi.mock('react-i18next', () => ({
-  useTranslation: () => ({
-    t: (key: string, fallback?: string | Record<string, unknown>, opts?: Record<string, unknown>) => {
-      const base = typeof fallback === 'string' ? fallback : key;
-      const vars = (typeof fallback === 'object' ? fallback : opts) ?? {};
-      return base.replace(/\{\{(\w+)\}\}/g, (_m, k) => String((vars as Record<string, unknown>)[k] ?? ''));
-    },
-  }),
-}));
+vi.mock('react-i18next', async () => {
+  const { createReactI18nextMock } = await import('../../test/mockI18n');
+  return createReactI18nextMock();
+});
 
 const h = vi.hoisted(() => ({
   showToast: vi.fn(),
@@ -38,6 +33,9 @@ vi.mock('@tanstack/react-query', () => ({
   useQueryClient: () => ({ invalidateQueries: h.invalidateQueries }),
 }));
 // Not under test; it fetches on mount.
+// Ignore / Block sections (#5408) own TanStack queries; covered by their own tests.
+vi.mock('./MeshCoreIgnoredNodesSection', () => ({ MeshCoreIgnoredNodesSection: () => null }));
+vi.mock('./MeshCoreMessageFiltersSection', () => ({ MeshCoreMessageFiltersSection: () => null }));
 vi.mock('./MeshCoreNodeDisplaySection', () => ({
   MeshCoreNodeDisplaySection: () => null,
 }));
@@ -99,11 +97,12 @@ describe('MeshCoreSettingsView — receive-only toggle rendering', () => {
 });
 
 describe('MeshCoreSettingsView — receive-only button gating', () => {
-  it('disables Send advert, Discover x3 and Discover regions, all with the control tooltip', () => {
+  it('disables both advert buttons, Discover x3 and Discover regions, all with the control tooltip', () => {
     renderView(true);
 
     const gated = [
-      screen.getByRole('button', { name: 'Send advert' }),
+      screen.getByRole('button', { name: 'Advert (nearby, zero-hop)' }),
+      screen.getByRole('button', { name: 'Flood advert' }),
       screen.getByRole('button', { name: 'Discover Nearby Nodes' }),
       screen.getByRole('button', { name: 'Discover Repeaters' }),
       screen.getByRole('button', { name: 'Discover Sensors' }),
@@ -129,7 +128,8 @@ describe('MeshCoreSettingsView — receive-only button gating', () => {
     renderView(false);
 
     const gated = [
-      screen.getByRole('button', { name: 'Send advert' }),
+      screen.getByRole('button', { name: 'Advert (nearby, zero-hop)' }),
+      screen.getByRole('button', { name: 'Flood advert' }),
       screen.getByRole('button', { name: 'Discover Nearby Nodes' }),
       screen.getByRole('button', { name: 'Discover Repeaters' }),
       screen.getByRole('button', { name: 'Discover Sensors' }),

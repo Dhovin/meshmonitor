@@ -58,6 +58,8 @@ export interface DbNode {
   channelUtilization?: number | null;
   airUtilTx?: number | null;
   lastHeard?: number | null;
+  /** #5390: earliest reception on this source, Unix SECONDS (like lastHeard). Set once. */
+  firstHeard?: number | null;
   snr?: number | null;
   rssi?: number | null;
   lastTracerouteRequest?: number | null;
@@ -112,6 +114,33 @@ export interface DbNode {
   hasRemoteAdmin?: boolean | null;
   lastRemoteAdminCheck?: number | null;
   remoteAdminMetadata?: string | null;
+  /**
+   * Set when the row was created by importing a Meshtastic contact URL rather
+   * than by hearing the node (#5317). Milliseconds, like `createdAt`. NULL for
+   * every normally-discovered node.
+   */
+  importedAt?: number | null;
+  /**
+   * Likely-aircraft classification (#5364/#5365, migration 175). `true` =
+   * likely aircraft, `false` = classified as not, `null` = never classified /
+   * unknown / detection off for this source.
+   */
+  likelyAircraft?: boolean | null;
+  /** `'agl' | 'msl' | 'unknown'`, null when unclassified. */
+  aircraftBasis?: string | null;
+  /** DEM metres at the classified point; null if not sampled. */
+  groundElevation?: number | null;
+  /** `altitude − groundElevation`, signed; null unless basis is `'agl'`. */
+  heightAboveGround?: number | null;
+  /** Epoch ms of the last classification write; the backfill key. */
+  aircraftClassifiedAt?: number | null;
+  /** Epoch ms the age-out sweep ignored this node (#5364/#5365 Phase 2); null when not aged out. */
+  aircraftAgedOutAt?: number | null;
+  /** Epoch ms the "confirmed fixed" rule fired (Phase 2 D4); null when not marked. */
+  aircraftFixedAt?: number | null;
+  /** Anchor of the fixed mark; null when not marked. */
+  aircraftFixedLatitude?: number | null;
+  aircraftFixedLongitude?: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -140,6 +169,12 @@ export interface DbMessage {
   viaStoreForward?: boolean | null;
   /** Broadcast carried a verified XEdDSA signature (firmware 2.8+). NULL for pre-migration rows / unsigned traffic. */
   xeddsaSigned?: boolean | null;
+  /**
+   * `meshtastic.MeshPacket.TransportMechanism` the message arrived on (#5101).
+   * NULL = pre-migration row -> classify by `viaMqtt`. Outbound sends store
+   * INTERNAL (0).
+   */
+  transportMechanism?: number | null;
   rxSnr?: number | null;
   rxRssi?: number | null;
   ackFailed?: boolean | null;
@@ -238,6 +273,12 @@ export interface DbRouteSegment {
   toNodeId: string;
   distanceKm: number;
   isRecordHolder: boolean | null;
+  /**
+   * Effective `meshtastic.MeshPacket.TransportMechanism` of this hop (#5101):
+   * the traceroute record's mechanism, or MQTT (5) when the hop's arrival SNR
+   * was the unknown-SNR sentinel. NULL = pre-migration row -> RF.
+   */
+  transportMechanism?: number | null;
   timestamp: number;
   createdAt: number;
 }

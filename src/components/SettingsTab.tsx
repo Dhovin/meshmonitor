@@ -20,7 +20,10 @@ import settingsStyles from './SettingsTab.module.css';
 import SystemBackupSection from './configuration/SystemBackupSection';
 import DatabaseMaintenanceSection from './configuration/DatabaseMaintenanceSection';
 import ScriptsSection from './settings/ScriptsSection';
+import CoverageMqttRecordingSection from './settings/CoverageMqttRecordingSection';
 import FirmwareUpdateSection from './configuration/FirmwareUpdateSection';
+import SignFlipCorrectionSettings from './settings/SignFlipCorrectionSettings';
+import { parseSignFlipSettings, clampSignFlipRangeKm, SIGN_FLIP_DEFAULT_RANGE_KM } from '../utils/signFlipPosition';
 import ChannelDatabaseSection from './configuration/ChannelDatabaseSection';
 import { CustomThemeManagement } from './CustomThemeManagement';
 import { CustomTilesetManager } from './CustomTilesetManager';
@@ -34,6 +37,7 @@ import {
   settingsNavItems,
 } from './search/configSections';
 import PositionEstimationSection from './PositionEstimationSection';
+import AutoEnrichmentSection from './AutoEnrichmentSection';
 import MeshIssuesSection from './MeshIssuesSection';
 import TapbackEmojiSettings from './TapbackEmojiSettings';
 import EmbedSettings from './settings/EmbedSettings';
@@ -43,15 +47,38 @@ import GeoJsonLayerManager from './GeoJsonLayerManager';
 import MapStyleManager from './MapStyleManager';
 import { useDashboardSources } from '../hooks/useDashboardData';
 import { DEFAULT_TERRARIUM_URL } from '../types/elevation';
+import { ADSB_FEEDS, ADSB_FEED_IDS, DEFAULT_ADSB_FEED, isAdsbFeed } from '../utils/adsbFeeds';
+import { clampCoverageRetentionDays, COVERAGE_RETENTION_DEFAULT_DAYS, isCoverageMqttSourceType } from '../utils/coverage';
 import { useSourceQuery } from '../hooks/useSourceQuery';
 import { useSource } from '../contexts/SourceContext';
+import TelemetryOutlierDialog from './TelemetryOutlierDialog/TelemetryOutlierDialog';
+import { getTelemetryLabel } from './TelemetryChart';
 import {
-  NODE_DISPLAY_SETTING_KEYS,
+  SETTINGS_TAB_PER_SOURCE_KEYS,
   NODE_DISPLAY_NUMERIC_DEFAULTS,
   NODE_DISPLAY_STRING_DEFAULTS,
   parseNodeDisplayNumber,
   parseNodeDisplayBoolean,
+  parseTxTargetMaxAgeHoursWhenUnlimited,
+  TX_TARGET_MAX_AGE_HOURS_WHEN_UNLIMITED_DEFAULT,
+  TX_TARGET_MAX_AGE_HOURS_WHEN_UNLIMITED_RANGE,
 } from '../constants/nodeDisplayDefaults';
+import {
+  parseAircraftSettings,
+  AIRCRAFT_AGL_RANGE,
+  AIRCRAFT_MSL_RANGE,
+  DEFAULT_AIRCRAFT_AGL_THRESHOLD_M,
+  DEFAULT_AIRCRAFT_MSL_THRESHOLD_M,
+  parseAircraftAgeOutSettings,
+  parseAircraftAgeOutLastResult,
+  isAircraftAgeOutAction,
+  AIRCRAFT_AGE_OUT_HOURS_DEFAULT,
+  AIRCRAFT_AGE_OUT_HOURS_RANGE,
+  DEFAULT_AIRCRAFT_AGE_OUT_ACTION,
+  type AircraftAgeOutAction,
+  type AircraftAgeOutLastResult,
+} from '../utils/aircraftClassification';
+import { formatDateTime } from '../utils/datetime';
 
 type DistanceUnit = 'km' | 'mi';
 type PositionHistoryLineStyle = 'linear' | 'spline';
@@ -105,6 +132,7 @@ interface SettingsDraft {
   defaultMapCenterZoom: number | null;
   mapCenterTargetZoom: number;
   mapZoomGateThreshold: number;
+  mapClusteringEnabled: boolean;
   defaultLandingPage: string;
   appearanceMode: AppearanceMode;
   darkTheme: Theme;
@@ -122,6 +150,23 @@ interface SettingsDraft {
   nodeDimmingEnabled: boolean;
   nodeDimmingStartHours: number;
   nodeDimmingMinOpacity: number;
+  // Likely-aircraft detection (#5364/#5365 Phase 1 WP5) — unseeded Node
+  // Display keys (AIRCRAFT_NODE_DISPLAY_KEYS), same scoped-POST routing as
+  // the group above via NODE_DISPLAY_SETTING_KEYS.
+  aircraftDetectionEnabled: boolean;
+  aircraftAglThresholdMeters: number;
+  aircraftMslThresholdMeters: number;
+  // Aircraft age-out (#5364/#5365 Phase 2) — same per-source routing.
+  aircraftAgeOutEnabled: boolean;
+  aircraftAgeOutHours: number;
+  aircraftAgeOutAction: AircraftAgeOutAction;
+  // Sign-flipped position correction (#5363) — per-source Node Display keys
+  // (SIGN_FLIP_NODE_DISPLAY_KEYS). Range in km; reference as typed strings
+  // (blank = use the source's own node).
+  signFlipCorrectionEnabled: boolean;
+  signFlipCorrectionRangeKm: number;
+  signFlipReferenceLatitude: string;
+  signFlipReferenceLongitude: string;
   solarMonitoringEnabled: boolean;
   solarMonitoringLatitude: number;
   solarMonitoringLongitude: number;
@@ -134,8 +179,14 @@ interface SettingsDraft {
   packetLogMaxAgeHours: number;
   homoglyphEnabled: boolean;
   localStatsIntervalMinutes: number;
+  // TX-target window when maxNodeAgeHours is 0 ("unlimited", #5376). Per-source,
+  // server-only — same Category C pattern as localStatsIntervalMinutes.
+  txTargetMaxAgeHoursWhenUnlimited: number;
   meshcoreCliTimeoutSeconds: number;
   adminRetryAttempts: number;
+  // Coverage Report retention window, in days (#5277 P1 WP2). Global, no
+  // SettingsContext prop home — same Category C pattern as the two above.
+  coverageRetentionDays: number;
   analyticsProvider: string;
   analyticsConfig: Record<string, string>;
   appriseApiServerUrl: string;
@@ -147,6 +198,12 @@ interface SettingsDraft {
   externalUrl: string;
   elevationEnabled: boolean;
   elevationSourceUrl: string;
+  // ADS-B flight matching (#5374). Global outbound service, same admin-field
+  // pattern as the elevation pair. `adsbApiToken` maps to the server-only
+  // `adsb_api_token` key (admins receive it unmasked).
+  adsbMatchEnabled: boolean;
+  adsbFeed: string;
+  adsbApiToken: string;
   // Deployment-wide Carto basemap API key (#4934). Global, admin-set, publicly
   // readable (NOT a secret) — publishable, domain-restricted token appended to
   // Carto tile URLs. Mirrors the elevationSourceUrl admin-field pattern.
@@ -363,8 +420,10 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     setDefaultMapCenterZoom,
     mapCenterTargetZoom,
     mapZoomGateThreshold,
+    mapClusteringEnabled,
     setMapCenterTargetZoom,
     setMapZoomGateThreshold,
+    setMapClusteringEnabled,
     defaultLandingPage,
     setDefaultLandingPage,
     appearanceMode,
@@ -384,7 +443,12 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
   // Scope destructive purges to the source whose Danger Zone this is; null in
   // global mode. `useSourceQuery()` returns a query string, so read the id
   // directly rather than parsing it back out (#5088).
-  const { sourceId: purgeSourceId } = useSource();
+  // sourceType (#5277 P2 WP3, widened P3 WP4) gates the Coverage recording
+  // section/nav item to MQTT-shaped sources — see isCoverageMqttSourceType
+  // below.
+  const { sourceId: purgeSourceId, sourceType } = useSource();
+  // #5333: outlier purge dialog (Danger Zone → Clean telemetry outliers).
+  const [outlierDialogOpen, setOutlierDialogOpen] = useState(false);
 
   // Single draft reducer replacing the 49 `local*` mirrors (Task 5.3). Lazy-initialized once from
   // the current context/props values; category-C fields (no context/prop home) start at their
@@ -415,6 +479,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     defaultMapCenterZoom,
     mapCenterTargetZoom,
     mapZoomGateThreshold,
+    mapClusteringEnabled,
     defaultLandingPage,
     appearanceMode,
     darkTheme,
@@ -429,6 +494,16 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     nodeDimmingEnabled,
     nodeDimmingStartHours,
     nodeDimmingMinOpacity,
+    aircraftDetectionEnabled: true,
+    aircraftAglThresholdMeters: DEFAULT_AIRCRAFT_AGL_THRESHOLD_M,
+    aircraftMslThresholdMeters: DEFAULT_AIRCRAFT_MSL_THRESHOLD_M,
+    aircraftAgeOutEnabled: false,
+    aircraftAgeOutHours: AIRCRAFT_AGE_OUT_HOURS_DEFAULT,
+    aircraftAgeOutAction: DEFAULT_AIRCRAFT_AGE_OUT_ACTION,
+    signFlipCorrectionEnabled: false,
+    signFlipCorrectionRangeKm: SIGN_FLIP_DEFAULT_RANGE_KM,
+    signFlipReferenceLatitude: '',
+    signFlipReferenceLongitude: '',
     solarMonitoringEnabled,
     solarMonitoringLatitude,
     solarMonitoringLongitude,
@@ -439,8 +514,10 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     packetLogMaxAgeHours: 24,
     homoglyphEnabled: false,
     localStatsIntervalMinutes: NODE_DISPLAY_NUMERIC_DEFAULTS.localStatsIntervalMinutes,
+    txTargetMaxAgeHoursWhenUnlimited: TX_TARGET_MAX_AGE_HOURS_WHEN_UNLIMITED_DEFAULT,
     meshcoreCliTimeoutSeconds: 15,
     adminRetryAttempts: 1,
+    coverageRetentionDays: COVERAGE_RETENTION_DEFAULT_DAYS,
     analyticsProvider: 'none',
     analyticsConfig: {},
     appriseApiServerUrl: '',
@@ -450,6 +527,9 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     externalUrl: '',
     elevationEnabled: false,
     elevationSourceUrl: '',
+    adsbMatchEnabled: false,
+    adsbFeed: DEFAULT_ADSB_FEED,
+    adsbApiToken: '',
     cartoApiKey: '',
     cotFeedEnabled: false,
     cotFeedPort: 8088,
@@ -467,10 +547,13 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
   const [initialPacketMonitorSettings, setInitialPacketMonitorSettings] = useState({ enabled: false, maxCount: 1000, maxAgeHours: 24 });
   const [initialHomoglyphEnabled, setInitialHomoglyphEnabled] = useState(false);
   const [initialLocalStatsIntervalMinutes, setInitialLocalStatsIntervalMinutes] = useState<number>(NODE_DISPLAY_NUMERIC_DEFAULTS.localStatsIntervalMinutes);
+  const [initialTxTargetMaxAgeHoursWhenUnlimited, setInitialTxTargetMaxAgeHoursWhenUnlimited] = useState<number>(TX_TARGET_MAX_AGE_HOURS_WHEN_UNLIMITED_DEFAULT);
   // MeshCore CLI console reply-timeout (seconds), issue #4027. Local-only server-backed setting
   // (no SettingsContext prop), mirroring localStats above.
   const [initialMeshcoreCliTimeoutSeconds, setInitialMeshcoreCliTimeoutSeconds] = useState(15);
   const [initialAdminRetryAttempts, setInitialAdminRetryAttempts] = useState(1);
+  // Coverage Report retention window (#5277 P1 WP2). Same Category C pattern.
+  const [initialCoverageRetentionDays, setInitialCoverageRetentionDays] = useState(COVERAGE_RETENTION_DEFAULT_DAYS);
   const [initialAnalyticsProvider, setInitialAnalyticsProvider] = useState<string>('none');
   const [initialAnalyticsConfig, setInitialAnalyticsConfig] = useState<string>('{}');
   const [initialAppriseApiServerUrl, setInitialAppriseApiServerUrl] = useState<string>('');
@@ -485,6 +568,33 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
   // `elevationSourceUrl` (stripSecretSettings returns the full map to admins).
   const [initialElevationEnabled, setInitialElevationEnabled] = useState(false);
   const [initialElevationSourceUrl, setInitialElevationSourceUrl] = useState('');
+  // ADS-B flight matching (#5374): same Category C pattern as elevation.
+  const [initialAdsbMatchEnabled, setInitialAdsbMatchEnabled] = useState(false);
+  const [initialAdsbFeed, setInitialAdsbFeed] = useState<string>(DEFAULT_ADSB_FEED);
+  const [initialAdsbApiToken, setInitialAdsbApiToken] = useState('');
+  // Likely-aircraft detection (#5364/#5365 Phase 1 WP5). Per-source, unseeded
+  // Node Display keys (AIRCRAFT_NODE_DISPLAY_KEYS) — same Category C pattern
+  // as the elevation pair above: no SettingsContext prop home, dirty-tracked
+  // against an `initial*` snapshot populated by the server-fetch effect.
+  const [initialAircraftDetectionEnabled, setInitialAircraftDetectionEnabled] = useState(true);
+  const [initialAircraftAglThresholdMeters, setInitialAircraftAglThresholdMeters] = useState(DEFAULT_AIRCRAFT_AGL_THRESHOLD_M);
+  const [initialAircraftMslThresholdMeters, setInitialAircraftMslThresholdMeters] = useState(DEFAULT_AIRCRAFT_MSL_THRESHOLD_M);
+  // Aircraft age-out (#5364/#5365 Phase 2): same Category C pattern. The
+  // last-run pair is server-written and read-only here (not in the draft).
+  const [initialAircraftAgeOutEnabled, setInitialAircraftAgeOutEnabled] = useState(false);
+  const [initialAircraftAgeOutHours, setInitialAircraftAgeOutHours] = useState(AIRCRAFT_AGE_OUT_HOURS_DEFAULT);
+  const [initialAircraftAgeOutAction, setInitialAircraftAgeOutAction] = useState<AircraftAgeOutAction>(DEFAULT_AIRCRAFT_AGE_OUT_ACTION);
+  // Sign-flip correction (#5363): Category C, one snapshot for the four keys.
+  const [initialSignFlip, setInitialSignFlip] = useState({
+    enabled: false,
+    rangeKm: SIGN_FLIP_DEFAULT_RANGE_KM,
+    referenceLatitude: '',
+    referenceLongitude: '',
+  });
+  const [aircraftAgeOutLastRun, setAircraftAgeOutLastRun] = useState<{
+    at: number | null;
+    result: AircraftAgeOutLastResult | null;
+  }>({ at: null, result: null });
   // #4934: deployment-wide Carto API key (no context/prop home, same admin-field
   // pattern as elevationSourceUrl above). Default '' (unset).
   const [initialCartoApiKey, setInitialCartoApiKey] = useState('');
@@ -585,6 +695,11 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           updateField('localStatsIntervalMinutes', statsInterval);
           setInitialLocalStatsIntervalMinutes(statsInterval);
 
+          // Load the TX-target window used when the node window is unlimited (#5376).
+          const txTargetHours = parseTxTargetMaxAgeHoursWhenUnlimited(settings.txTargetMaxAgeHoursWhenUnlimited);
+          updateField('txTargetMaxAgeHoursWhenUnlimited', txTargetHours);
+          setInitialTxTargetMaxAgeHoursWhenUnlimited(txTargetHours);
+
           // Load MeshCore CLI console timeout (#4027). Absent/invalid => 15s default.
           const cliTimeoutParsed = parseInt(settings.meshcoreCliTimeoutSeconds || '15', 10);
           const cliTimeout = Number.isFinite(cliTimeoutParsed) ? Math.min(60, Math.max(1, cliTimeoutParsed)) : 15;
@@ -597,6 +712,12 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           const retryAttempts = Number.isFinite(retryParsed) ? Math.min(10, Math.max(1, retryParsed)) : 1;
           updateField('adminRetryAttempts', retryAttempts);
           setInitialAdminRetryAttempts(retryAttempts);
+
+          // Load Coverage Report retention window (#5277 P1 WP2). Absent/invalid
+          // falls back to the 7-day default; clamped 1-90 like the server side.
+          const coverageRetention = clampCoverageRetentionDays(settings.coverage_retention_days);
+          updateField('coverageRetentionDays', coverageRetention);
+          setInitialCoverageRetentionDays(coverageRetention);
 
           // Load node dimming initial values from server (#4412 Phase 3 WP4(c):
           // the trio now lands on the draft via updateField, like every other
@@ -655,6 +776,74 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
             : '';
           updateField('elevationSourceUrl', elevationSourceUrl);
           setInitialElevationSourceUrl(elevationSourceUrl);
+
+          // ADS-B flight matching (#5374). Off unless stored 'true'; an
+          // unknown feed reads as the default.
+          const adsbOn = settings.adsbMatchEnabled === 'true';
+          updateField('adsbMatchEnabled', adsbOn);
+          setInitialAdsbMatchEnabled(adsbOn);
+          const adsbFeed = isAdsbFeed(settings.adsbFeed) ? settings.adsbFeed : DEFAULT_ADSB_FEED;
+          updateField('adsbFeed', adsbFeed);
+          setInitialAdsbFeed(adsbFeed);
+          const adsbToken = typeof settings.adsb_api_token === 'string' ? settings.adsb_api_token : '';
+          updateField('adsbApiToken', adsbToken);
+          setInitialAdsbApiToken(adsbToken);
+
+          // Load likely-aircraft detection settings (#5364/#5365 Phase 1
+          // WP5). Per-source, routed through NODE_DISPLAY_SETTING_KEYS; an
+          // unset source (absent keys) falls through to
+          // parseAircraftSettings' hardcoded defaults, never a global row —
+          // the GET back-fill already skips every NODE_DISPLAY_SETTING_KEYS
+          // key (§4.5), so a legacy global row can never leak in here.
+          const aircraft = parseAircraftSettings({
+            enabled: settings.aircraftDetectionEnabled,
+            aglThresholdM: settings.aircraftAglThresholdMeters,
+            mslThresholdM: settings.aircraftMslThresholdMeters,
+          });
+          updateField('aircraftDetectionEnabled', aircraft.enabled);
+          setInitialAircraftDetectionEnabled(aircraft.enabled);
+          updateField('aircraftAglThresholdMeters', aircraft.aglThresholdM);
+          setInitialAircraftAglThresholdMeters(aircraft.aglThresholdM);
+          updateField('aircraftMslThresholdMeters', aircraft.mslThresholdM);
+          setInitialAircraftMslThresholdMeters(aircraft.mslThresholdM);
+
+          // Aircraft age-out (#5364/#5365 Phase 2). Off / 24 h / ignore
+          // when unset, per parseAircraftAgeOutSettings.
+          const ageOut = parseAircraftAgeOutSettings({
+            enabled: settings.aircraftAgeOutEnabled,
+            hours: settings.aircraftAgeOutHours,
+            action: settings.aircraftAgeOutAction,
+          });
+          updateField('aircraftAgeOutEnabled', ageOut.enabled);
+          setInitialAircraftAgeOutEnabled(ageOut.enabled);
+          updateField('aircraftAgeOutHours', ageOut.hours);
+          setInitialAircraftAgeOutHours(ageOut.hours);
+          updateField('aircraftAgeOutAction', ageOut.action);
+          setInitialAircraftAgeOutAction(ageOut.action);
+
+          // Sign-flip correction (#5363). Off / 500 km / own node when unset.
+          // The typed reference strings are kept as stored so a half-entered
+          // point shows up for fixing rather than silently vanishing.
+          const signFlip = parseSignFlipSettings({
+            enabled: settings.signFlipCorrectionEnabled,
+            rangeKm: settings.signFlipCorrectionRangeKm,
+          });
+          const signFlipSnapshot = {
+            enabled: signFlip.enabled,
+            rangeKm: signFlip.rangeKm,
+            referenceLatitude: typeof settings.signFlipReferenceLatitude === 'string' ? settings.signFlipReferenceLatitude : '',
+            referenceLongitude: typeof settings.signFlipReferenceLongitude === 'string' ? settings.signFlipReferenceLongitude : '',
+          };
+          updateField('signFlipCorrectionEnabled', signFlipSnapshot.enabled);
+          updateField('signFlipCorrectionRangeKm', signFlipSnapshot.rangeKm);
+          updateField('signFlipReferenceLatitude', signFlipSnapshot.referenceLatitude);
+          updateField('signFlipReferenceLongitude', signFlipSnapshot.referenceLongitude);
+          setInitialSignFlip(signFlipSnapshot);
+          const lastRunAt = Number(settings.aircraftAgeOutLastRunAt);
+          setAircraftAgeOutLastRun({
+            at: Number.isFinite(lastRunAt) && lastRunAt > 0 ? lastRunAt : null,
+            result: parseAircraftAgeOutLastResult(settings.aircraftAgeOutLastResult),
+          });
 
           // #4934: deployment-wide Carto basemap API key. Admins receive the
           // unmasked value (it is not secret-stripped).
@@ -726,6 +915,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
       defaultMapCenterZoom,
       mapCenterTargetZoom,
       mapZoomGateThreshold,
+      mapClusteringEnabled,
       defaultLandingPage,
       appearanceMode,
       darkTheme,
@@ -745,6 +935,16 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
       nodeDimmingEnabled,
       nodeDimmingStartHours,
       nodeDimmingMinOpacity,
+      aircraftDetectionEnabled: initialAircraftDetectionEnabled,
+      aircraftAglThresholdMeters: initialAircraftAglThresholdMeters,
+      aircraftMslThresholdMeters: initialAircraftMslThresholdMeters,
+      aircraftAgeOutEnabled: initialAircraftAgeOutEnabled,
+      aircraftAgeOutHours: initialAircraftAgeOutHours,
+      aircraftAgeOutAction: initialAircraftAgeOutAction,
+      signFlipCorrectionEnabled: initialSignFlip.enabled,
+      signFlipCorrectionRangeKm: initialSignFlip.rangeKm,
+      signFlipReferenceLatitude: initialSignFlip.referenceLatitude,
+      signFlipReferenceLongitude: initialSignFlip.referenceLongitude,
       solarMonitoringEnabled,
       solarMonitoringLatitude,
       solarMonitoringLongitude,
@@ -755,8 +955,10 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
       packetLogMaxAgeHours: initialPacketMonitorSettings.maxAgeHours,
       homoglyphEnabled: initialHomoglyphEnabled,
       localStatsIntervalMinutes: initialLocalStatsIntervalMinutes,
+      txTargetMaxAgeHoursWhenUnlimited: initialTxTargetMaxAgeHoursWhenUnlimited,
       meshcoreCliTimeoutSeconds: initialMeshcoreCliTimeoutSeconds,
       adminRetryAttempts: initialAdminRetryAttempts,
+      coverageRetentionDays: initialCoverageRetentionDays,
       analyticsProvider: initialAnalyticsProvider,
       analyticsConfig: parsedAnalyticsConfig,
       appriseApiServerUrl: initialAppriseApiServerUrl,
@@ -766,6 +968,9 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
       externalUrl: initialExternalUrl,
       elevationEnabled: initialElevationEnabled,
       elevationSourceUrl: initialElevationSourceUrl,
+      adsbMatchEnabled: initialAdsbMatchEnabled,
+      adsbFeed: initialAdsbFeed,
+      adsbApiToken: initialAdsbApiToken,
       cartoApiKey: initialCartoApiKey,
       cotFeedEnabled: initialCotFeedEnabled,
       cotFeedPort: initialCotFeedPort,
@@ -773,15 +978,21 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
   }, [maxNodeAgeHours, inactiveNodeThresholdHours, inactiveNodeCheckIntervalMinutes, inactiveNodeCooldownHours,
       temperatureUnit, distanceUnit, positionHistoryLineStyle, telemetryVisualizationHours, favoriteTelemetryStorageDays,
       preferredSortField, preferredSortDirection, timeFormat, dateFormat, mapTilesetLight, mapTilesetDark, mapPinStyle, mapPinColorMode, nodeListStyle,
-      iconStyle, neighborInfoMinZoom, defaultMapCenterLat, defaultMapCenterLon, defaultMapCenterZoom, mapCenterTargetZoom, mapZoomGateThreshold,
+      iconStyle, neighborInfoMinZoom, defaultMapCenterLat, defaultMapCenterLon, defaultMapCenterZoom, mapCenterTargetZoom, mapZoomGateThreshold, mapClusteringEnabled,
       defaultLandingPage, appearanceMode, darkTheme, lightTheme, nodeHopsCalculation, preferredDashboardSortOption,
       linkPreviewsEnabled, discardInvalidPositions, noIndexEnabled, meshcoreChannelRetryEnabled, showIncompleteNodes,
       nodeDimmingEnabled, nodeDimmingStartHours, nodeDimmingMinOpacity,
+      initialAircraftDetectionEnabled, initialAircraftAglThresholdMeters, initialAircraftMslThresholdMeters,
+      initialAircraftAgeOutEnabled, initialAircraftAgeOutHours, initialAircraftAgeOutAction,
+      initialSignFlip,
       solarMonitoringEnabled, solarMonitoringLatitude, solarMonitoringLongitude, solarMonitoringAzimuth, solarMonitoringDeclination,
-      initialPacketMonitorSettings, initialHomoglyphEnabled, initialLocalStatsIntervalMinutes, initialMeshcoreCliTimeoutSeconds, initialAdminRetryAttempts,
+      initialPacketMonitorSettings, initialHomoglyphEnabled, initialLocalStatsIntervalMinutes, initialTxTargetMaxAgeHoursWhenUnlimited,
+      initialMeshcoreCliTimeoutSeconds, initialAdminRetryAttempts,
+      initialCoverageRetentionDays,
       initialAnalyticsProvider, initialAnalyticsConfig, initialAppriseApiServerUrl, initialExternalUrl, initialElevationEnabled, initialElevationSourceUrl,
       initialPrivacyPolicyUrl, initialTermsOfServiceUrl, initialContactUrl,
-      initialCartoApiKey, initialCotFeedEnabled, initialCotFeedPort]);
+      initialCartoApiKey, initialCotFeedEnabled, initialCotFeedPort,
+      initialAdsbMatchEnabled, initialAdsbFeed, initialAdsbApiToken]);
 
   // Re-seed the draft's category-A/B fields whenever the upstream props/context values change.
   // PINNED BEHAVIOR (do not add a dirty-guard here — that would be a behavior change, out of
@@ -826,6 +1037,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
         defaultMapCenterZoom,
         mapCenterTargetZoom,
         mapZoomGateThreshold,
+        mapClusteringEnabled,
         defaultLandingPage,
         appearanceMode,
         darkTheme,
@@ -850,7 +1062,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
   }, [maxNodeAgeHours, inactiveNodeThresholdHours, inactiveNodeCheckIntervalMinutes, inactiveNodeCooldownHours,
       temperatureUnit, distanceUnit, positionHistoryLineStyle, telemetryVisualizationHours, favoriteTelemetryStorageDays,
       preferredSortField, preferredSortDirection, timeFormat, dateFormat, mapTilesetLight, mapTilesetDark, mapPinStyle, mapPinColorMode, nodeListStyle,
-      iconStyle, neighborInfoMinZoom, defaultMapCenterLat, defaultMapCenterLon, defaultMapCenterZoom, mapCenterTargetZoom, mapZoomGateThreshold,
+      iconStyle, neighborInfoMinZoom, defaultMapCenterLat, defaultMapCenterLon, defaultMapCenterZoom, mapCenterTargetZoom, mapZoomGateThreshold, mapClusteringEnabled,
       defaultLandingPage, appearanceMode, darkTheme, lightTheme, nodeHopsCalculation, preferredDashboardSortOption,
       linkPreviewsEnabled, discardInvalidPositions, noIndexEnabled, meshcoreChannelRetryEnabled, showIncompleteNodes,
       nodeDimmingEnabled, nodeDimmingStartHours, nodeDimmingMinOpacity,
@@ -937,6 +1149,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     setDefaultMapCenterZoom(d.defaultMapCenterZoom);
     setMapCenterTargetZoom(d.mapCenterTargetZoom);
     setMapZoomGateThreshold(d.mapZoomGateThreshold);
+    setMapClusteringEnabled(d.mapClusteringEnabled);
     setDefaultLandingPage(d.defaultLandingPage);
     setAppearanceMode(d.appearanceMode);
     setDarkTheme(d.darkTheme);
@@ -953,11 +1166,25 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     setNodeDimmingMinOpacity(d.nodeDimmingMinOpacity);
 
     // Update initial* snapshots for category-C fields after successful save
+    setInitialAircraftDetectionEnabled(d.aircraftDetectionEnabled);
+    setInitialAircraftAglThresholdMeters(d.aircraftAglThresholdMeters);
+    setInitialAircraftMslThresholdMeters(d.aircraftMslThresholdMeters);
+    setInitialAircraftAgeOutEnabled(d.aircraftAgeOutEnabled);
+    setInitialAircraftAgeOutHours(d.aircraftAgeOutHours);
+    setInitialAircraftAgeOutAction(d.aircraftAgeOutAction);
+    setInitialSignFlip({
+      enabled: d.signFlipCorrectionEnabled,
+      rangeKm: d.signFlipCorrectionRangeKm,
+      referenceLatitude: d.signFlipReferenceLatitude,
+      referenceLongitude: d.signFlipReferenceLongitude,
+    });
     setInitialPacketMonitorSettings({ enabled: d.packetLogEnabled, maxCount: d.packetLogMaxCount, maxAgeHours: d.packetLogMaxAgeHours });
     setInitialHomoglyphEnabled(d.homoglyphEnabled);
     setInitialLocalStatsIntervalMinutes(d.localStatsIntervalMinutes);
+    setInitialTxTargetMaxAgeHoursWhenUnlimited(d.txTargetMaxAgeHoursWhenUnlimited);
     setInitialMeshcoreCliTimeoutSeconds(d.meshcoreCliTimeoutSeconds);
     setInitialAdminRetryAttempts(d.adminRetryAttempts);
+    setInitialCoverageRetentionDays(d.coverageRetentionDays);
     setInitialAnalyticsProvider(d.analyticsProvider);
     setInitialAnalyticsConfig(JSON.stringify(d.analyticsConfig));
     setInitialAppriseApiServerUrl(d.appriseApiServerUrl.trim());
@@ -967,11 +1194,14 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
     setInitialExternalUrl(d.externalUrl.trim());
     setInitialElevationEnabled(d.elevationEnabled);
     setInitialElevationSourceUrl(d.elevationSourceUrl.trim());
+    setInitialAdsbMatchEnabled(d.adsbMatchEnabled);
+    setInitialAdsbFeed(d.adsbFeed);
+    setInitialAdsbApiToken(d.adsbApiToken.trim());
     setInitialCartoApiKey(d.cartoApiKey.trim());
     setInitialCotFeedEnabled(d.cotFeedEnabled);
     setInitialCotFeedPort(d.cotFeedPort);
   }, [setNeighborInfoMinZoom, setDefaultMapCenterLat, setDefaultMapCenterLon, setDefaultMapCenterZoom,
-      setMapCenterTargetZoom, setMapZoomGateThreshold, setDefaultLandingPage, setAppearanceMode, setDarkTheme, setLightTheme,
+      setMapCenterTargetZoom, setMapZoomGateThreshold, setMapClusteringEnabled, setDefaultLandingPage, setAppearanceMode, setDarkTheme, setLightTheme,
       setNodeHopsCalculation, setPreferredDashboardSortOption, setLinkPreviewsEnabled, setDiscardInvalidPositions,
       setNoIndexEnabled, setMeshcoreChannelRetryEnabled, setHideIncompleteNodes,
       setNodeDimmingEnabled, setNodeDimmingStartHours, setNodeDimmingMinOpacity]);
@@ -1011,6 +1241,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
         defaultMapCenterZoom: draft.defaultMapCenterZoom !== null ? draft.defaultMapCenterZoom.toString() : '',
         mapCenterTargetZoom: draft.mapCenterTargetZoom.toString(),
         mapZoomGateThreshold: draft.mapZoomGateThreshold.toString(),
+        mapClusteringEnabled: draft.mapClusteringEnabled.toString(),
         defaultLandingPage: draft.defaultLandingPage,
         theme: effectiveTheme,
         appearanceMode: draft.appearanceMode,
@@ -1031,12 +1262,33 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
         hideIncompleteNodes: draft.hideIncompleteNodes ? '1' : '0',
         homoglyphEnabled: String(draft.homoglyphEnabled),
         localStatsIntervalMinutes: draft.localStatsIntervalMinutes.toString(),
+        txTargetMaxAgeHoursWhenUnlimited: draft.txTargetMaxAgeHoursWhenUnlimited.toString(),
         meshcoreCliTimeoutSeconds: draft.meshcoreCliTimeoutSeconds.toString(),
         adminRetryAttempts: draft.adminRetryAttempts.toString(),
+        coverage_retention_days: String(clampCoverageRetentionDays(draft.coverageRetentionDays)),
         nodeHopsCalculation: draft.nodeHopsCalculation,
         nodeDimmingEnabled: draft.nodeDimmingEnabled ? '1' : '0',
         nodeDimmingStartHours: draft.nodeDimmingStartHours.toString(),
         nodeDimmingMinOpacity: draft.nodeDimmingMinOpacity.toString(),
+        // Likely-aircraft detection (#5364/#5365 Phase 1 WP5). Stored as
+        // 'true'/'false' (not the '0'/'1' of the seeded Node Display
+        // booleans above), matching elevationEnabled/autoFavoriteEnabled —
+        // these three are unseeded (AIRCRAFT_NODE_DISPLAY_KEYS), not part of
+        // migration 131's frozen ten. The partition below still routes them
+        // to the scoped POST because they are in NODE_DISPLAY_SETTING_KEYS.
+        aircraftDetectionEnabled: draft.aircraftDetectionEnabled ? 'true' : 'false',
+        aircraftAglThresholdMeters: String(draft.aircraftAglThresholdMeters),
+        aircraftMslThresholdMeters: String(draft.aircraftMslThresholdMeters),
+        // Aircraft age-out (#5364/#5365 Phase 2). The server-written
+        // aircraftAgeOutLastRunAt/LastResult are never posted.
+        aircraftAgeOutEnabled: draft.aircraftAgeOutEnabled ? 'true' : 'false',
+        aircraftAgeOutHours: String(draft.aircraftAgeOutHours),
+        aircraftAgeOutAction: draft.aircraftAgeOutAction,
+        // Sign-flip correction (#5363), per-source via NODE_DISPLAY_SETTING_KEYS.
+        signFlipCorrectionEnabled: draft.signFlipCorrectionEnabled ? 'true' : 'false',
+        signFlipCorrectionRangeKm: String(clampSignFlipRangeKm(draft.signFlipCorrectionRangeKm)),
+        signFlipReferenceLatitude: draft.signFlipReferenceLatitude.trim(),
+        signFlipReferenceLongitude: draft.signFlipReferenceLongitude.trim(),
         analyticsProvider: draft.analyticsProvider,
         analyticsConfig: JSON.stringify(draft.analyticsConfig),
         appriseApiServerUrl: draft.appriseApiServerUrl.trim(),
@@ -1046,20 +1298,26 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
         externalUrl: draft.externalUrl.trim(),
         elevationEnabled: draft.elevationEnabled ? 'true' : 'false',
         elevationSourceUrl: draft.elevationSourceUrl.trim(),
+        adsbMatchEnabled: draft.adsbMatchEnabled ? 'true' : 'false',
+        adsbFeed: draft.adsbFeed,
+        adsb_api_token: draft.adsbApiToken.trim(),
         cartoApiKey: draft.cartoApiKey.trim(),
         cotFeedEnabled: draft.cotFeedEnabled ? '1' : '0',
         cotFeedPort: String(draft.cotFeedPort),
       };
 
-      // Node Display keys are per-source (#4412 Phase 3); everything else keeps
-      // today's unscoped global behaviour. Partition — never a second literal, the
-      // single `const settings = {…}` block above is source-extracted by
+      // Node Display keys are per-source (#4412 Phase 3), as is the #5376
+      // TX-target window; everything else keeps today's unscoped global
+      // behaviour. Partition — never a second literal, the single
+      // `const settings = {…}` block above is source-extracted by
       // server.settings-persistence.test.ts (which also statically executes this
-      // partition to assert it routes exactly the ten NODE_DISPLAY_SETTING_KEYS).
+      // partition to assert it routes exactly SETTINGS_TAB_PER_SOURCE_KEYS —
+      // NODE_DISPLAY_SETTING_KEYS, including the three likely-aircraft keys
+      // from #5364/#5365, plus the TX-target window from #5376).
       const nodeDisplayBody: Record<string, unknown> = {};
       const globalBody: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(settings)) {
-        if ((NODE_DISPLAY_SETTING_KEYS as readonly string[]).includes(k)) {
+        if ((SETTINGS_TAB_PER_SOURCE_KEYS as readonly string[]).includes(k)) {
           nodeDisplayBody[k] = v;
         } else {
           globalBody[k] = v;
@@ -1290,6 +1548,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
       updateField('linkPreviewsEnabled', true);
       updateField('discardInvalidPositions', true);
       updateField('meshcoreChannelRetryEnabled', false);
+      updateField('coverageRetentionDays', COVERAGE_RETENTION_DEFAULT_DAYS);
 
       // Update parent component with defaults
       onMaxNodeAgeChange(NODE_DISPLAY_NUMERIC_DEFAULTS.maxNodeAgeHours);
@@ -1322,6 +1581,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
 
       // Update initial packet monitor settings
       setInitialPacketMonitorSettings({ enabled: false, maxCount: 1000, maxAgeHours: 24 });
+      setInitialCoverageRetentionDays(COVERAGE_RETENTION_DEFAULT_DAYS);
 
       showToast(t('settings.reset_success'), 'success');
     } catch (error) {
@@ -1554,6 +1814,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           canWriteSettings,
           databaseType,
           firmwareOtaEnabled,
+          sourceType,
         })}
       />
       <div className="settings-content settings-multi-column">
@@ -2163,6 +2424,20 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
               style={{ width: '100px' }}
             />
           </div>
+          <div className="setting-item">
+            <label htmlFor="mapClusteringEnabled">
+              {t('settings.map_clustering_enabled_label')}
+              <span className="setting-description">{t('settings.map_clustering_enabled_description')}</span>
+            </label>
+            {/* #5404: independent of the click zoom gate above — turning this
+                off removes the cluster layer but keeps the gate/spiderfy. */}
+            <input
+              id="mapClusteringEnabled"
+              type="checkbox"
+              checked={draft.mapClusteringEnabled}
+              onChange={(e) => updateField('mapClusteringEnabled', e.target.checked)}
+            />
+          </div>
           <GeoJsonLayerManager />
           <MapStyleManager />
           {isAdmin && (
@@ -2200,8 +2475,8 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           <h3>{t('settings.node_display')}</h3>
           <div className="setting-item">
             <label htmlFor="maxNodeAge">
-              {t('settings.max_node_age_label')}
-              <span className="setting-description">{t('settings.max_node_age_description')}</span>
+              {t('settings.node_window_label')}
+              <span className="setting-description">{t('settings.node_window_description')}</span>
             </label>
             <input
               id="maxNodeAge"
@@ -2210,6 +2485,26 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
               max="720"
               value={draft.maxNodeAgeHours}
               onChange={(e) => updateField('maxNodeAgeHours', parseInt(e.target.value))}
+              className="setting-input"
+            />
+          </div>
+          <div className="setting-item">
+            <label htmlFor="txTargetMaxAgeHoursWhenUnlimited">
+              {t('settings.tx_target_window_label')}
+              <span className="setting-description">{t('settings.tx_target_window_description')}</span>
+              <span className={settingsStyles.txWarning} data-testid="tx-target-window-warning">
+                <UiIcon name="alert" />
+                {t('settings.tx_target_window_warning')}
+              </span>
+            </label>
+            <input
+              id="txTargetMaxAgeHoursWhenUnlimited"
+              type="number"
+              min={TX_TARGET_MAX_AGE_HOURS_WHEN_UNLIMITED_RANGE.min}
+              max={TX_TARGET_MAX_AGE_HOURS_WHEN_UNLIMITED_RANGE.max}
+              step="1"
+              value={draft.txTargetMaxAgeHoursWhenUnlimited}
+              onChange={(e) => updateField('txTargetMaxAgeHoursWhenUnlimited', parseInt(e.target.value))}
               className="setting-input"
             />
           </div>
@@ -2359,6 +2654,169 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
               </div>
             </>
           )}
+
+          {/* Likely-aircraft detection (#5364/#5365 Phase 1 WP5, spec §5.10).
+              Meshtastic-only (D2/D18) — do NOT add to
+              MeshCoreNodeDisplaySection.tsx; SettingsTab never mounts under a
+              MeshCore route. */}
+          <div className="setting-item" style={{ marginTop: '1.5rem' }}>
+            <h4 style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', margin: 0 }}>
+              <UiIcon name="aircraft" /> {t('settings.aircraft.title', 'Likely aircraft')}
+            </h4>
+          </div>
+          <div className="setting-item">
+            <label>
+              <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                <input
+                  id="aircraftDetectionEnabled"
+                  type="checkbox"
+                  checked={draft.aircraftDetectionEnabled}
+                  onChange={(e) => updateField('aircraftDetectionEnabled', e.target.checked)}
+                  style={{ cursor: 'pointer' }}
+                />
+                {t('settings.aircraft.detection_enabled', 'Detect likely aircraft')}
+              </span>
+            </label>
+          </div>
+          <div className="setting-item">
+            <label htmlFor="aircraftAglThresholdMeters">
+              {t('settings.aircraft.agl_threshold_label', 'Height above ground threshold (m)')}
+            </label>
+            <input
+              id="aircraftAglThresholdMeters"
+              type="number"
+              min={AIRCRAFT_AGL_RANGE.min}
+              max={AIRCRAFT_AGL_RANGE.max}
+              step="10"
+              disabled={!draft.aircraftDetectionEnabled}
+              value={draft.aircraftAglThresholdMeters}
+              onChange={(e) => updateField(
+                'aircraftAglThresholdMeters',
+                Math.min(AIRCRAFT_AGL_RANGE.max, Math.max(AIRCRAFT_AGL_RANGE.min, Math.round(parseFloat(e.target.value)) || DEFAULT_AIRCRAFT_AGL_THRESHOLD_M)),
+              )}
+              className="setting-input"
+            />
+          </div>
+          <div className="setting-item">
+            <label htmlFor="aircraftMslThresholdMeters">
+              {t('settings.aircraft.msl_threshold_label', 'Fallback: altitude above sea level (m)')}
+            </label>
+            <input
+              id="aircraftMslThresholdMeters"
+              type="number"
+              min={AIRCRAFT_MSL_RANGE.min}
+              max={AIRCRAFT_MSL_RANGE.max}
+              step="100"
+              disabled={!draft.aircraftDetectionEnabled}
+              value={draft.aircraftMslThresholdMeters}
+              onChange={(e) => updateField(
+                'aircraftMslThresholdMeters',
+                Math.min(AIRCRAFT_MSL_RANGE.max, Math.max(AIRCRAFT_MSL_RANGE.min, Math.round(parseFloat(e.target.value)) || DEFAULT_AIRCRAFT_MSL_THRESHOLD_M)),
+              )}
+              className="setting-input"
+            />
+          </div>
+          <div className="setting-item">
+            <p className="setting-description">
+              {t('settings.aircraft.help_threshold', 'A node is flagged when its reported altitude is more than this height above the terrain at its position. When terrain data is unavailable, only the sea-level fallback applies.')}
+            </p>
+            {!draft.elevationEnabled && (
+              <p className="setting-description" style={{ color: 'var(--color-warning)' }}>
+                {t('settings.aircraft.warn_elevation_disabled', 'Terrain elevation is off (Global Settings → Elevation): only the sea-level fallback is used.')}
+              </p>
+            )}
+            <p className="setting-description">
+              {t('settings.aircraft.help_effects', 'Flagged nodes get an aircraft badge on the map and can be hidden in Map Features. Auto-Favorite exclusion is set in Automation → Auto Favorite.')}
+            </p>
+          </div>
+
+          {/* Aircraft age-out (#5364/#5365 Phase 2). DB-only: nothing is sent
+              to any radio. */}
+          <div className="setting-item" data-testid="aircraft-age-out">
+            <label>
+              <span style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                <input
+                  id="aircraftAgeOutEnabled"
+                  type="checkbox"
+                  checked={draft.aircraftAgeOutEnabled}
+                  disabled={!draft.aircraftDetectionEnabled}
+                  onChange={(e) => updateField('aircraftAgeOutEnabled', e.target.checked)}
+                  style={{ cursor: 'pointer' }}
+                />
+                {t('settings.aircraft.age_out_enabled', 'Age out likely aircraft')}
+              </span>
+            </label>
+            <p className="setting-description">
+              {t('settings.aircraft.age_out_help', 'A likely aircraft not heard for this many hours is ignored or deleted. Favorites and your own node are never aged out. An ignored aircraft comes back when it sends a new position.')}
+            </p>
+          </div>
+          <div className="setting-item">
+            <label htmlFor="aircraftAgeOutHours">
+              {t('settings.aircraft.age_out_hours_label', 'Age out after (hours)')}
+            </label>
+            <input
+              id="aircraftAgeOutHours"
+              type="number"
+              min={AIRCRAFT_AGE_OUT_HOURS_RANGE.min}
+              max={AIRCRAFT_AGE_OUT_HOURS_RANGE.max}
+              step="1"
+              disabled={!draft.aircraftDetectionEnabled || !draft.aircraftAgeOutEnabled}
+              value={draft.aircraftAgeOutHours}
+              onChange={(e) => updateField(
+                'aircraftAgeOutHours',
+                Math.min(AIRCRAFT_AGE_OUT_HOURS_RANGE.max, Math.max(AIRCRAFT_AGE_OUT_HOURS_RANGE.min, Math.round(parseFloat(e.target.value)) || AIRCRAFT_AGE_OUT_HOURS_DEFAULT)),
+              )}
+              className="setting-input"
+            />
+          </div>
+          <div className="setting-item">
+            <label htmlFor="aircraftAgeOutAction">
+              {t('settings.aircraft.age_out_action_label', 'Action')}
+            </label>
+            <select
+              id="aircraftAgeOutAction"
+              disabled={!draft.aircraftDetectionEnabled || !draft.aircraftAgeOutEnabled}
+              value={draft.aircraftAgeOutAction}
+              onChange={(e) => {
+                if (isAircraftAgeOutAction(e.target.value)) updateField('aircraftAgeOutAction', e.target.value);
+              }}
+              className="setting-input"
+            >
+              <option value="ignore">{t('settings.aircraft.age_out_action_ignore', 'Ignore')}</option>
+              <option value="delete">{t('settings.aircraft.age_out_action_delete', 'Delete')}</option>
+            </select>
+            {draft.aircraftAgeOutAction === 'delete' && (
+              <p className="setting-description" style={{ color: 'var(--color-warning)' }} data-testid="aircraft-age-out-delete-warning">
+                {t('settings.aircraft.age_out_delete_warning', 'Delete removes the node and all its history, including positions. Ignore can be undone.')}
+              </p>
+            )}
+          </div>
+          <div className="setting-item">
+            <p className="setting-description" data-testid="aircraft-age-out-last-run">
+              {aircraftAgeOutLastRun.at == null
+                ? t('settings.aircraft.age_out_last_run_never', 'Last run: not yet.')
+                : t('settings.aircraft.age_out_last_run', {
+                    time: formatDateTime(new Date(aircraftAgeOutLastRun.at), timeFormat, dateFormat),
+                    agedOut: (aircraftAgeOutLastRun.result?.agedOut ?? 0) + (aircraftAgeOutLastRun.result?.deleted ?? 0),
+                    fixed: aircraftAgeOutLastRun.result?.fixed ?? 0,
+                    lifted: aircraftAgeOutLastRun.result?.lifted ?? 0,
+                    defaultValue: 'Last run: {{time}}. {{agedOut}} aged out, {{fixed}} reclassified as fixed, {{lifted}} returned.',
+                  })}
+            </p>
+          </div>
+
+          {/* Sign-flipped position correction (#5363). Display only. */}
+          <SignFlipCorrectionSettings
+            enabled={draft.signFlipCorrectionEnabled}
+            rangeKm={draft.signFlipCorrectionRangeKm}
+            referenceLatitude={draft.signFlipReferenceLatitude}
+            referenceLongitude={draft.signFlipReferenceLongitude}
+            distanceUnit={draft.distanceUnit}
+            onEnabledChange={(v) => updateField('signFlipCorrectionEnabled', v)}
+            onRangeKmChange={(v) => updateField('signFlipCorrectionRangeKm', v)}
+            onReferenceLatitudeChange={(v) => updateField('signFlipReferenceLatitude', v)}
+            onReferenceLongitudeChange={(v) => updateField('signFlipReferenceLongitude', v)}
+          />
         </div>}
 
         {show('settings-telemetry') && <div id="settings-telemetry" className="settings-section">
@@ -2573,6 +3031,15 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           )}
         </div>}
 
+        {show('settings-coverage-mqtt') && canWriteSettings && isCoverageMqttSourceType(sourceType) && purgeSourceId && (
+          <CoverageMqttRecordingSection
+            baseUrl={baseUrl}
+            sourceId={purgeSourceId}
+            canWrite={canWriteSettings}
+            sourceType={sourceType}
+          />
+        )}
+
         {show('settings-remote-admin') && isAdmin && <div id="settings-remote-admin" className="settings-section">
           <h3>{t('settings.remote_admin_section', 'Remote Administration')}</h3>
           <div className="setting-item">
@@ -2591,6 +3058,30 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
               onChange={(e) => {
                 const n = parseInt(e.target.value, 10);
                 updateField('adminRetryAttempts', Number.isNaN(n) ? 1 : Math.min(10, Math.max(1, n)));
+              }}
+              className="setting-input"
+            />
+          </div>
+        </div>}
+
+        {show('settings-coverage') && canWriteSettings && <div id="settings-coverage" className="settings-section">
+          <h3>{t('settings.coverage_section', 'Coverage Report')}</h3>
+          <div className="setting-item">
+            <label htmlFor="coverageRetentionDays">
+              {t('settings.coverage_retention_days', 'RF reception retention (days)')}
+              <span className="setting-description">
+                {t('settings.coverage_retention_help', 'How long Coverage Report RF receptions are kept before the hourly sweep deletes them. Lowering this value permanently deletes older receptions on the next sweep — that cannot be undone. Range 1-90; default 7.')}
+              </span>
+            </label>
+            <input
+              id="coverageRetentionDays"
+              type="number"
+              min="1"
+              max="90"
+              value={draft.coverageRetentionDays}
+              onChange={(e) => {
+                const n = parseInt(e.target.value, 10);
+                updateField('coverageRetentionDays', clampCoverageRetentionDays(Number.isNaN(n) ? undefined : n));
               }}
               className="setting-input"
             />
@@ -2731,6 +3222,70 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
           </div>
         </div>}
 
+        {show('settings-adsb') && isAdmin && <div id="settings-adsb" className="settings-section">
+          <h3>{t('settings.adsb_section', 'Flight matching (ADS-B)')}</h3>
+          <p className="setting-description">
+            {t(
+              'settings.adsb_section_description',
+              'When a node becomes a likely aircraft, MeshMonitor asks the selected public ADS-B feed which aircraft is at that spot. At most two lookups per flagging. Nothing is sent over the mesh.'
+            )}
+          </p>
+          <div className="setting-item">
+            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+              <input
+                id="adsbMatchEnabled"
+                type="checkbox"
+                checked={draft.adsbMatchEnabled}
+                onChange={(e) => updateField('adsbMatchEnabled', e.target.checked)}
+                style={{ cursor: 'pointer' }}
+              />
+              <span>{t('settings.adsb_enabled_label', 'Look up likely aircraft on a public ADS-B feed')}</span>
+            </label>
+            <span className="setting-description">
+              {t('settings.adsb_enabled_description', 'Off by default. When on, MeshMonitor sends the flagged node\'s approximate position to the feed over HTTPS. A match only confirms; no match never clears the likely-aircraft flag.')}
+            </span>
+          </div>
+          <div className="setting-item">
+            <label htmlFor="adsbFeed">
+              {t('settings.adsb_feed_label', 'Feed')}
+              <span className="setting-description">
+                {draft.adsbFeed === 'adsb.fi'
+                  ? t('settings.adsb_feed_terms_adsb_fi', 'adsb.fi: for personal, non-commercial use only.')
+                  : t('settings.adsb_feed_terms_adsb_lol', 'adsb.lol: open data under the ODbL.')}
+              </span>
+            </label>
+            <select
+              id="adsbFeed"
+              value={draft.adsbFeed}
+              onChange={(e) => updateField('adsbFeed', e.target.value)}
+              className="setting-input"
+              disabled={!draft.adsbMatchEnabled}
+            >
+              {ADSB_FEED_IDS.map((id) => (
+                <option key={id} value={id}>{ADSB_FEEDS[id].name}</option>
+              ))}
+            </select>
+          </div>
+          <div className="setting-item">
+            <label htmlFor="adsbApiToken">
+              {t('settings.adsb_api_key_label', 'API key (optional)')}
+              <span className="setting-description">
+                {t('settings.adsb_api_key_description', 'Leave empty. Kept for adsb.lol\'s announced future key; sent only when set. Stored server-side and never shown to non-admins.')}
+              </span>
+            </label>
+            <input
+              id="adsbApiToken"
+              type="password"
+              value={draft.adsbApiToken}
+              onChange={(e) => updateField('adsbApiToken', e.target.value)}
+              className="setting-input"
+              autoComplete="off"
+              spellCheck={false}
+              disabled={!draft.adsbMatchEnabled}
+            />
+          </div>
+        </div>}
+
         {show('settings-atak-cot') && isAdmin && <div id="settings-atak-cot" className="settings-section">
           <h3>{t('settings.atak_cot_section', 'ATAK / CoT Feed')}</h3>
           <p className="setting-description">
@@ -2814,6 +3369,12 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
         {show('settings-position-estimation') && canWriteSettings && (
         <div id="settings-position-estimation" className="settings-section">
           <PositionEstimationSection baseUrl={baseUrl} />
+        </div>
+        )}
+
+        {show('settings-auto-enrichment') && canWriteSettings && (
+        <div id="settings-auto-enrichment" className="settings-section">
+          <AutoEnrichmentSection baseUrl={baseUrl} />
         </div>
         )}
 
@@ -3010,6 +3571,30 @@ const SettingsTab: React.FC<SettingsTabProps> = ({
               {t('settings.purge_telemetry_button')}
             </button>
           </div>
+
+          {isAdmin && (
+            <div className="danger-action">
+              <div className="danger-action-info">
+                <h4>{t('settings.clean_outliers_title')}</h4>
+                <p>{t('settings.clean_outliers_description')}</p>
+              </div>
+              <button
+                className="danger-button"
+                onClick={() => setOutlierDialogOpen(true)}
+              >
+                {t('settings.clean_outliers_button')}
+              </button>
+            </div>
+          )}
+          {isAdmin && (
+            <TelemetryOutlierDialog
+              isOpen={outlierDialogOpen}
+              onClose={() => setOutlierDialogOpen(false)}
+              sourceId={purgeSourceId}
+              sources={availableSources.map(src => ({ id: src.id, name: src.name }))}
+              getTypeLabel={getTelemetryLabel}
+            />
+          )}
 
           <div className="danger-action">
             <div className="danger-action-info">

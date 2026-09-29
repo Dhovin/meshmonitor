@@ -22,8 +22,20 @@ import { MeshCoreContact, formatMeshCoreChannelName } from '../../utils/meshcore
 import { MeshCoreMessageStream } from './MeshCoreMessageStream';
 import { useAuth } from '../../contexts/AuthContext';
 import { loadChannelLastRead, markChannelRead as persistChannelRead } from './meshcoreUnreadStore';
+import { slotMoveMap, subscribeChannelsReordered } from './meshcoreChannelReorderEvents';
+import { subscribeFiltersChanged } from './meshcoreFilterEvents';
 import { compareMeshCoreMessages } from './messageOrder';
 import { UiIcon } from '../icons';
+import { MeshCoreChannelReorderList } from './MeshCoreChannelReorderList';
+import {
+  type ChannelSortMode,
+  loadChannelSortMode,
+  saveChannelSortMode,
+  loadChannelCustomOrder,
+  saveChannelCustomOrder,
+  sortChannels,
+} from './meshcoreChannelOrder';
+import styles from './MeshCoreChannelsView.module.css';
 
 const MOBILE_BREAKPOINT = 768;
 const isMobileViewport = (): boolean =>
@@ -112,6 +124,12 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
   const [channels, setChannels] = useState<ChannelRow[]>([]);
   const [selectedIdx, setSelectedIdx] = useState<number>(0);
   const [loadingChannels, setLoadingChannels] = useState(false);
+  // Bumped when the device's channel slots are reordered (#5379) so the
+  // slot-keyed list and counts reload.
+  const [reorderTick, setReorderTick] = useState(0);
+  // Bumped when this source's Ignore / Block lists change (#5408): the
+  // ignored flag is computed at read time, so the backlog and counts reload.
+  const [filtersTick, setFiltersTick] = useState(0);
   const [mobileShowContent, setMobileShowContent] = useState(false);
   // Per-channel backlog for the *active* channel, fetched independently of the
   // shared `messages` pool so each channel shows its own history (not a slice
@@ -150,6 +168,14 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
   const [sortUnreadFirst, setSortUnreadFirst] = useState<boolean>(
     () => localStorage.getItem(SORT_UNREAD_FIRST_KEY) === 'true',
   );
+  // Display order for the list (#5385) and the saved drag-and-drop order
+  // (#5379). View-only and per-source; see ./meshcoreChannelOrder.ts. No device
+  // writes, so the firmware slot indices never move.
+  const [sortMode, setSortMode] = useState<ChannelSortMode>(() => loadChannelSortMode(sourceId));
+  const [customOrder, setCustomOrder] = useState<number[]>(() => loadChannelCustomOrder(sourceId));
+  // The channel-set key (`channelIdsKey`) the reorder panel was opened
+  // against, or null when closed. `reordering` is derived from it below.
+  const [reorderingFor, setReorderingFor] = useState<string | null>(null);
   // Per-message scope/region override (#3701). `null` means "no override —
   // use the channel's resolved scope". A string is a one-off override applied
   // to the NEXT send only; it is never persisted to the channel row. Reset on
@@ -183,6 +209,9 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
   // Re-seed the last-read map when the source changes (the map is per-source).
   useEffect(() => {
     setLastRead(loadChannelLastRead(sourceId));
+    setSortMode(loadChannelSortMode(sourceId));
+    setCustomOrder(loadChannelCustomOrder(sourceId));
+    setReorderingFor(null);
   }, [sourceId]);
 
   // Persist the sort preference whenever it changes.
@@ -226,6 +255,29 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
     // we can't replicate it; leave the scope as-is (channel / source default).
   }, []);
 
+  // Follow an on-device channel reorder (#5379): keep the open channel open
+  // at its new slot, then reload everything keyed by slot.
+  useEffect(() => {
+    if (!sourceId) return;
+    return subscribeChannelsReordered((detail) => {
+      if (detail.sourceId !== sourceId) return;
+      const map = slotMoveMap(detail.moves);
+      setSelectedIdx(prev => map.get(prev) ?? prev);
+      // useMeshCore already rewrote the saved Custom order (#5392); pick it
+      // up, and drop any display-order draft built on the old slots.
+      setCustomOrder(loadChannelCustomOrder(sourceId));
+      setReorderingFor(null);
+      setReorderTick(v => v + 1);
+    });
+  }, [sourceId]);
+
+  useEffect(() => {
+    if (!sourceId) return;
+    return subscribeFiltersChanged((detail) => {
+      if (detail.sourceId === sourceId) setFiltersTick(v => v + 1);
+    });
+  }, [sourceId]);
+
   // Fetch the synced channel list for this source. We use /api/channels/all
   // (rather than /api/channels) so MeshCore rows with idx > 7 aren't dropped
   // by the legacy Meshtastic-shaped 0-7 filter on the basic endpoint. The
@@ -263,7 +315,7 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
     return () => { cancelled = true; };
   // Status connected→disconnected→connected transitions trigger a re-fetch so a
   // freshly-synced channel list shows up without a full page reload.
-  }, [baseUrl, sourceId, csrfFetch, status?.connected]);
+  }, [baseUrl, sourceId, csrfFetch, status?.connected, reorderTick]);
 
   // Always include a synthetic "Channel 0" placeholder when the device hasn't
   // reported any channels yet — keeps the view usable on first connect, and
@@ -285,6 +337,19 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
   // Fetch accurate per-channel message counts for the list badges whenever the
   // channel set changes or the source (re)connects.
   const channelIdsKey = displayChannels.map(c => c.id).join(',');
+  // The reorder panel snapshots the channel list when it opens. If the set of
+  // channels changes underneath it (reconnect re-sync adds or drops a slot),
+  // close it rather than let a stale draft be saved.
+  //
+  // This is derived during render, not done in a `useEffect([channelIdsKey])`.
+  // An effect runs after commit, so a click on Reorder landing between the
+  // commit that first shows the channel list and the effect flush was
+  // swallowed: React flushed the pending effect's `setReorderingFor(null)` after
+  // the click's toggle, and the panel never opened.
+  if (reorderingFor !== null && reorderingFor !== channelIdsKey) {
+    setReorderingFor(null);
+  }
+  const reordering = reorderingFor !== null && reorderingFor === channelIdsKey;
   useEffect(() => {
     if (!sourceId || !channelIdsKey) return;
     let cancelled = false;
@@ -305,7 +370,7 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
       }
     })();
     return () => { cancelled = true; };
-  }, [baseUrl, sourceId, channelIdsKey, csrfFetch, status?.connected]);
+  }, [baseUrl, sourceId, channelIdsKey, csrfFetch, status?.connected, reorderTick, filtersTick]);
 
   const active = displayChannels.find(c => c.id === selectedIdx) ?? displayChannels[0];
   const activeFilter = useMemo(() => buildChannelFilter(active.id), [active.id]);
@@ -442,7 +507,7 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
       }
     })();
     return () => { cancelled = true; };
-  }, [baseUrl, sourceId, active.id, csrfFetch, status?.connected]);
+  }, [baseUrl, sourceId, active.id, csrfFetch, status?.connected, filtersTick]);
 
   // Load an older page of the active channel's history (#4460 infinite scroll).
   // Offset is the current backlog length (oldest-first fetch order means the
@@ -536,6 +601,8 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
     for (const c of displayChannels) {
       const liveMatch = messages.filter(buildChannelFilter(c.id));
       for (const m of liveMatch) {
+        // Ignored messages never count as unread (#5408).
+        if (m.filtered) continue;
         if (m.timestamp > (map[c.id] ?? 0)) map[c.id] = m.timestamp;
       }
     }
@@ -551,18 +618,48 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
     return latest > (lastRead[idx] ?? 0);
   }, [active.id, mobileShowContent, effectiveLatest, lastRead]);
 
-  // Channel ordering for the list. Default: by index. "Unread first": unread
-  // channels (most recent activity first) then the rest by index (#3703).
+  const channelLabel = useCallback(
+    (c: { id: number; name: string }) => formatMeshCoreChannelName(
+      c.name,
+      t('meshcore.channels.unnamed', 'Channel {{idx}}', { idx: c.id }),
+    ),
+    [t],
+  );
+
+  // Base order from the sort dropdown (#5385): device slot order, name, last
+  // message, or the saved custom order (#5379).
+  const baseOrderedChannels = useMemo(
+    () => sortChannels(displayChannels, sortMode, {
+      customOrder,
+      latest: effectiveLatest,
+      label: channelLabel,
+    }),
+    [displayChannels, sortMode, customOrder, effectiveLatest, channelLabel],
+  );
+
+  // "Unread first" (#3703) layers on top: unread channels (most recent activity
+  // first), then the rest in the base order.
   const orderedChannels = useMemo(() => {
-    if (!sortUnreadFirst) return displayChannels;
-    return [...displayChannels].sort((a, b) => {
-      const ua = isChannelUnread(a.id);
-      const ub = isChannelUnread(b.id);
-      if (ua !== ub) return ua ? -1 : 1;
-      if (ua && ub) return (effectiveLatest[b.id] ?? 0) - (effectiveLatest[a.id] ?? 0);
-      return a.id - b.id;
-    });
-  }, [displayChannels, sortUnreadFirst, isChannelUnread, effectiveLatest]);
+    if (!sortUnreadFirst) return baseOrderedChannels;
+    const unread = baseOrderedChannels
+      .filter(c => isChannelUnread(c.id))
+      .sort((a, b) => (effectiveLatest[b.id] ?? 0) - (effectiveLatest[a.id] ?? 0));
+    const rest = baseOrderedChannels.filter(c => !isChannelUnread(c.id));
+    return [...unread, ...rest];
+  }, [baseOrderedChannels, sortUnreadFirst, isChannelUnread, effectiveLatest]);
+
+  const handleSortModeChange = useCallback((mode: ChannelSortMode) => {
+    setSortMode(mode);
+    saveChannelSortMode(sourceId, mode);
+  }, [sourceId]);
+
+  const handleSaveCustomOrder = useCallback((order: number[]) => {
+    setCustomOrder(order);
+    saveChannelCustomOrder(sourceId, order);
+    setSortMode('custom');
+    saveChannelSortMode(sourceId, 'custom');
+    setReorderingFor(null);
+  }, [sourceId]);
 
   const unreadChannelCount = useMemo(
     () => displayChannels.filter(c => isChannelUnread(c.id)).length,
@@ -634,7 +731,40 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
             <span className="pane-count">{displayChannels.length}</span>
           </span>
         </div>
+        <div className={styles.orderBar}>
+          <select
+            className={styles.sortSelect}
+            value={sortMode}
+            onChange={e => handleSortModeChange(e.target.value as ChannelSortMode)}
+            disabled={reordering}
+            aria-label={t('meshcore.channels.order.sort_by', 'Sort channels by')}
+            title={t('meshcore.channels.order.sort_by', 'Sort channels by')}
+          >
+            <option value="device">{t('meshcore.channels.order.device', 'Device order')}</option>
+            <option value="name">{t('meshcore.channels.order.name', 'Channel name')}</option>
+            <option value="lastMessage">{t('meshcore.channels.order.last_message', 'Last message')}</option>
+            <option value="custom">{t('meshcore.channels.order.custom', 'Custom')}</option>
+          </select>
+          {channels.length > 1 && (
+            <button
+              type="button"
+              className={`${styles.reorderButton} ${reordering ? styles.active : ''}`}
+              onClick={() => setReorderingFor(prev => (prev === channelIdsKey ? null : channelIdsKey))}
+              aria-pressed={reordering}
+              title={t('meshcore.channels.order.reorder_title', 'Set a custom channel order (MeshMonitor display only)')}
+            >
+              <UiIcon name="dragHandle" size={14} /> {t('meshcore.channels.order.reorder', 'Reorder')}
+            </button>
+          )}
+        </div>
         <div className="meshcore-list-pane-body">
+          {reordering ? (
+            <MeshCoreChannelReorderList
+              channels={baseOrderedChannels.map(c => ({ id: c.id, label: channelLabel(c) }))}
+              onSave={handleSaveCustomOrder}
+              onCancel={() => setReorderingFor(null)}
+            />
+          ) : (<>
           {loadingChannels && channels.length === 0 && (
             <div className="mc-channel-row" aria-busy="true">
               <div className="mc-channel-row-name">
@@ -663,10 +793,7 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
                   />
                 )}
                 <div className="mc-channel-row-name">
-                  {formatMeshCoreChannelName(
-                    c.name,
-                    t('meshcore.channels.unnamed', 'Channel {{idx}}', { idx: c.id }),
-                  )}
+                  {channelLabel(c)}
                 </div>
                 <div className="mc-channel-row-meta">
                   {count} {t('meshcore.messages', 'messages')}
@@ -674,6 +801,7 @@ export const MeshCoreChannelsView: React.FC<MeshCoreChannelsViewProps> = ({
               </button>
             );
           })}
+          </>)}
         </div>
       </div>
       <div className="meshcore-main-pane">

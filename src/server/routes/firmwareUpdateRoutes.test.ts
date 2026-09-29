@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 
@@ -129,6 +129,15 @@ vi.mock('../services/firmwareUpdateService.js', () => ({
     clearStagedUpload: mockClearStagedUpload,
   },
   FirmwareChannel: {},
+  OtaPreflightError: class OtaPreflightError extends Error {
+    constructor(
+      public readonly code: string,
+      message: string
+    ) {
+      super(message);
+      this.name = 'OtaPreflightError';
+    }
+  },
 }));
 
 // Mock meshtasticManager (routes use fallbackManager for post-flash
@@ -144,22 +153,27 @@ vi.mock('../meshtasticManager.js', () => ({
 // tests — resolveManager falls through to fallbackManager above, same as
 // the retired Proxy alias always did in this unmocked-registry environment.
 vi.mock('../sourceManagerRegistry.js', () => ({
-  sourceManagerRegistry: {},
+  sourceManagerRegistry: {
+    getAllManagers: () => [],
+    getManager: () => undefined,
+  },
 }));
 
 vi.mock('../sourceManagerTypes.js', () => ({
   getPrimaryMeshtasticManager: () => undefined,
+  isMeshtasticManager: (m: { sourceType?: string }) => m?.sourceType === 'meshtastic_tcp',
 }));
 
 // Mock environment config — issue #2981 guard reads meshtasticNodeIpProvided
 // to decide whether the gatewayIp argument was explicitly configured by the
 // operator. Tests pass an explicit IP, so flag it as provided.
+const mockEnv = vi.hoisted(() => ({
+  meshtasticNodeIp: '192.168.1.100',
+  meshtasticNodeIpProvided: true,
+  meshtasticTcpPort: 4403,
+}));
 vi.mock('../config/environment.js', () => ({
-  getEnvironmentConfig: () => ({
-    meshtasticNodeIp: '192.168.1.100',
-    meshtasticNodeIpProvided: true,
-    meshtasticTcpPort: 4403,
-  }),
+  getEnvironmentConfig: () => mockEnv,
 }));
 
 // Mock logger
@@ -173,6 +187,8 @@ vi.mock('../../utils/logger.js', () => ({
 }));
 
 import firmwareUpdateRoutes from './firmwareUpdateRoutes.js';
+
+const IDLE_STATUS = { state: 'idle', step: null, message: '', logs: [] };
 
 function createApp() {
   const app = express();
@@ -189,6 +205,9 @@ describe('firmwareUpdateRoutes', () => {
     // clearAllMocks resets call history but not implementations, so restore the
     // default (not bridged) — the bridged-node test overrides it to true.
     mockIsLocalNodeBridged.mockReturnValue(false);
+    // /update refuses while another update is running (#5424 follow-up), so
+    // default to idle; tests that need another state override it.
+    mockGetStatus.mockReturnValue(IDLE_STATUS);
     app = createApp();
   });
 
@@ -329,7 +348,7 @@ describe('firmwareUpdateRoutes', () => {
       ];
       mockFindReleaseByVersion.mockReturnValue(releases[0]);
       mockStartPreflight.mockReturnValue(undefined);
-      mockGetStatus.mockReturnValue({
+      mockGetStatus.mockReturnValueOnce(IDLE_STATUS).mockReturnValue({
         state: 'awaiting-confirm',
         step: 'preflight',
         message: 'Preflight complete',
@@ -348,6 +367,27 @@ describe('firmwareUpdateRoutes', () => {
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
       expect(mockStartPreflight).toHaveBeenCalled();
+    });
+
+    it('returns 400 with the refusal code when preflight refuses an ambiguous board (#5423)', async () => {
+      const { OtaPreflightError } = await import('../services/firmwareUpdateService.js');
+      mockFindReleaseByVersion.mockReturnValue({
+        tagName: 'v2.5.0', version: '2.5.0', prerelease: false, publishedAt: '2024-01-01', htmlUrl: '', assets: [],
+      });
+      mockStartPreflight.mockImplementationOnce(() => {
+        throw new OtaPreflightError('OTA_AMBIGUOUS_BOARD', 'Diy V1 is shared by several firmware builds');
+      });
+
+      const res = await request(app)
+        .post('/api/firmware/update')
+        .send({ targetVersion: '2.5.0', gatewayIp: '192.168.1.100', hwModel: 39, currentVersion: '2.4.0' });
+
+      expect(res.status).toBe(400);
+      expect(res.body).toMatchObject({
+        success: false,
+        code: 'OTA_AMBIGUOUS_BOARD',
+        error: 'Diy V1 is shared by several firmware builds',
+      });
     });
 
     it('should return 400 when missing required fields', async () => {
@@ -403,6 +443,56 @@ describe('firmwareUpdateRoutes', () => {
       expect(res.status).toBe(400);
       expect(res.body.success).toBe(false);
       expect(res.body.error).toMatch(/not found/i);
+    });
+
+    // Issue #5424: the gateway carries the source's custom TCP port.
+    describe('custom TCP port / IPv6 gateway (#5424)', () => {
+      const release = {
+        tagName: 'v2.5.0', version: '2.5.0', prerelease: false,
+        publishedAt: '2024-01-01', htmlUrl: '', assets: [],
+      };
+      const send = (gatewayIp: string) =>
+        request(app).post('/api/firmware/update').send({
+          targetVersion: '2.5.0', gatewayIp, hwModel: 44, currentVersion: '2.4.0',
+        });
+
+      afterEach(() => {
+        mockEnv.meshtasticNodeIpProvided = true;
+      });
+
+      it('passes host:port through to preflight unchanged', async () => {
+        mockFindReleaseByVersion.mockReturnValue(release);
+        mockGetStatus.mockReturnValueOnce(IDLE_STATUS).mockReturnValue({ state: 'awaiting-confirm', step: 'preflight', message: '', logs: [] });
+
+        const res = await send('10.0.0.5:5000');
+
+        expect(res.status).toBe(200);
+        expect(mockStartPreflight).toHaveBeenCalledWith(
+          expect.objectContaining({ gatewayIp: '10.0.0.5:5000' }),
+        );
+      });
+
+      it('still refuses the unconfigured env default when a port is appended', async () => {
+        mockEnv.meshtasticNodeIpProvided = false;
+        mockFindReleaseByVersion.mockReturnValue(release);
+
+        const res = await send('192.168.1.100:5000');
+
+        expect(res.status).toBe(400);
+        expect(res.body.error).toMatch(/No node IP configured/);
+        expect(mockStartPreflight).not.toHaveBeenCalled();
+      });
+
+      it('rejects an IPv6 literal with a clear reason before starting', async () => {
+        mockFindReleaseByVersion.mockReturnValue(release);
+
+        const res = await send('fe80::1');
+
+        expect(res.status).toBe(400);
+        expect(res.body.code).toBe('OTA_IPV6_UNSUPPORTED');
+        expect(res.body.error).toMatch(/IPv6/);
+        expect(mockStartPreflight).not.toHaveBeenCalled();
+      });
     });
   });
 
@@ -486,7 +576,7 @@ describe('firmwareUpdateRoutes', () => {
   describe('POST /api/firmware/update with useStagedUpload (#5249)', () => {
     it('starts preflight against the staged upload without a targetVersion', async () => {
       mockGetStagedUpload.mockReturnValue({ originalName: 'firmware.bin', size: 4096 });
-      mockGetStatus.mockReturnValue({ state: 'awaiting-confirm', step: 'preflight', message: '', logs: [] });
+      mockGetStatus.mockReturnValueOnce(IDLE_STATUS).mockReturnValue({ state: 'awaiting-confirm', step: 'preflight', message: '', logs: [] });
 
       const res = await request(app)
         .post('/api/firmware/update')
@@ -588,7 +678,7 @@ describe('firmwareUpdateRoutes', () => {
   describe('POST /api/firmware/update with useCustomUrl (#5011)', () => {
     it('starts preflight against the saved URL without a targetVersion', async () => {
       mockGetCustomUrl.mockResolvedValue('https://raw.githubusercontent.com/o/r/main/firmware.bin');
-      mockGetStatus.mockReturnValue({ state: 'awaiting-confirm', step: 'preflight', message: '', logs: [] });
+      mockGetStatus.mockReturnValueOnce(IDLE_STATUS).mockReturnValue({ state: 'awaiting-confirm', step: 'preflight', message: '', logs: [] });
 
       const res = await request(app)
         .post('/api/firmware/update')
@@ -614,7 +704,7 @@ describe('firmwareUpdateRoutes', () => {
       // Belt and braces with the save-time rewrite: a URL stored by an older
       // build never reaches fetch in its page form.
       mockGetCustomUrl.mockResolvedValue('https://github.com/o/r/blob/main/firmware.bin');
-      mockGetStatus.mockReturnValue({ state: 'awaiting-confirm', step: 'preflight', message: '', logs: [] });
+      mockGetStatus.mockReturnValueOnce(IDLE_STATUS).mockReturnValue({ state: 'awaiting-confirm', step: 'preflight', message: '', logs: [] });
 
       await request(app)
         .post('/api/firmware/update')

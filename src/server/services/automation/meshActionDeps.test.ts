@@ -8,11 +8,18 @@ vi.mock('../../sourceManagerRegistry.js', () => ({
   sourceManagerRegistry: { getManager: (id: string) => getManager(id) },
 }));
 // The deps module also imports these at load time; stub to harmless objects.
-vi.mock('../../../services/database.js', () => ({ default: {} }));
+const mockDb = vi.hoisted(() => ({
+  getAssetNodeAsync: vi.fn(),
+  deleteNodeAsync: vi.fn(),
+}));
+vi.mock('../../../services/database.js', () => ({ default: mockDb }));
 vi.mock('../appriseNotificationService.js', () => ({ appriseNotificationService: {} }));
 vi.mock('../../utils/scriptRunner.js', () => ({ runScript: vi.fn() }));
 
 import { createMeshActionDeps } from './meshActionDeps.js';
+
+/** Every Meshtastic send from the Automation Engine is tagged (#5414). */
+const AUTOMATION = { origin: 'automation' };
 
 describe('createMeshActionDeps sendMessage — MeshCore scope (#3833)', () => {
   beforeEach(() => { getManager.mockReset(); });
@@ -48,7 +55,7 @@ describe('createMeshActionDeps sendMessage — MeshCore scope (#3833)', () => {
     await deps.sendMessage({ sourceId: 'mt', text: 'hi', channel: 3, scopeOverride: 'paris' });
 
     // sendTextMessage(text, channel, destination, replyId, emoji) — no scope arg.
-    expect(sendTextMessage).toHaveBeenCalledWith('hi', 3, undefined, undefined, 0);
+    expect(sendTextMessage).toHaveBeenCalledWith('hi', 3, undefined, undefined, 0, undefined, undefined, AUTOMATION);
   });
 });
 
@@ -85,7 +92,7 @@ describe('createMeshActionDeps sendMessage — MeshCore DM destination (#4018)',
 
     await deps.sendMessage({ sourceId: 'mt', text: 'hi', channel: 0, destination: 'not-a-node' as unknown as number });
 
-    expect(sendTextMessage).toHaveBeenCalledWith('hi', 0, undefined, undefined, 0);
+    expect(sendTextMessage).toHaveBeenCalledWith('hi', 0, undefined, undefined, 0, undefined, undefined, AUTOMATION);
   });
 });
 
@@ -146,7 +153,7 @@ describe('createMeshActionDeps sendMessage — maxAttempts through the queue (#4
 
     await deps.sendMessage({ sourceId: 'mt', text: 'hi', channel: 0, destination: 777 });
 
-    expect(sendTextMessage).toHaveBeenCalledWith('hi', 0, 777, undefined, 0);
+    expect(sendTextMessage).toHaveBeenCalledWith('hi', 0, 777, undefined, 0, undefined, undefined, AUTOMATION);
     expect(enqueue).not.toHaveBeenCalled();
   });
 
@@ -168,6 +175,7 @@ describe('createMeshActionDeps sendMessage — maxAttempts through the queue (#4
     expect(args[5]).toBeUndefined();    // channel: undefined ⇒ a DM
     expect(args[6]).toBe(3);            // maxAttemptsOverride
     expect(args[7]).toBeUndefined();    // emoji (0 || undefined)
+    expect(args[9]).toBe('automation'); // origin (#5414)
     expect(sendTextMessage).not.toHaveBeenCalled();
     expect(result).toEqual({ queued: true, messageId: 'q42', maxAttempts: 3 });
   });
@@ -180,7 +188,7 @@ describe('createMeshActionDeps sendMessage — maxAttempts through the queue (#4
 
     await deps.sendMessage({ sourceId: 'mt', text: 'hi', channel: 2, maxAttempts: 3 });
 
-    expect(sendTextMessage).toHaveBeenCalledWith('hi', 2, undefined, undefined, 0);
+    expect(sendTextMessage).toHaveBeenCalledWith('hi', 2, undefined, undefined, 0, undefined, undefined, AUTOMATION);
     expect(enqueue).not.toHaveBeenCalled();
   });
 
@@ -191,7 +199,7 @@ describe('createMeshActionDeps sendMessage — maxAttempts through the queue (#4
 
     await deps.sendMessage({ sourceId: 'mt', text: 'hi', channel: 0, destination: 777, maxAttempts: 3 });
 
-    expect(sendTextMessage).toHaveBeenCalledWith('hi', 0, 777, undefined, 0);
+    expect(sendTextMessage).toHaveBeenCalledWith('hi', 0, 777, undefined, 0, undefined, undefined, AUTOMATION);
   });
 
   it('a MeshCore manager (only sendMessage) ignores maxAttempts, no throw', async () => {
@@ -226,22 +234,22 @@ describe('createMeshActionDeps requestData — node operations (#3835)', () => {
     const deps = createMeshActionDeps();
 
     await deps.requestData({ sourceId: 'mt', op: 'telemetry', target: '123', channel: 2, telemetryType: 'environment' });
-    expect(m.sendTelemetryRequest).toHaveBeenCalledWith(123, 2, 'environment');
+    expect(m.sendTelemetryRequest).toHaveBeenCalledWith(123, 2, 'environment', AUTOMATION);
 
     await deps.requestData({ sourceId: 'mt', op: 'position', target: '123', channel: 0 });
-    expect(m.sendPositionRequest).toHaveBeenCalledWith(123, 0);
+    expect(m.sendPositionRequest).toHaveBeenCalledWith(123, 0, AUTOMATION);
 
     await deps.requestData({ sourceId: 'mt', op: 'traceroute', target: '123', channel: 1 });
-    expect(m.sendTraceroute).toHaveBeenCalledWith(123, 1);
+    expect(m.sendTraceroute).toHaveBeenCalledWith(123, 1, AUTOMATION);
 
     await deps.requestData({ sourceId: 'mt', op: 'nodeinfo', target: '123', channel: 0 });
-    expect(m.sendNodeInfoRequest).toHaveBeenCalledWith(123, 0);
+    expect(m.sendNodeInfoRequest).toHaveBeenCalledWith(123, 0, AUTOMATION);
 
     await deps.requestData({ sourceId: 'mt', op: 'neighbors', target: '123', channel: 0 });
-    expect(m.sendNeighborInfoRequest).toHaveBeenCalledWith(123, 0);
+    expect(m.sendNeighborInfoRequest).toHaveBeenCalledWith(123, 0, AUTOMATION);
 
     await deps.requestData({ sourceId: 'mt', op: 'advert', target: '', channel: 5 });
-    expect(m.broadcastNodeInfoToChannel).toHaveBeenCalledWith(5);
+    expect(m.broadcastNodeInfoToChannel).toHaveBeenCalledWith(5, AUTOMATION);
   });
 
   function meshcoreManager() {
@@ -250,7 +258,7 @@ describe('createMeshActionDeps requestData — node operations (#3835)', () => {
       requestRemoteTelemetry: vi.fn().mockResolvedValue({}),
       traceContactPath: vi.fn().mockResolvedValue({}),
       requestNeighbors: vi.fn().mockResolvedValue({}),
-      sendAdvert: vi.fn().mockResolvedValue(true),
+      sendAutomatedAdvert: vi.fn().mockResolvedValue({ sent: true }),
     };
   }
 
@@ -268,8 +276,25 @@ describe('createMeshActionDeps requestData — node operations (#3835)', () => {
     await deps.requestData({ sourceId: 'mc', op: 'neighbors', target: 'aabbcc', channel: 0 });
     expect(m.requestNeighbors).toHaveBeenCalledWith('aabbcc');
 
+    await deps.requestData({ sourceId: 'mc', op: 'advert', target: '', channel: 0, advertMode: 'zero_hop' });
+    expect(m.sendAutomatedAdvert).toHaveBeenCalledWith('zero_hop', expect.any(String));
+  });
+
+  it('MeshCore advert: absent mode (legacy action) goes through the floor as flood', async () => {
+    const m = meshcoreManager();
+    getManager.mockReturnValue(m);
+    const deps = createMeshActionDeps();
     await deps.requestData({ sourceId: 'mc', op: 'advert', target: '', channel: 0 });
-    expect(m.sendAdvert).toHaveBeenCalled();
+    expect(m.sendAutomatedAdvert).toHaveBeenCalledWith('flood', expect.any(String));
+  });
+
+  it('MeshCore advert: a flood skipped by the floor fails the step with the reason', async () => {
+    const m = meshcoreManager();
+    m.sendAutomatedAdvert.mockResolvedValue({ sent: false, reason: 'flood advert skipped: last flood was 5 min ago' });
+    getManager.mockReturnValue(m);
+    const deps = createMeshActionDeps();
+    await expect(deps.requestData({ sourceId: 'mc', op: 'advert', target: '', channel: 0, advertMode: 'flood' }))
+      .rejects.toThrow(/flood advert skipped/);
   });
 
   it('throws for a MeshCore-unsupported op reaching the deps directly', async () => {
@@ -410,7 +435,7 @@ describe('createMeshActionDeps — hop-limit override (#5121)', () => {
 
     await deps.sendMessage({ sourceId: 'mt', text: 'hi', channel: 1, hopLimitOverride: 2 });
 
-    expect(sendTextMessage).toHaveBeenCalledWith('hi', 1, undefined, undefined, 0, undefined, undefined, { hopLimitOverride: 2 });
+    expect(sendTextMessage).toHaveBeenCalledWith('hi', 1, undefined, undefined, 0, undefined, undefined, { hopLimitOverride: 2, origin: 'automation' });
   });
 
   it('carries the override through the queue when maxAttempts is set', async () => {
@@ -435,7 +460,7 @@ describe('createMeshActionDeps — hop-limit override (#5121)', () => {
     await deps.sendMessage({ sourceId: 'mt', text: 'hi', channel: 0, destination: 777, maxAttempts: 3, hopLimitOverride: 0 });
 
     expect(enqueue).not.toHaveBeenCalled();
-    expect(sendTextMessage).toHaveBeenCalledWith('hi', 0, 777, undefined, 0, undefined, undefined, { hopLimitOverride: 0 });
+    expect(sendTextMessage).toHaveBeenCalledWith('hi', 0, 777, undefined, 0, undefined, undefined, { hopLimitOverride: 0, origin: 'automation' });
   });
 
   it('passes the override on a tapback', async () => {
@@ -445,7 +470,7 @@ describe('createMeshActionDeps — hop-limit override (#5121)', () => {
 
     await deps.sendTapback({ sourceId: 'mt', emoji: '👍', channel: 2, replyId: 9, hopLimitOverride: 0 });
 
-    expect(sendTextMessage).toHaveBeenCalledWith('👍', 2, undefined, 9, 1, undefined, undefined, { hopLimitOverride: 0 });
+    expect(sendTextMessage).toHaveBeenCalledWith('👍', 2, undefined, 9, 1, undefined, undefined, { hopLimitOverride: 0, origin: 'automation' });
   });
 
   it('keeps the original tapback call shape without an override', async () => {
@@ -455,6 +480,32 @@ describe('createMeshActionDeps — hop-limit override (#5121)', () => {
 
     await deps.sendTapback({ sourceId: 'mt', emoji: '👍', channel: 2, replyId: 9 });
 
-    expect(sendTextMessage).toHaveBeenCalledWith('👍', 2, undefined, 9, 1);
+    expect(sendTextMessage).toHaveBeenCalledWith('👍', 2, undefined, 9, 1, undefined, undefined, AUTOMATION);
+  });
+});
+
+// #5354: the automation "delete node" action is an automated cleanup, so it
+// must skip a tracked asset (a manual Delete Node still works).
+describe('createMeshActionDeps manageNode delete — tracked assets (#5354)', () => {
+  beforeEach(() => {
+    getManager.mockReset().mockReturnValue({ sendTextMessage: vi.fn() });
+    mockDb.getAssetNodeAsync.mockReset().mockResolvedValue(null);
+    mockDb.deleteNodeAsync.mockReset().mockResolvedValue(undefined);
+  });
+
+  it('skips a tracked asset and reports why', async () => {
+    mockDb.getAssetNodeAsync.mockResolvedValue({ nodeNum: 7, retentionDays: 90 });
+    const deps = createMeshActionDeps();
+
+    const out = await deps.manageNode({ sourceId: 'mt', nodeNum: 7, op: 'delete' });
+
+    expect(out).toEqual({ skipped: true, reason: 'node is a tracked asset' });
+    expect(mockDb.deleteNodeAsync).not.toHaveBeenCalled();
+  });
+
+  it('still deletes a node that is not an asset', async () => {
+    const deps = createMeshActionDeps();
+    await deps.manageNode({ sourceId: 'mt', nodeNum: 8, op: 'delete' });
+    expect(mockDb.deleteNodeAsync).toHaveBeenCalledWith(8, 'mt');
   });
 });

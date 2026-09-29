@@ -4,12 +4,13 @@
  *
  * @vitest-environment jsdom
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import type React from 'react';
 import type { DeviceInfo } from '../types/device';
 import type { NodeFilters } from '../types/ui';
 import { pendingFavoriteRequests } from '../utils/pendingToggles';
+import { setNodeQuickAgeHours } from './useNodeQuickAgeFilter';
 
 const mockUseSource = vi.fn();
 const mockUseData = vi.fn();
@@ -182,6 +183,66 @@ describe('useSourceView', () => {
       expect(nodeNums).not.toContain(200); // stale non-favorite is dropped
     });
 
+    it('keeps all nodes when max node age is zero (#5338)', () => {
+      const stale = makeNode({ nodeNum: 200, lastHeard: 1 });
+      const neverHeard = makeNode({ nodeNum: 300, lastHeard: 0 });
+      mockUseNodes.mockReturnValue({ nodes: [makeNode(), stale, neverHeard], isLoading: false, error: null });
+      mockUseSettings.mockReturnValue({ maxNodeAgeHours: 0, distanceUnit: 'metric', showIncompleteNodes: true });
+
+      const { result } = renderHook(() => useSourceView(baseParams()));
+
+      expect(result.current.processedNodes.map(n => n.nodeNum).sort()).toEqual([100, 200, 300]);
+    });
+
+    describe('Nodes tab quick age filter (#5387)', () => {
+      afterEach(() => {
+        act(() => setNodeQuickAgeHours(null));
+      });
+      const threeDaysAgo = () => Math.floor(Date.now() / 1000) - 72 * 3600;
+
+      it('widens the Settings window on the Nodes tab, and "Setting" restores it', () => {
+        const older = makeNode({ nodeNum: 200, lastHeard: threeDaysAgo() });
+        mockUseNodes.mockReturnValue({ nodes: [makeNode(), older], isLoading: false, error: null });
+        const { result } = renderHook(() => useSourceView(baseParams()));
+        expect(result.current.processedNodes.map(n => n.nodeNum)).toEqual([100]);
+
+        act(() => setNodeQuickAgeHours(168));
+        expect(result.current.processedNodes.map(n => n.nodeNum).sort()).toEqual([100, 200]);
+
+        act(() => setNodeQuickAgeHours(null));
+        expect(result.current.processedNodes.map(n => n.nodeNum)).toEqual([100]);
+      });
+
+      it('narrows the window, and 0 (All) removes the cutoff', () => {
+        const sixHoursAgo = makeNode({ nodeNum: 200, lastHeard: Math.floor(Date.now() / 1000) - 6 * 3600 });
+        const ancient = makeNode({ nodeNum: 300, lastHeard: 1 });
+        mockUseSettings.mockReturnValue({ maxNodeAgeHours: 720, distanceUnit: 'metric', showIncompleteNodes: true });
+        mockUseNodes.mockReturnValue({ nodes: [makeNode(), sixHoursAgo, ancient], isLoading: false, error: null });
+
+        act(() => setNodeQuickAgeHours(0));
+        const { result } = renderHook(() => useSourceView(baseParams()));
+        expect(result.current.processedNodes.map(n => n.nodeNum).sort()).toEqual([100, 200, 300]);
+
+        act(() => setNodeQuickAgeHours(24));
+        expect(result.current.processedNodes.map(n => n.nodeNum).sort()).toEqual([100, 200]);
+      });
+
+      it('does not apply off the Nodes tab (processedNodes also feeds Messages)', () => {
+        const older = makeNode({ nodeNum: 200, lastHeard: threeDaysAgo() });
+        mockUseNodes.mockReturnValue({ nodes: [makeNode(), older], isLoading: false, error: null });
+        mockUseUI.mockReturnValue({
+          activeTab: 'messages',
+          nodesNodeFilter: '',
+          sortField: 'longName',
+          sortDirection: 'asc',
+          setTracerouteLoading,
+        });
+        act(() => setNodeQuickAgeHours(168));
+        const { result } = renderHook(() => useSourceView(baseParams()));
+        expect(result.current.processedNodes.map(n => n.nodeNum)).toEqual([100]);
+      });
+    });
+
     it('applies nodesNodeFilter text search only when activeTab is "nodes"', () => {
       const nodeA = makeNode({ nodeNum: 100, user: { id: '!64', longName: 'Alpha', shortName: 'A' } });
       const nodeB = makeNode({ nodeNum: 200, user: { id: '!c8', longName: 'Bravo', shortName: 'B' } });
@@ -207,6 +268,54 @@ describe('useSourceView', () => {
       const { result: onMessagesTab } = renderHook(() => useSourceView(baseParams()));
       // messagesNodeFilter is separate — nodesNodeFilter text search is skipped off the nodes tab
       expect(onMessagesTab.current.processedNodes.map(n => n.nodeNum).sort()).toEqual([100, 200]);
+    });
+
+    describe('agedOutAircraftNodes (#5364/#5365 Phase 2 "Show aged-out")', () => {
+      const oldSec = Math.floor(Date.now() / 1000) - 72 * 3600; // older than the 24 h window
+
+      it('lists aged-out aircraft that processedNodes drops, skipping the age window', () => {
+        const agedOut = makeNode({ nodeNum: 200, isIgnored: true, likelyAircraft: true, aircraftAgedOutAt: 1, lastHeard: oldSec });
+        const manual = makeNode({ nodeNum: 300, isIgnored: true, lastHeard: oldSec });
+        const fresh = makeNode({ nodeNum: 100 });
+        mockUseNodes.mockReturnValue({ nodes: [fresh, agedOut, manual], isLoading: false, error: null });
+
+        const { result } = renderHook(() => useSourceView(baseParams()));
+        expect(result.current.processedNodes.map(n => n.nodeNum)).toEqual([100]);
+        // Only the aged-out one; a manual ignore never comes back through this list.
+        expect(result.current.agedOutAircraftNodes.map(n => n.nodeNum)).toEqual([200]);
+      });
+
+      it('an aircraft flagged but not ignored is not in the aged-out list', () => {
+        const flagged = makeNode({ nodeNum: 200, isIgnored: false, likelyAircraft: true, aircraftAgedOutAt: 1 });
+        mockUseNodes.mockReturnValue({ nodes: [flagged], isLoading: false, error: null });
+        const { result } = renderHook(() => useSourceView(baseParams()));
+        expect(result.current.agedOutAircraftNodes).toEqual([]);
+      });
+
+      it('applies the other node filters to aged-out nodes (text search)', () => {
+        const a = makeNode({ nodeNum: 200, isIgnored: true, aircraftAgedOutAt: 1, lastHeard: oldSec, user: { id: '!c8', longName: 'Alpha', shortName: 'A' } });
+        const b = makeNode({ nodeNum: 300, isIgnored: true, aircraftAgedOutAt: 1, lastHeard: oldSec, user: { id: '!12c', longName: 'Bravo', shortName: 'B' } });
+        mockUseNodes.mockReturnValue({ nodes: [a, b], isLoading: false, error: null });
+        mockUseUI.mockReturnValue({
+          activeTab: 'nodes',
+          nodesNodeFilter: 'Bravo',
+          sortField: 'longName',
+          sortDirection: 'asc',
+          setTracerouteLoading,
+        });
+        const { result } = renderHook(() => useSourceView(baseParams()));
+        expect(result.current.agedOutAircraftNodes.map(n => n.nodeNum)).toEqual([300]);
+      });
+
+      it('does not repeat a node already in processedNodes (showIgnored on)', () => {
+        const agedOut = makeNode({ nodeNum: 200, isIgnored: true, aircraftAgedOutAt: 1 });
+        mockUseNodes.mockReturnValue({ nodes: [agedOut], isLoading: false, error: null });
+        const { result } = renderHook(() =>
+          useSourceView(baseParams({ nodeFilters: { ...defaultNodeFilters, showIgnored: true } })),
+        );
+        expect(result.current.processedNodes.map(n => n.nodeNum)).toEqual([200]);
+        expect(result.current.agedOutAircraftNodes).toEqual([]);
+      });
     });
 
     it('sorts favorites before non-favorites', () => {

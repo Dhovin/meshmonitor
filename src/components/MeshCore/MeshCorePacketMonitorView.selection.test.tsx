@@ -4,20 +4,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 
-vi.mock('react-i18next', () => ({
-  useTranslation: () => ({
-    t: (key: string, fallback?: string | Record<string, unknown>, options?: Record<string, unknown>) => {
-      const opts = typeof fallback === 'object' ? fallback : options;
-      let text = typeof fallback === 'string' ? fallback : key;
-      if (opts) {
-        Object.entries(opts).forEach(([k, v]) => {
-          text = text.replace(new RegExp(`{{${k}}}`, 'g'), String(v));
-        });
-      }
-      return text;
-    },
-  }),
-}));
+vi.mock('react-i18next', async () => {
+  const { createReactI18nextMock } = await import('../../test/mockI18n');
+  return createReactI18nextMock();
+});
 
 let hasPermissionImpl: (resource: string, action: string) => boolean = () => true;
 vi.mock('../../contexts/AuthContext', () => ({

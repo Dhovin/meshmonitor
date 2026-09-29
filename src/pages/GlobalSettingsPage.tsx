@@ -2,8 +2,8 @@
  * GlobalSettingsPage — standalone page for global (non-source-specific) settings.
  *
  * Renders SettingsTab in `mode="global"` so only global sections are shown:
- * Language, Units & Formats, Appearance, Map, System Backup, Database
- * Maintenance, and Analytics.
+ * Language, Units & Formats, Sorting, Appearance, Map, System Backup,
+ * Database Maintenance, and Analytics.
  */
 
 import { useNavigate } from 'react-router-dom';
@@ -17,6 +17,7 @@ import SettingsTab from '../components/SettingsTab';
 import ConfigSearchHost from '../components/search/ConfigSearchHost';
 import { appBasename } from '../init';
 import '../styles/settings.css';
+import styles from './GlobalSettingsPage.module.css';
 
 function GlobalSettingsInner() {
   const navigate = useNavigate();
@@ -75,7 +76,7 @@ function GlobalSettingsInner() {
   } = useSettings();
 
   return (
-    <div style={{ maxWidth: 1200, margin: '0 auto', padding: '1rem' }}>
+    <div className={styles.page} data-testid="global-settings-page">
       <button
         onClick={() => navigate('/', { state: { showList: true } })}
         style={{

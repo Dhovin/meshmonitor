@@ -74,6 +74,8 @@ vi.mock('./firmwareHardwareMap.js', () => ({
   getPlatformForBoard: vi.fn(),
   isOtaCapable: vi.fn(),
   getHardwareDisplayName: vi.fn(),
+  getAmbiguousOtaModel: vi.fn().mockReturnValue(null),
+  getOtaSiblingWarnings: vi.fn().mockReturnValue([]),
 }));
 
 // #3962 Phase 4.2a WP4: firmwareUpdateService resolves its manager via
@@ -490,6 +492,20 @@ describe('FirmwareUpdateService', () => {
       expect(result.rejected.length).toBeGreaterThan(0);
     });
 
+    // #5423: the Station G3 entries of the real v2.7.26 esp32s3 release zip.
+    it('should pick the station-g3 app binary, not station-g2 or the factory image', () => {
+      const files = [
+        'firmware-station-g2-2.7.26.54e0d8d.bin',
+        'firmware-station-g2-2.7.26.54e0d8d.factory.bin',
+        'firmware-station-g3-2.7.26.54e0d8d.mt.json',
+        'firmware-station-g3-2.7.26.54e0d8d.factory.bin',
+        'firmware-station-g3-2.7.26.54e0d8d.bin',
+        'littlefs-station-g3-2.7.26.54e0d8d.bin',
+      ];
+      const result = service.findFirmwareBinary(files, 'station-g3', '2.7.26.54e0d8d');
+      expect(result.matched).toBe('firmware-station-g3-2.7.26.54e0d8d.bin');
+    });
+
     it('should reject factory binaries', () => {
       const files = [
         'firmware-heltec-v3-2.6.1.abcdef.factory.bin',
@@ -513,6 +529,25 @@ describe('FirmwareUpdateService', () => {
       const result = service.findFirmwareBinary([], 'heltec-v3', '2.6.1.abcdef');
       expect(result.matched).toBeNull();
       expect(result.rejected).toEqual([]);
+    });
+
+    // #5402: some Meshtastic release zips (e.g. esp32s3) nest per-board
+    // binaries under a platform subdirectory instead of the extraction root.
+    it('should match a firmware binary nested under a platform subdirectory', () => {
+      const files = [
+        'esp32s3',
+        'esp32s3/firmware-heltec-v4-2.8.0.47db0e3.bin',
+        'esp32s3/firmware-heltec-v4-2.8.0.47db0e3.factory.bin',
+        'esp32s3/firmware-heltec-v4-r8-oled-2.8.0.47db0e3.bin',
+        'esp32s3/firmware-heltec-v4-r8-tft-2.8.0.47db0e3.bin',
+        'esp32s3/firmware-heltec-v4-tft-2.8.0.47db0e3.bin',
+        'esp32s3/firmware-heltec-v4-2.8.0.47db0e3.mt.json',
+      ];
+      const result = service.findFirmwareBinary(files, 'heltec-v4', '2.8.0.47db0e3');
+      expect(result.matched).toBe('esp32s3/firmware-heltec-v4-2.8.0.47db0e3.bin');
+      expect(result.rejected).toContainEqual(
+        expect.objectContaining({ name: 'esp32s3/firmware-heltec-v4-2.8.0.47db0e3.factory.bin' })
+      );
     });
   });
 
@@ -1070,6 +1105,57 @@ describe('FirmwareUpdateService', () => {
           expect(e.message).toMatch(/Node readiness check failed/);
           expect(svc.runCliCommand).not.toHaveBeenCalled();
         }
+      });
+    });
+
+    describe('custom TCP port in the gateway (#5424)', () => {
+      it('backup probes the parsed host/port and passes host:port to --host', async () => {
+        const svc = new FirmwareUpdateService() as any;
+        svc.ensureBackupDir = vi.fn();
+        svc.waitForNodeTcpReady = vi.fn().mockResolvedValue(undefined);
+        // Fail the CLI so no backup file is written; the calls are what we check.
+        svc.runCliCommand = vi.fn().mockResolvedValue({ stdout: '', stderr: 'x', exitCode: 1 });
+
+        await expect(svc.executeBackup('10.0.0.5:5000', '!abc')).rejects.toThrow(/Backup command failed/);
+
+        expect(svc.waitForNodeTcpReady).toHaveBeenCalledWith('10.0.0.5', 5000);
+        const args = svc.runCliCommand.mock.calls[0][1] as string[];
+        expect(args.slice(0, 2)).toEqual(['--host', '10.0.0.5:5000']);
+      });
+
+      it('backup with a bare host probes the default 4403 port', async () => {
+        const svc = new FirmwareUpdateService() as any;
+        svc.ensureBackupDir = vi.fn();
+        svc.waitForNodeTcpReady = vi.fn().mockResolvedValue(undefined);
+        svc.runCliCommand = vi.fn().mockResolvedValue({ stdout: '', stderr: 'x', exitCode: 1 });
+
+        await expect(svc.executeBackup('10.0.0.5', '!abc')).rejects.toThrow();
+
+        expect(svc.waitForNodeTcpReady).toHaveBeenCalledWith('10.0.0.5', 4403);
+        expect((svc.runCliCommand.mock.calls[0][1] as string[]).slice(0, 2)).toEqual(['--host', '10.0.0.5']);
+      });
+
+      it('flash readiness and post-failure waits use the custom port; --host carries it', async () => {
+        const svc = new FirmwareUpdateService() as any;
+        svc.waitForNodeReady = vi.fn().mockImplementation((_h: string, port: number) =>
+          port === 3232 ? Promise.reject(new Error('no loader')) : Promise.resolve(),
+        );
+        svc.probePort = vi.fn().mockRejectedValue(new Error('no loader'));
+        svc.runCliCommand = vi.fn().mockResolvedValue({ stdout: '', stderr: 'timeout', exitCode: 1 });
+        svc.tempDir = '/tmp/test';
+        svc.cleanupTempDir = vi.fn();
+
+        await expect(svc.executeFlash('10.0.0.5:5000', '/tmp/test/firmware.bin')).rejects.toThrow();
+
+        const waits = svc.waitForNodeReady.mock.calls.map((c: unknown[]) => [c[0], c[1]]);
+        // Pre-flash readiness on the API port.
+        expect(waits[0]).toEqual(['10.0.0.5', 5000]);
+        // The OTA loader transfer port is never replaced by the API port.
+        expect(waits).toContainEqual(['10.0.0.5', 3232]);
+        // The post-failure reboot wait uses the API port, not a hard-coded 4403.
+        expect(waits[waits.length - 1]).toEqual(['10.0.0.5', 5000]);
+        expect(waits).not.toContainEqual(['10.0.0.5', 4403]);
+        expect((svc.runCliCommand.mock.calls[0][1] as string[]).slice(0, 2)).toEqual(['--host', '10.0.0.5:5000']);
       });
     });
 

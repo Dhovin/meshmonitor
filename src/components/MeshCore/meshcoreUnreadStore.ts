@@ -32,6 +32,8 @@
  * which is also what keeps the pre-existing unit tests meaningful.
  */
 
+import { uniquePrefixMatch } from '../../utils/meshcoreKeyMatch';
+
 const CHANGE_EVENT = 'meshcore-unread-changed';
 
 export const channelLastReadKey = (sourceId: string) =>
@@ -201,6 +203,26 @@ export function markChannelRead(sourceId: string, idx: number, ts: number = Date
 }
 
 /**
+ * Follow an on-device channel reorder (#5379): move each channel's last-read
+ * marker from its old slot key to its new one, in localStorage and in the
+ * hydrated server snapshot. The server already moved its own rows in the same
+ * transaction as the rest of the remap, so nothing is pushed back. `moves` is
+ * a permutation, so no two markers land on one key.
+ */
+export function remapChannelLastRead(sourceId: string, moves: Array<{ from: number; to: number }>): void {
+  if (!sourceId || moves.length === 0) return;
+  const map = new Map(moves.map((m) => [String(m.from), String(m.to)]));
+  const remap = (rec: Record<string, number>): Record<string, number> => {
+    const out: Record<string, number> = {};
+    for (const [key, ts] of Object.entries(rec)) out[map.get(key) ?? key] = ts;
+    return out;
+  };
+  const snapshot = serverState.get(sourceId);
+  if (snapshot) snapshot.channels = remap(snapshot.channels);
+  persist(channelLastReadKey(sourceId), remap(loadMap<string>(channelLastReadKey(sourceId))));
+}
+
+/**
  * Mark a DM conversation (with `peerKey`) read up to `ts` (defaults to now).
  * `peerKey` must be the canonical peer key (see {@link canonicalizePeerKey}).
  * Never moves the marker backwards.
@@ -246,13 +268,9 @@ export function canonicalizePeerKey(
   contacts: ReadonlyArray<{ publicKey?: string }>,
 ): string {
   if (!key) return key;
-  for (const c of contacts) {
-    if (c.publicKey === key) return key;
-  }
-  for (const c of contacts) {
-    if (c.publicKey && c.publicKey.startsWith(key)) return c.publicKey;
-  }
-  return key;
+  // Unique match only (#5349): an ambiguous prefix stays as-is rather than
+  // being folded into whichever colliding contact comes first.
+  return uniquePrefixMatch(contacts, key)?.publicKey ?? key;
 }
 
 /** True when `a` and `b` reference the same key allowing for prefix matching. */
@@ -274,7 +292,7 @@ export function isChannelPseudoKey(k: string | null | undefined): boolean {
  * canonical peer keys.
  */
 export function computeUnreadDmPeers(params: {
-  messages: ReadonlyArray<{ fromPublicKey: string; toPublicKey?: string; timestamp: number; messageType?: string }>;
+  messages: ReadonlyArray<{ fromPublicKey: string; toPublicKey?: string; timestamp: number; messageType?: string; filtered?: string }>;
   contacts: ReadonlyArray<{ publicKey?: string }>;
   selfKey: string | undefined;
   dmLastRead: Record<string, number>;
@@ -300,6 +318,8 @@ export function computeUnreadDmPeers(params: {
   for (const m of messages) {
     if (!m.toPublicKey) continue;
     if (m.messageType === 'room_post') continue;
+    // Ignored messages never count as unread (#5408).
+    if (m.filtered) continue;
     if (isChannelPseudoKey(m.fromPublicKey) || isChannelPseudoKey(m.toPublicKey)) continue;
     // Only received messages count as unread — sender is NOT us, recipient IS us.
     if (peerKeysMatch(m.fromPublicKey, selfKey)) continue;

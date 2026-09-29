@@ -22,6 +22,8 @@ import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import type { MySql2Database } from 'drizzle-orm/mysql2';
 import { and, desc, gte, inArray, isNotNull, lt, max, or, eq } from 'drizzle-orm';
 import { isBogusPosition } from '../../utils/nullIsland.js';
+import { reachTransportClass } from '../../utils/tracerouteTransport.js';
+import type { NodeTransportClass } from '../../utils/nodeTransport.js';
 import {
   telemetrySqlite,
   telemetryPostgres,
@@ -69,6 +71,24 @@ export interface GetPositionsArgs {
   pageSize: number;
   cursor?: string | null;
 }
+
+/** Args for {@link AnalysisRepository.getPositionsForNodes} (#5364/#5365 Phase 3). */
+export interface GetPositionsForNodesArgs {
+  sourceIds: string[];
+  nodeNums: number[];
+  sinceMs: number;
+}
+
+/** nodeNums per `IN (...)` chunk — keeps the bound-parameter count modest on every backend. */
+export const POSITIONS_FOR_NODES_CHUNK = 500;
+
+/**
+ * Hard ceiling on rows read per telemetry type per chunk. A flight trail
+ * needs a few hundred fixes; this only stops a misclassified node that
+ * reports every few seconds from pulling a week of rows into memory. The
+ * NEWEST rows win when the cap bites.
+ */
+export const POSITIONS_FOR_NODES_ROW_CAP = 50_000;
 
 interface Cursor {
   ts: number;
@@ -152,6 +172,8 @@ export interface HopEntry {
   sourceId: string;
   nodeNum: number;
   hops: number;
+  /** Only present when `GetHopCountsArgs.includeTransport` is set (#5101). */
+  transport?: NodeTransportClass;
 }
 
 export interface HopCountsResult {
@@ -160,6 +182,18 @@ export interface HopCountsResult {
 
 export interface GetHopCountsArgs {
   sourceIds: string[];
+  /**
+   * Each source's local node number. A source with no entry (MQTT, MeshCore,
+   * or a TCP source that has never learned its node) has no "local" to count
+   * hops from, so it contributes no entries (#5289).
+   */
+  localNodeNums: ReadonlyMap<string, number>;
+  /**
+   * Also classify each entry's transport via `reachTransportClass` (#5101).
+   * Default off, so the Map Analysis `/hop-counts` payload and its select
+   * list stay unchanged for callers that don't ask for it.
+   */
+  includeTransport?: boolean;
 }
 
 /**
@@ -412,6 +446,98 @@ export class AnalysisRepository {
   }
 
   /**
+   * Every position fix for the given nodes on the given sources since
+   * `sinceMs`, in ascending time order (#5364/#5365 Phase 3, flight trails).
+   *
+   * Built like {@link getPositions}: lat / lon / alt telemetry rows pivoted by
+   * `(sourceId, nodeNum, timestamp)`, Null Island fixes skipped. Not
+   * paginated; `nodeNums` is chunked by {@link POSITIONS_FOR_NODES_CHUNK} and
+   * each stream is capped at {@link POSITIONS_FOR_NODES_ROW_CAP} rows.
+   *
+   * A nodeNum is scoped only by the source list: a pair `(sourceId, nodeNum)`
+   * the caller did not ask for can come back when the same nodeNum exists on
+   * another listed source. Callers that care filter on the pair.
+   */
+  async getPositionsForNodes(args: GetPositionsForNodesArgs): Promise<PositionRow[]> {
+    if (args.sourceIds.length === 0 || args.nodeNums.length === 0) return [];
+
+    const telemetry = pickTelemetryTable(this.dbType);
+    const uniqueNodeNums = Array.from(new Set(args.nodeNums.map(Number)));
+    const selectShape = {
+      nodeNum: telemetry.nodeNum,
+      sourceId: telemetry.sourceId,
+      timestamp: telemetry.timestamp,
+      value: telemetry.value,
+    };
+
+    /* eslint-disable @typescript-eslint/no-explicit-any -- Drizzle cross-dialect union */
+    const runQuery = async (telemetryType: string, nodeNums: number[]): Promise<TelemRow[]> => {
+      const rows: any[] = await (this.db as any)
+        .select(selectShape)
+        .from(telemetry)
+        .where(
+          and(
+            inArray(telemetry.sourceId, args.sourceIds),
+            inArray(telemetry.nodeNum, nodeNums),
+            gte(telemetry.timestamp, args.sinceMs),
+            eq(telemetry.telemetryType, telemetryType),
+          ),
+        )
+        .orderBy(desc(telemetry.timestamp))
+        .limit(POSITIONS_FOR_NODES_ROW_CAP);
+      return rows.map((r) => ({
+        nodeNum: Number(r.nodeNum),
+        sourceId: r.sourceId ?? null,
+        timestamp: Number(r.timestamp),
+        value: Number(r.value),
+      }));
+    };
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+
+    const out: PositionRow[] = [];
+    for (let i = 0; i < uniqueNodeNums.length; i += POSITIONS_FOR_NODES_CHUNK) {
+      const chunk = uniqueNodeNums.slice(i, i + POSITIONS_FOR_NODES_CHUNK);
+      const latRows = await runQuery('latitude', chunk);
+      if (latRows.length === 0) continue;
+      const lonRows = await runQuery('longitude', chunk);
+      if (lonRows.length === 0) continue;
+      const altRows = await runQuery('altitude', chunk);
+
+      const lonByKey = new Map<string, number>();
+      for (const r of lonRows) {
+        if (r.sourceId == null) continue;
+        lonByKey.set(pairKey(r.sourceId, r.nodeNum, r.timestamp), r.value);
+      }
+      const altByKey = new Map<string, number>();
+      for (const r of altRows) {
+        if (r.sourceId == null) continue;
+        altByKey.set(pairKey(r.sourceId, r.nodeNum, r.timestamp), r.value);
+      }
+
+      for (const lat of latRows) {
+        if (lat.sourceId == null) continue;
+        const key = pairKey(lat.sourceId, lat.nodeNum, lat.timestamp);
+        const lon = lonByKey.get(key);
+        if (lon === undefined) continue;
+        // Null Island (0,0) guard, as in getPositions (#3763).
+        if (isBogusPosition(lat.value, lon)) continue;
+        const alt = altByKey.get(key);
+        out.push({
+          nodeNum: lat.nodeNum,
+          sourceId: lat.sourceId,
+          latitude: lat.value,
+          longitude: lon,
+          altitude: alt === undefined ? null : alt,
+          timestamp: lat.timestamp,
+        });
+      }
+    }
+
+    out.sort((a, b) => a.timestamp - b.timestamp);
+    return out;
+  }
+
+  /**
    * Get a paginated list of traceroute records across given sources, newest
    * first. Cursor pagination keyed on `(timestamp DESC, id DESC)` — the
    * traceroutes table has a single `id` PK so the (ts, id) tuple is a stable
@@ -634,18 +760,111 @@ export class AnalysisRepository {
    * rather than falling back to an older row. Both writers store
    * `JSON.stringify(route)`, so this is unreachable short of manual database
    * edits — and grey is the honest answer for data we cannot read.
+   *
+   * Only traceroutes the source's LOCAL node took part in count (#5289). The
+   * table also holds traces between two other nodes: every traceroute an MQTT
+   * source ingests, and any response that arrives with no pending row to fill.
+   * Those rows were keyed on `toNodeNum`, which for an inserted response is
+   * the REQUESTER, so a third party's trace to its own neighbour (`route`
+   * `'[]'`) painted that third party green, however far away it was. On a
+   * real MQTT broker source that was ~40% of all nodes, and 85% of shaded
+   * nodes disagreed with their own `hopsAway`.
+   *
+   * A row involving the local node comes in two shapes, and both give the hop
+   * count between the local node and the other end:
+   * - `fromNodeNum = local`: a pending request later filled by its response;
+   *   the other end is `toNodeNum`.
+   * - `toNodeNum = local`: a response inserted with no pending row (another
+   *   client asked, or the pending row timed out); the other end is
+   *   `fromNodeNum`.
    */
   async getHopCounts(args: GetHopCountsArgs): Promise<HopCountsResult> {
-    if (args.sourceIds.length === 0) {
-      return { entries: [] };
-    }
+    const includeTransport = args.includeTransport ?? false;
+    const seen = new Map<string, HopEntry & { timestamp: number }>();
+    for (const sourceId of args.sourceIds) {
+      const local = args.localNodeNums.get(sourceId);
+      if (local === undefined || !Number.isFinite(local)) continue;
+      for (const side of ['from', 'to'] as const) {
+        const rows = await this.newestAnsweredPerPeer(sourceId, local, side, includeTransport);
+        for (const r of rows) {
+          const nodeNum = Number(r.peer);
+          if (nodeNum === local) continue;
+          const timestamp = Number(r.timestamp);
+          const key = `${sourceId}:${nodeNum}`;
+          // Two rows can share the max timestamp for one node, and the node
+          // can appear in both shapes; keep the newest, first one on a tie.
+          const prev = seen.get(key);
+          if (prev && prev.timestamp >= timestamp) continue;
 
+          // Belt-and-braces: the query already excludes NULL routes.
+          if (r.route == null) continue;
+
+          let hops: number;
+          try {
+            const arr = JSON.parse(r.route);
+            // Anything that isn't an array is corrupt, not "zero hops".
+            if (!Array.isArray(arr)) continue;
+            hops = arr.length;
+          } catch {
+            continue;
+          }
+
+          const entry: HopEntry & { timestamp: number } = { sourceId, nodeNum, hops, timestamp };
+          if (includeTransport) {
+            // The endpoints are never filtered by `buildLegHopLinks`, so
+            // rebuilding them from `side` is exact — no new tie logic.
+            entry.transport = reachTransportClass({
+              fromNodeNum: side === 'from' ? local : nodeNum,
+              toNodeNum: side === 'from' ? nodeNum : local,
+              route: r.route,
+              snrTowards: r.snrTowards ?? null,
+              transportMechanism: r.transportMechanism == null ? null : Number(r.transportMechanism),
+            });
+          }
+          seen.set(key, entry);
+        }
+      }
+    }
+    return {
+      entries: Array.from(seen.values(), ({ sourceId, nodeNum, hops, transport }) => {
+        const entry: HopEntry = { sourceId, nodeNum, hops };
+        if (includeTransport) entry.transport = transport;
+        return entry;
+      }),
+    };
+  }
+
+  /**
+   * Newest answered traceroute per peer for one source, among rows where the
+   * local node is on the given side. `peer` is the node at the other end.
+   * `includeTransport` also selects `transportMechanism`/`snrTowards` so the
+   * caller can classify the route via `reachTransportClass` (#5101).
+   */
+  private async newestAnsweredPerPeer(
+    sourceId: string,
+    local: number,
+    side: 'from' | 'to',
+    includeTransport: boolean = false,
+  ): Promise<Array<{
+    peer: number;
+    route: string | null;
+    timestamp: number;
+    transportMechanism?: number | null;
+    snrTowards?: string | null;
+  }>> {
     const traceroutes = pickTraceroutesTable(this.dbType);
+    const localCol = side === 'from' ? traceroutes.fromNodeNum : traceroutes.toNodeNum;
+    const peerCol = side === 'from' ? traceroutes.toNodeNum : traceroutes.fromNodeNum;
+    const scope = and(
+      eq(traceroutes.sourceId, sourceId),
+      eq(localCol, local),
+      isNotNull(traceroutes.route),
+    );
 
     /* eslint-disable @typescript-eslint/no-explicit-any -- Drizzle cross-dialect union */
     const db = this.db as any;
 
-    // Narrow to the newest ANSWERED row per (sourceId, toNodeNum) in SQL
+    // Narrow to the newest ANSWERED row per peer in SQL
     // rather than fetching the whole table and reducing in JS.
     //
     // Traceroute history is capped per node-pair by TRACEROUTE_HISTORY_LIMIT
@@ -661,58 +880,33 @@ export class AnalysisRepository {
     // branch to get wrong. Verified against all three.
     const newest = db
       .select({
-        sourceId: traceroutes.sourceId,
-        toNodeNum: traceroutes.toNodeNum,
+        peer: peerCol,
         maxTs: max(traceroutes.timestamp).as('maxTs'),
       })
       .from(traceroutes)
-      .where(and(inArray(traceroutes.sourceId, args.sourceIds), isNotNull(traceroutes.route)))
-      .groupBy(traceroutes.sourceId, traceroutes.toNodeNum)
+      .where(scope)
+      .groupBy(peerCol)
       .as('newest');
 
     const rows: any[] = await db
       .select({
-        sourceId: traceroutes.sourceId,
-        toNodeNum: traceroutes.toNodeNum,
+        peer: peerCol,
         route: traceroutes.route,
+        timestamp: traceroutes.timestamp,
+        ...(includeTransport
+          ? { transportMechanism: traceroutes.transportMechanism, snrTowards: traceroutes.snrTowards }
+          : {}),
       })
       .from(traceroutes)
       .innerJoin(
         newest,
         and(
-          eq(traceroutes.sourceId, newest.sourceId),
-          eq(traceroutes.toNodeNum, newest.toNodeNum),
+          eq(peerCol, newest.peer),
           eq(traceroutes.timestamp, newest.maxTs),
         ),
       )
-      .where(and(inArray(traceroutes.sourceId, args.sourceIds), isNotNull(traceroutes.route)));
+      .where(scope);
     /* eslint-enable @typescript-eslint/no-explicit-any */
-
-    const seen = new Map<string, HopEntry>();
-    for (const r of rows) {
-      const sourceId = r.sourceId ?? '';
-      if (!sourceId) continue;
-      const nodeNum = Number(r.toNodeNum);
-      const key = `${sourceId}:${nodeNum}`;
-      // Two rows can share the max timestamp for one node; either is "newest",
-      // so take the first and ignore the rest.
-      if (seen.has(key)) continue;
-
-      // Belt-and-braces: the query already excludes NULL routes.
-      if (r.route == null) continue;
-
-      let hops: number;
-      try {
-        const arr = JSON.parse(r.route);
-        // Anything that isn't an array is corrupt, not "zero hops".
-        if (!Array.isArray(arr)) continue;
-        hops = arr.length;
-      } catch {
-        continue;
-      }
-
-      seen.set(key, { sourceId, nodeNum, hops });
-    }
-    return { entries: Array.from(seen.values()) };
+    return rows;
   }
 }

@@ -80,6 +80,7 @@ Every automation has exactly one trigger (the **WHEN**). Each trigger exposes a 
 | **A watched node rebooted** | An uptime reset is detected (uptime decreases without a matching graceful reboot) | Multi-select of nodes; suppresses matched self-triggered reboots so an automation-initiated `deviceReboot` doesn't re-fire the alert |
 | **A watched node's external power changed** | A node reports losing or restoring external power (voltage / power-source telemetry) | Multi-select of nodes; separate `lost` vs `restored` fires, both exposed as `{{ trigger.event }}` |
 | **A watched node's battery is trending down** | A node's battery drops through a threshold with a sustained negative slope over the window | Multi-select of nodes; threshold percent (default 25); window hours (default 24). Doubles as a solar underperformance proxy on nodes that normally recharge each day |
+| **A node becomes a likely aircraft** | A node's reported altitude puts it more than the source's [likely-aircraft](/features/settings#likely-aircraft-detection) threshold above the terrain (or the sea-level fallback, when terrain elevation is unavailable) | Any node — narrow with a **Source is one of…** condition on a wide MQTT feed. Meshtastic only |
 
 ### Became mobile & left home (tamper / theft monitoring)
 
@@ -90,6 +91,29 @@ These two triggers are designed for fleets of **stationary** GPS nodes (rooftops
 - **Left home** — on the first position after you add a node to the rule, MeshMonitor stores that fix as the node’s **home** for this automation. Later fixes farther than **Threshold (metres)** fire the automation. Returning within the threshold re-arms it. Homes are stored in the database so a MeshMonitor restart does not silently re-home a stolen node.
 - Prefer **Cooldown applies to = node** so one stolen site does not suppress alerts for the rest of the fleet.
 - Pair with **Send a message** (channel) and/or **Send a notification** (Apprise) actions.
+
+### Became likely aircraft
+
+Fires once when a node's [likely-aircraft flag](/features/settings#likely-aircraft-detection) turns
+on — including the first time it's ever set, not only a `false` → `true` flip. It does **not** fire
+for a silent backfill or a silent recompute after a settings change (both change the flag without
+raising the event), and it fires again only after the node drops back below the threshold and then
+crosses it once more. Sends nothing to the mesh — the classification itself is local math plus
+outbound elevation-tile fetches. Meshtastic only (including MQTT sources); a wide MQTT feed can see
+many aircraft at once, so narrow the rule with a **Source is one of…** condition.
+
+Tokens available on this trigger:
+
+| Token | Resolves to |
+| --- | --- |
+| `{{ trigger.nodeNum }}` | The node's number |
+| `{{ trigger.altitude }}` | Reported altitude (m, MSL) |
+| `{{ trigger.heightAboveGround }}` | Height above ground (m) — only set when `basis` is `agl` |
+| `{{ trigger.groundElevation }}` | Ground elevation at the node's position (m) |
+| `{{ trigger.basis }}` | `agl` (height-above-ground basis) or `msl` (sea-level fallback basis) |
+| `{{ trigger.thresholdM }}` | The threshold (in meters) that was crossed |
+| `{{ trigger.previousLikelyAircraft }}` | The flag's previous value (`false` or empty/unset) |
+| `{{ trigger.latitude }}` / `{{ trigger.longitude }}` | The node's position when it was classified |
 
 ### Message trigger & channel-name matching
 
@@ -425,6 +449,7 @@ Asks a node to report data — the automation equivalent of the manual request b
 - **Request** — what to ask for: **Telemetry**, **Position (Meshtastic)**, **Traceroute / path**,
   **Node info exchange (Meshtastic)**, **Neighbor info**, or **Announce self (advert)**.
 - **Telemetry type** — which metric set to ask for, when the request is **Telemetry**.
+- **Advert reach (MeshCore)** — for **Announce self (advert)** on a MeshCore source: **Zero-hop** (nearby nodes only, the default for new actions) or **Flood** (whole mesh). Actions saved before this option existed flood. Automated floods run at most once per hour per source; a flood inside that hour is skipped and the step fails with the reason. See [MeshCore adverts](/features/meshcore#automated-flood-limit). Meshtastic ignores this option.
 - **Via sources** — which radio(s) to send the request through. Leave empty to use the triggering
   source — but a source **is required** for source-less triggers (Schedule / System).
 - **Target node** — node # (Meshtastic) or contact public key (MeshCore). Leave blank to target the
@@ -465,6 +490,51 @@ Responder uses) when the automation fires.
 
 > The script itself does **not** send messages — capture its output into a variable, then use a
 > separate **Send a message** action to relay it.
+
+### Enable or disable an automation
+
+In JSON mode, this action has the type `action.setAutomationEnabled`.
+
+Turns another automation, or this one, on or off. It does the same thing as the enable switch on
+the Automations page, with no script, API token, or `curl` call. It sends nothing on the mesh.
+
+- **Automation** — pick one from the list (shown by name, saved by id). Choose **Enter an id or
+  template** to type an id instead, such as `{{ var.targetAutomation }}`.
+- **Change** — **Set to** forces the state you pick in **New state** (**Enabled** or
+  **Disabled**). **Toggle** flips whatever state the automation is in now.
+- **New state** — shown for **Set to** only. In JSON mode, `enabled` also takes `true` / `false`,
+  the strings `"true"` / `"false"`, or a `{{ }}` template that resolves to one of them.
+
+What happens when it runs:
+
+- The engine saves the new state and reloads its rules, as the enable and disable buttons do. If
+  the automation already has that state, the engine writes nothing and skips the reload.
+- An id that matches no automation fails the step with `no automation with id "…"` in the run
+  log. The rest of the run still goes ahead, as it does for any failed action.
+- The run log shows the target's id, name, mode, new state and old state on the step.
+- **An automation that disables itself stops there.** Its later actions do not run, and the run
+  log ends with a **run stopped** step that says why. Use this for a one-shot rule: do the work
+  first, then disable itself as the last action.
+- A rule this action disables will not fire for the event that is being handled, even if it
+  listens for the same trigger and was due to run next.
+- The [Test panel](#testing-dry-run) reports what would change, and fails an unknown id, but never
+  changes any automation.
+
+Common patterns:
+
+- **Kill switch** — a Message trigger that matches `!quiet`, a condition that checks the sender
+  is your admin node, then **Set to Disabled** on a noisy rule.
+- **Time window** — a Schedule at `0 22 * * *` sets a chatty rule to **Disabled**, and a second
+  Schedule at `0 7 * * *` sets it back to **Enabled**.
+- **One-shot** — a rule that sends its reply, then disables itself.
+
+> Take care with ids built from mesh input. With `{{ trigger.text }}` as the id, anyone who can
+> message the node can switch your automations on and off. Pick the automation from the list, or
+> gate the rule on the sender first.
+
+Loop safety: turning an automation on or off raises no event, so no trigger can fire from it.
+Rule A that toggles rule B can't set off rule B, and two rules can't toggle each other in a loop
+through this action alone. The trigger's own cooldown and rate limit still apply.
 
 ### Set a variable / flag
 
@@ -854,6 +924,30 @@ to something usable. Prefer it (or `{{ trigger.fromName }}`) over the **raw iden
 - `{{ trigger.from }}` / `{{ trigger.fromId }}` are **raw identity**: on Meshtastic the node number /
   `!hex` id; on MeshCore the sender's public key — or, for a channel message (which carries no
   per-sender key on the wire), the synthetic `channel-<idx>` slot key, **not** a sender identity.
+
+### MeshCore packet hash — `{{ trigger.packetHash }}`
+
+On a MeshCore **message** trigger, `{{ trigger.packetHash }}` is the MeshCore **packet hash** of the
+frame the message arrived in: 16 uppercase hex characters (e.g. `3A24AED15A9CB70A`), computed the
+same way as the MeshCore firmware and the reference packet-capture tool. MeshCore analyzers key
+packets on it, so it links a received message to its packet page:
+
+```
+https://map.meshcore.com.hr/#/packets/{{ trigger.packetHash }}
+```
+
+That map looks packets up without regard to case, so the uppercase hash works as-is.
+
+- **MeshCore only.** Empty on Meshtastic (use `{{ trigger.packetId }}` there).
+- **Channel messages:** exact. MeshMonitor decrypts the raw frame with the channel's key and only
+  takes the hash when the frame decrypts to this exact message. Messages from an MQTT-ingested
+  MeshCore source are exact too — the hash comes from the raw bytes on the wire.
+- **Direct messages:** **best-effort.** A DM is encrypted with the sender's key, which the companion
+  never hands out, so MeshMonitor matches the frame by the sender's 1-byte hash and the hop count.
+  Two DMs from senders sharing that byte, in the same second or two, could swap hashes.
+- **Empty** when the raw frame couldn't be matched: room-server posts, messages the device
+  queued while MeshMonitor was disconnected (they arrive with no raw frame), channel frames that
+  didn't verify, and our own outbound messages.
 
 ### In-builder validation
 

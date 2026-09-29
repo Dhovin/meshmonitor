@@ -18,34 +18,46 @@ import * as path from 'path';
 import { assertSafeUrl, SsrfBlockedError } from '../utils/ssrfGuard.js';
 import { logger } from '../../utils/logger.js';
 import { parseFirmwareVersion, isParsedFirmwareAtLeast } from '../../utils/firmwareVersion.js';
+import { parseOtaGateway } from '../../utils/otaGateway.js';
 import databaseService from '../../services/database.js';
-import { fallbackManager } from '../meshtasticManager.js';
+import { fallbackManager, type MeshtasticManager } from '../meshtasticManager.js';
 import { sourceManagerRegistry } from '../sourceManagerRegistry.js';
-import { getPrimaryMeshtasticManager } from '../sourceManagerTypes.js';
+import { getPrimaryMeshtasticManager, isMeshtasticManager } from '../sourceManagerTypes.js';
 import { dataEventEmitter } from './dataEventEmitter.js';
 import {
   getBoardName,
   getPlatformForBoard,
   isOtaCapable,
   getHardwareDisplayName,
+  getAmbiguousOtaModel,
+  getOtaSiblingWarnings,
 } from './firmwareHardwareMap.js';
+import type { OtaSiblingWarning } from './firmwareHardwareMap.js';
 // Re-export for consumers
 export { getBoardName, getPlatformForBoard, isOtaCapable, getHardwareDisplayName };
 
-const DEFAULT_MESHTASTIC_TCP_PORT = 4403;
-// Port served by the MeshtasticOTA-WiFi loader in the ota_1 partition during OTA mode.
-const OTA_LOADER_PORT = 3232;
-
-function parseGateway(gateway: string): { host: string; port: number } {
-  const trimmed = gateway.trim();
-  // Support "host:port" but leave IPv6 literals alone — dev/prod only use IPv4 or hostnames.
-  const lastColon = trimmed.lastIndexOf(':');
-  if (lastColon > 0 && /^\d+$/.test(trimmed.slice(lastColon + 1))) {
-    const port = Number(trimmed.slice(lastColon + 1));
-    return { host: trimmed.slice(0, lastColon), port };
+/**
+ * A preflight refusal the route should report as a 400 with a machine code,
+ * rather than a generic 500.
+ */
+export class OtaPreflightError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string
+  ) {
+    super(message);
+    this.name = 'OtaPreflightError';
   }
-  return { host: trimmed, port: DEFAULT_MESHTASTIC_TCP_PORT };
 }
+
+// Port served by the MeshtasticOTA-WiFi loader in the ota_1 partition during OTA mode.
+// This is the firmware-image transfer port and is NOT the TCP API port — a
+// source's custom API port (#5424) never applies to it.
+const OTA_LOADER_PORT = 3232;
+// `gatewayIp` throughout this service is `host` or `host:port` (see
+// parseOtaGateway). The frontend appends the source's custom TCP API port
+// (#5424); the meshtastic CLI accepts the same string on `--host`, but socket
+// probes must use the parsed host and port.
 
 // ---- Types ----
 
@@ -91,6 +103,13 @@ export interface UpdateStatus {
   logs: string[];
   targetVersion?: string;
   error?: string;
+  /**
+   * The source whose node this update is flashing (#5424 follow-up). Every
+   * disconnect/reconnect in the run targets this source's manager, never the
+   * primary. Absent on a legacy single-source install that sent no sourceId,
+   * where the primary manager is the only one there is.
+   */
+  sourceId?: string;
   preflightInfo?: {
     currentVersion: string;
     targetVersion: string;
@@ -104,6 +123,12 @@ export interface UpdateStatus {
   downloadSize?: number;
   matchedFile?: string;
   rejectedFiles?: Array<{ name: string; reason: string }>;
+  /**
+   * Set at preflight and kept for the whole wizard: the board being flashed
+   * shares its hw model with other release builds (#5423). Empty when the
+   * operator picked the build (custom URL / upload) or the model is unique.
+   */
+  warnings?: OtaSiblingWarning[];
 }
 
 // ---- GitHub API response types (raw) ----
@@ -426,6 +451,13 @@ export class FirmwareUpdateService {
    * Find the correct firmware .bin in a list of extracted file names.
    * Uses strict regex: firmware-${boardName}-\d+\.\d+\.\d+\.[a-f0-9]+\.bin$
    * Rejects .factory.bin and other variants.
+   *
+   * `files` may be paths relative to the extraction root (e.g.
+   * `esp32s3/firmware-heltec-v4-2.8.0.47db0e3.bin`) — some Meshtastic release
+   * zips nest per-platform binaries under a subdirectory (#5402). Matching
+   * happens on the basename so board/version checks are unaffected by the
+   * subdirectory, but `matched`/`rejected` entries keep the full relative
+   * path so the caller can still locate the file under the extraction root.
    */
   findFirmwareBinary(
     files: string[],
@@ -439,15 +471,17 @@ export class FirmwareUpdateService {
     let matched: string | null = null;
 
     for (const file of files) {
+      const baseName = path.basename(file);
+
       // Skip non-bin files
-      if (!file.endsWith('.bin')) {
+      if (!baseName.endsWith('.bin')) {
         continue;
       }
 
       // Check if it looks like a firmware file for this board
-      if (!file.startsWith(`firmware-${boardName}-`)) {
+      if (!baseName.startsWith(`firmware-${boardName}-`)) {
         // Not for this board — skip silently (don't add to rejected unless it's firmware-*)
-        if (file.startsWith('firmware-')) {
+        if (baseName.startsWith('firmware-')) {
           rejected.push({ name: file, reason: 'wrong board name' });
         } else {
           rejected.push({ name: file, reason: 'not a firmware binary' });
@@ -456,13 +490,13 @@ export class FirmwareUpdateService {
       }
 
       // Reject factory binaries
-      if (file.includes('.factory.')) {
+      if (baseName.includes('.factory.')) {
         rejected.push({ name: file, reason: 'factory binary' });
         continue;
       }
 
       // Check strict pattern match
-      if (strictPattern.test(file)) {
+      if (strictPattern.test(baseName)) {
         matched = file;
       } else {
         rejected.push({ name: file, reason: 'does not match expected naming pattern' });
@@ -544,14 +578,52 @@ export class FirmwareUpdateService {
   }
 
   /**
+   * The manager that owns the device this update is flashing.
+   *
+   * With a `sourceId` on the status (set at preflight), re-resolve that source
+   * by id so a disconnect or reconnect lands on ITS manager, never on the
+   * primary: a Meshtastic node allows one TCP client, so freeing or re-taking
+   * the wrong source's slot leaves the CLI hanging on the real target.
+   * Returns null when that source is gone or no longer a Meshtastic source;
+   * callers then skip the reconnect rather than reconnect a different radio.
+   *
+   * Without a `sourceId` (legacy single-source install) this is the primary,
+   * or `fallbackManager` when none is registered.
+   *
+   * Callers doing more than one manager call in an operation must capture the
+   * result once (#3962 Phase 4.2a atomicity).
+   */
+  private resolveUpdateManager(): MeshtasticManager | null {
+    const sourceId = this.status.sourceId;
+    if (!sourceId) return getPrimaryMeshtasticManager(sourceManagerRegistry) ?? fallbackManager;
+    const manager = sourceManagerRegistry.getManager(sourceId);
+    if (manager && isMeshtasticManager(manager)) return manager;
+    logger.warn(
+      `[FirmwareUpdateService] Source ${sourceId} no longer has a Meshtastic manager; ` +
+        'skipping its disconnect/reconnect',
+    );
+    return null;
+  }
+
+  /** Reconnect the update's source after a failed step. Never throws. */
+  private async reconnectAfterFailure(mgr: MeshtasticManager | null, step: string): Promise<void> {
+    if (!mgr) return;
+    logger.debug(`[FirmwareUpdateService] Reconnecting MeshMonitor after ${step} failure`);
+    try {
+      await mgr.userReconnect();
+    } catch (reconnectError) {
+      logger.error(`[FirmwareUpdateService] Reconnect after ${step} failure errored:`, reconnectError);
+    }
+  }
+
+  /**
    * Cancel an active update process.
    * Kills any active child process, cleans temp directory, resets to idle.
    */
   async cancelUpdate(): Promise<void> {
-    // Capture the manager once for this operation (atomicity: #3962 Phase
-    // 4.2a — do not re-resolve per call site, the registry's primary could
-    // swap mid-operation).
-    const mgr = getPrimaryMeshtasticManager(sourceManagerRegistry) ?? fallbackManager;
+    // Capture the update's own manager once, BEFORE the status reset below
+    // clears the sourceId it is resolved from (atomicity: #3962 Phase 4.2a).
+    const mgr = this.resolveUpdateManager();
 
     // Capture step BEFORE resetting status so we know whether MM was
     // already disconnected from the node. Steps 'backup' onwards run after
@@ -579,7 +651,7 @@ export class FirmwareUpdateService {
       this.updateStatus({ message: 'Update cancelled' });
       logger.info('[FirmwareUpdateService] Update cancelled by user');
 
-      if (wasDisconnected) {
+      if (wasDisconnected && mgr) {
         logger.debug('[FirmwareUpdateService] Reconnecting MeshMonitor after cancel');
         try {
           await mgr.userReconnect();
@@ -606,11 +678,10 @@ export class FirmwareUpdateService {
    * The UI will show the disconnected/reconnecting state.
    */
   async completeUpdate(): Promise<void> {
-    // Capture the manager once for this disconnect→reconnect operation
-    // (atomicity: #3962 Phase 4.2a — a single capture ensures all three
-    // calls below target the same instance even if the registry's primary
-    // changes mid-operation).
-    const mgr = getPrimaryMeshtasticManager(sourceManagerRegistry) ?? fallbackManager;
+    // Capture the update's own manager once for this disconnect→reconnect
+    // operation, before the status reset clears its sourceId (atomicity:
+    // #3962 Phase 4.2a — all three calls below target the same instance).
+    const mgr = this.resolveUpdateManager();
 
     this.cleanupTempDir();
     // #5249: the upload has been flashed, so drop it. Keeping it would leave a
@@ -621,6 +692,7 @@ export class FirmwareUpdateService {
     this.status = createIdleStatus();
     this.updateStatus({});
     logger.info('[FirmwareUpdateService] Update completed — initiating full reconnect cycle');
+    if (!mgr) return;
 
     // Force disconnect (clears intervals, transport, etc.)
     await mgr.userDisconnect();
@@ -1011,9 +1083,29 @@ export class FirmwareUpdateService {
      * actually be fetched.
      */
     customUrl?: string;
+    /**
+     * Source whose node is being flashed (#5424 follow-up). The route has
+     * already checked it is a connected Meshtastic TCP source. Omitted only on
+     * a legacy single-source install.
+     */
+    sourceId?: string;
   }): void {
     if (this.status.state !== 'idle') {
       throw new Error('Cannot start preflight: state is not idle');
+    }
+
+    // #5423: a hw model shared by several release builds can't be matched to
+    // one binary. Refuse release/nightly updates; a custom URL or uploaded
+    // .bin is the operator's own pick of build, so those still proceed.
+    const ambiguous = getAmbiguousOtaModel(params.hwModel);
+    const operatorPickedBuild = Boolean(params.customUrl) || Boolean(params.useStagedUpload);
+    if (ambiguous && !operatorPickedBuild) {
+      throw new OtaPreflightError(
+        'OTA_AMBIGUOUS_BOARD',
+        `${getHardwareDisplayName(params.hwModel)} is shared by several firmware builds ` +
+          `(${ambiguous.builds.join(', ')}); MeshMonitor can't tell which one this node runs. ` +
+          `Flash it manually, or choose the build yourself with a custom firmware URL or an uploaded .bin.`
+      );
     }
 
     const boardName = getBoardName(params.hwModel);
@@ -1021,7 +1113,7 @@ export class FirmwareUpdateService {
       throw new Error(`Unknown hardware model ${params.hwModel}: cannot determine board name`);
     }
 
-    const platform = getPlatformForBoard(boardName);
+    const platform = ambiguous ? ambiguous.platform : getPlatformForBoard(boardName);
     if (!platform || !isOtaCapable(platform)) {
       throw new Error(
         `Board "${boardName}" (platform: ${platform ?? 'unknown'}) is not OTA capable`
@@ -1104,11 +1196,20 @@ export class FirmwareUpdateService {
 
     const displayName = getHardwareDisplayName(params.hwModel);
 
+    // A custom URL / upload is the operator's own pick of build, so the
+    // "we are about to flash the base build" warning doesn't apply there.
+    const warnings = operatorPickedBuild ? [] : getOtaSiblingWarnings(params.hwModel);
+    for (const w of warnings) {
+      logger.warn(`[FirmwareUpdateService] ${w.message}`);
+    }
+
     this.updateStatus({
       state: 'awaiting-confirm',
       step: 'preflight',
+      warnings,
       message: `Preflight complete. Ready to update ${displayName} from ${params.currentVersion} to ${params.targetVersion}`,
       targetVersion: params.targetVersion,
+      sourceId: params.sourceId,
       downloadUrl,
       preflightInfo: {
         currentVersion: params.currentVersion,
@@ -1141,7 +1242,15 @@ export class FirmwareUpdateService {
       message: 'Disconnecting from node for firmware update...',
     });
     logger.debug('[FirmwareUpdateService] Disconnecting MeshMonitor from node for CLI access');
-    await (getPrimaryMeshtasticManager(sourceManagerRegistry) ?? fallbackManager).userDisconnect();
+    const mgr = this.resolveUpdateManager();
+    if (!mgr) {
+      // The source vanished between preflight and confirm. Stop here: going on
+      // would run the CLI against a node whose TCP slot we never freed.
+      const message = `Source ${this.status.sourceId} is no longer available; cannot disconnect it for the update.`;
+      this.updateStatus({ state: 'error', step: 'backup', message, error: message });
+      throw new Error(message);
+    }
+    await mgr.userDisconnect();
     this.appendLog('Disconnected from node.');
     logger.debug('[FirmwareUpdateService] MeshMonitor disconnected from node');
   }
@@ -1163,7 +1272,10 @@ export class FirmwareUpdateService {
 
       // Wait for the firmware to release its TCP slot from the prior
       // MeshMonitor connection — otherwise the CLI silently hangs on connect.
-      await this.waitForNodeTcpReady(gatewayIp);
+      // Probe the parsed host/port — `gatewayIp` may carry the source's custom
+      // TCP port as `host:port` (#5424), which is not a valid socket host.
+      const gw = parseOtaGateway(gatewayIp);
+      await this.waitForNodeTcpReady(gw.host, gw.port);
 
       const result = await this.runCliCommand('meshtastic', [
         '--host', gatewayIp,
@@ -1209,8 +1321,7 @@ export class FirmwareUpdateService {
         error: message,
       });
       // Reconnect on failure so MeshMonitor isn't left disconnected
-      logger.debug('[FirmwareUpdateService] Reconnecting MeshMonitor after backup failure');
-      await (getPrimaryMeshtasticManager(sourceManagerRegistry) ?? fallbackManager).userReconnect();
+      await this.reconnectAfterFailure(this.resolveUpdateManager(), 'backup');
       throw error;
     }
   }
@@ -1376,12 +1487,7 @@ export class FirmwareUpdateService {
       // Reconnect on failure so MeshMonitor isn't left disconnected. Backup
       // already disconnected the node — without this, the user has to wait
       // for the 60s auto-reconnect timer or manually reconnect.
-      logger.debug('[FirmwareUpdateService] Reconnecting MeshMonitor after download failure');
-      try {
-        await (getPrimaryMeshtasticManager(sourceManagerRegistry) ?? fallbackManager).userReconnect();
-      } catch (reconnectError) {
-        logger.error('[FirmwareUpdateService] Reconnect after download failure errored:', reconnectError);
-      }
+      await this.reconnectAfterFailure(this.resolveUpdateManager(), 'download');
       throw error;
     }
   }
@@ -1459,7 +1565,10 @@ export class FirmwareUpdateService {
         }
       }
 
-      const extractedFiles = fs.readdirSync(extractDir);
+      // Recursive: some Meshtastic release zips nest per-platform binaries
+      // under a subdirectory (e.g. `esp32s3/firmware-heltec-v4-...bin`), and a
+      // top-level-only listing would silently miss them (#5402).
+      const extractedFiles = fs.readdirSync(extractDir, { recursive: true }) as string[];
       const { matched, rejected } = this.findFirmwareBinary(extractedFiles, boardName, version);
 
       if (!matched) {
@@ -1491,12 +1600,7 @@ export class FirmwareUpdateService {
         error: message,
       });
       // Reconnect on failure — node is still disconnected from the backup step.
-      logger.debug('[FirmwareUpdateService] Reconnecting MeshMonitor after extract failure');
-      try {
-        await (getPrimaryMeshtasticManager(sourceManagerRegistry) ?? fallbackManager).userReconnect();
-      } catch (reconnectError) {
-        logger.error('[FirmwareUpdateService] Reconnect after extract failure errored:', reconnectError);
-      }
+      await this.reconnectAfterFailure(this.resolveUpdateManager(), 'extract');
       throw error;
     }
   }
@@ -1507,8 +1611,9 @@ export class FirmwareUpdateService {
   async executeFlash(gatewayIp: string, firmwarePath: string): Promise<void> {
     // Capture once for this operation (atomicity: #3962 Phase 4.2a — the
     // success path and the failure path below are mutually exclusive but
-    // both must target the same manager instance resolved at entry).
-    const mgr = getPrimaryMeshtasticManager(sourceManagerRegistry) ?? fallbackManager;
+    // both must target the same manager instance resolved at entry). It is
+    // the update's own source, never the primary (#5424 follow-up).
+    const mgr = this.resolveUpdateManager();
 
     this.updateStatus({
       state: 'in-progress',
@@ -1517,7 +1622,7 @@ export class FirmwareUpdateService {
       progress: 0,
     });
 
-    const { host, port } = parseGateway(gatewayIp);
+    const { host, port } = parseOtaGateway(gatewayIp);
     try {
       await this.waitForNodeReady(host, port);
       this.appendLog(`Node ${host}:${port} is accepting connections — starting OTA.`);
@@ -1532,7 +1637,7 @@ export class FirmwareUpdateService {
       });
       logger.error(`[FirmwareUpdateService] Readiness check failed before OTA: ${message}`);
       logger.debug('[FirmwareUpdateService] Reconnecting MeshMonitor after readiness failure');
-      await mgr.userReconnect();
+      await mgr?.userReconnect();
       throw new Error(`Node readiness check failed: ${message}`);
     }
 
@@ -1718,15 +1823,15 @@ export class FirmwareUpdateService {
       });
 
       // The device just rebooted into new firmware — it takes ~10–30s to come
-      // back on :4403. Reconnecting before the port is open triggers the TCP
+      // back on its API port. Reconnecting before the port is open triggers the TCP
       // transport's auto-reconnect loop which races with later reconnect calls
       // (e.g. from completeUpdate) and leaves the source in a "connected but
       // no config" limbo where handleConnected fires on a torn-down transport.
       // Poll the API port ourselves first, then reconnect synchronously once.
-      const nodeHost = parseGateway(gatewayIp).host;
+      // Wait on the source's configured API port, not a hard-coded 4403 (#5424).
       logger.debug('[FirmwareUpdateService] OTA flash completed — waiting for node to finish reboot before reconnecting');
       try {
-        await this.waitForNodeReady(nodeHost, DEFAULT_MESHTASTIC_TCP_PORT, 120_000);
+        await this.waitForNodeReady(host, port, 120_000);
         this.appendLog('Node is back online. Reconnecting MeshMonitor...');
       } catch (err) {
         const m = err instanceof Error ? err.message : String(err);
@@ -1734,8 +1839,10 @@ export class FirmwareUpdateService {
         logger.warn(`[FirmwareUpdateService] Post-flash reboot wait timed out: ${m}`);
       }
 
-      await mgr.userReconnect();
-      this.appendLog('Reconnected to node.');
+      if (mgr) {
+        await mgr.userReconnect();
+        this.appendLog('Reconnected to node.');
+      }
 
       this.updateStatus({
         state: 'awaiting-confirm',
@@ -1759,11 +1866,11 @@ export class FirmwareUpdateService {
       // race we're explicitly trying to avoid.
       logger.debug('[FirmwareUpdateService] Reconnecting MeshMonitor after flash failure');
       try {
-        await this.waitForNodeReady(parseGateway(gatewayIp).host, DEFAULT_MESHTASTIC_TCP_PORT, 30_000);
+        await this.waitForNodeReady(host, port, 30_000);
       } catch {
         // Best-effort — reconnect anyway and let the transport's retry handle it.
       }
-      await mgr.userReconnect();
+      await mgr?.userReconnect();
       throw error;
     } finally {
       // Only clean up temp dir on success — keep it for retry on failure
@@ -1792,14 +1899,15 @@ export class FirmwareUpdateService {
   ): Promise<string> {
     // Capture once for this operation (atomicity: #3962 Phase 4.2a — the
     // polling loop, the CLI-fallback disconnect, and the finally-block
-    // reconnect must all target the same manager instance resolved at entry).
-    const mgr = getPrimaryMeshtasticManager(sourceManagerRegistry) ?? fallbackManager;
+    // reconnect must all target the same manager instance resolved at entry),
+    // the update's own source rather than the primary (#5424 follow-up).
+    const mgr = this.resolveUpdateManager();
     const timeoutMs = opts?.timeoutMs ?? 30_000;
     const intervalMs = opts?.intervalMs ?? 500;
     const stale = opts?.staleVersion ?? '';
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const v = mgr.getLocalNodeInfo()?.firmwareVersion;
+      const v = mgr?.getLocalNodeInfo()?.firmwareVersion;
       if (v && v !== stale) return v;
       await new Promise((r) => setTimeout(r, intervalMs));
     }
@@ -1807,14 +1915,20 @@ export class FirmwareUpdateService {
     // of the post-OTA `@meshtastic/js` reconnect flap). Fall back to the
     // meshtastic CLI to read the version straight from the node — this is the
     // same path we use elsewhere and is independent of MM's transport state.
-    const fallback = mgr.getLocalNodeInfo()?.firmwareVersion ?? '';
+    const fallback = mgr?.getLocalNodeInfo()?.firmwareVersion ?? '';
     if (fallback && fallback !== stale) return fallback;
     if (!opts?.gatewayIp) return fallback;
+    if (!mgr) {
+      // resolveUpdateManager already warned. The CLI read below still works;
+      // there is just no MeshMonitor connection to release or restore.
+      logger.debug('[FirmwareUpdateService] Verify CLI fallback runs without a manager for the update source');
+    }
     try {
       logger.debug('[FirmwareUpdateService] Verify wait expired — falling back to CLI to read firmware version directly');
       // Temporarily release MM's TCP slot so the CLI can connect cleanly.
-      await mgr.userDisconnect().catch(() => { /* best-effort */ });
-      await this.waitForNodeTcpReady(opts.gatewayIp).catch(() => { /* best-effort */ });
+      await mgr?.userDisconnect().catch(() => { /* best-effort */ });
+      const gw = parseOtaGateway(opts.gatewayIp);
+      await this.waitForNodeTcpReady(gw.host, gw.port).catch(() => { /* best-effort */ });
       // Post-OTA, the node passes the TCP probe but its meshtastic protocol
       // layer may still be initializing — the first --info attempt often times
       // out or returns partial JSON. Retry up to 3 times with backoff, and log
@@ -1849,7 +1963,7 @@ export class FirmwareUpdateService {
       return fallback;
     } finally {
       // Hand the TCP slot back to MM so the rest of the app stays connected.
-      mgr.userReconnect().catch((e) =>
+      mgr?.userReconnect().catch((e) =>
         logger.warn(`[FirmwareUpdateService] userReconnect after CLI fallback failed: ${e instanceof Error ? e.message : String(e)}`)
       );
     }

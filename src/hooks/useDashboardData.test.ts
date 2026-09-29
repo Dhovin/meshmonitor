@@ -247,6 +247,208 @@ describe('mergeUnifiedSourceData', () => {
     expect((merged.nodes[0] as any).lastHeard).toBe(5000);
   });
 
+  it('carries altitude + aircraft fields from the SAME record as the chosen position (#5364/#5365)', () => {
+    // The freshest record has a position but no altitude/classification; an
+    // older record has both a position AND the classification. Both fields
+    // must come from the record whose position was actually chosen, not be
+    // spliced together from two different records.
+    const merged = mergeUnifiedSourceData([
+      {
+        nodes: [
+          {
+            nodeNum: 300,
+            lastHeard: 9000,
+            longName: 'Plane',
+            latitude: 35.0,
+            longitude: -80.0,
+            // No altitude/likelyAircraft on this fresher record.
+          },
+        ],
+        traceroutes: [],
+        neighborInfo: [],
+        channels: [],
+      },
+      {
+        nodes: [
+          {
+            nodeNum: 300,
+            lastHeard: 1000,
+            longName: 'Plane',
+            latitude: 35.5,
+            longitude: -80.5,
+            altitude: 3200,
+            likelyAircraft: true,
+            aircraftBasis: 'agl',
+            groundElevation: 200,
+            heightAboveGround: 3000,
+            aircraftAgedOutAt: 1_700_000_000_000,
+            aircraftFixedAt: 1_700_000_100_000,
+          },
+        ],
+        traceroutes: [],
+        neighborInfo: [],
+        channels: [],
+      },
+    ]);
+    // pickPositionRecord has no positionTimestamp to rank by here, so it falls
+    // back to newest-lastHeard among candidates with a real fix — both do —
+    // meaning the freshest (9000) record's position wins, and its (absent)
+    // altitude/aircraft fields must NOT be back-filled from the older record.
+    const node = merged.nodes[0] as any;
+    expect(node.latitude).toBe(35.0);
+    expect(node.altitude).toBeNull();
+    expect(node.likelyAircraft).toBeNull();
+    expect(node.aircraftBasis).toBeNull();
+    expect(node.groundElevation).toBeNull();
+    expect(node.heightAboveGround).toBeNull();
+    // Phase 2 marks follow the same record (#5364/#5365).
+    expect(node.aircraftAgedOutAt).toBeNull();
+    expect(node.aircraftFixedAt).toBeNull();
+  });
+
+  it('carries the sign-flip flag and reported pair only from the chosen record (#5363)', () => {
+    const bundle = (nodes: unknown[]) => ({ nodes, traceroutes: [], neighborInfo: [], channels: [] });
+    // Fresher record (A) was corrected; older record (B) is uncorrected.
+    const corrected = mergeUnifiedSourceData([
+      bundle([{
+        nodeNum: 400, lastHeard: 9000, latitude: 27.9, longitude: -82.5,
+        positionSignFlipCorrected: true, reportedLatitude: 27.9, reportedLongitude: 82.5,
+      }]),
+      bundle([{ nodeNum: 400, lastHeard: 1000, latitude: 27.9, longitude: 82.5 }]),
+    ]).nodes[0] as any;
+    expect(corrected.longitude).toBe(-82.5);
+    expect(corrected.positionSignFlipCorrected).toBe(true);
+    expect(corrected.reportedLongitude).toBe(82.5);
+
+    // Reverse: the chosen (fresher) record is uncorrected, so the flag from
+    // the older record must not be spliced onto it.
+    const plain = mergeUnifiedSourceData([
+      bundle([{ nodeNum: 401, lastHeard: 9000, latitude: 27.9, longitude: 82.5 }]),
+      bundle([{
+        nodeNum: 401, lastHeard: 1000, latitude: 27.9, longitude: -82.5,
+        positionSignFlipCorrected: true, reportedLatitude: 27.9, reportedLongitude: 82.5,
+      }]),
+    ]).nodes[0] as any;
+    expect(plain.longitude).toBe(82.5);
+    expect(plain.positionSignFlipCorrected).toBeUndefined();
+    expect(plain.reportedLongitude).toBeUndefined();
+  });
+
+  it('carries altitude + aircraft fields through when the classified record IS the chosen position', () => {
+    const merged = mergeUnifiedSourceData([
+      {
+        nodes: [
+          {
+            nodeNum: 301,
+            lastHeard: 9000,
+            longName: 'Plane',
+            latitude: 35.0,
+            longitude: -80.0,
+            altitude: 3200,
+            likelyAircraft: true,
+            aircraftBasis: 'agl',
+            groundElevation: 200,
+            heightAboveGround: 3000,
+            aircraftAgedOutAt: 1_700_000_000_000,
+            aircraftFixedAt: 1_700_000_100_000,
+          },
+        ],
+        traceroutes: [],
+        neighborInfo: [],
+        channels: [],
+      },
+    ]);
+    const node = merged.nodes[0] as any;
+    expect(node.altitude).toBe(3200);
+    expect(node.likelyAircraft).toBe(true);
+    expect(node.aircraftBasis).toBe('agl');
+    expect(node.groundElevation).toBe(200);
+    expect(node.heightAboveGround).toBe(3000);
+    expect(node.aircraftAgedOutAt).toBe(1_700_000_000_000);
+    expect(node.aircraftFixedAt).toBe(1_700_000_100_000);
+  });
+
+  it('does not let chatter on a coarse record promote its position (#5292)', () => {
+    // PARC, as reported: two sources hold the SAME physical spot at different
+    // precisions (14-bit inside the 13-bit grid cell). The coarse source has
+    // the newer lastHeard because it heard unrelated traffic, but its position
+    // observation is the same event. The unified marker must not jump to the
+    // coarser cell.
+    const merged = mergeUnifiedSourceData([
+      {
+        nodes: [
+          {
+            nodeNum: 300,
+            lastHeard: 9000,
+            positionTimestamp: 1_760_000_000_000 - 5_000,
+            positionPrecisionBits: 13,
+            position: { latitude: 44.2761216, longitude: -78.3024128 },
+          },
+        ],
+        traceroutes: [],
+        neighborInfo: [],
+        channels: [],
+      },
+      {
+        nodes: [
+          {
+            nodeNum: 300,
+            lastHeard: 1000,
+            positionTimestamp: 1_760_000_000_000,
+            positionPrecisionBits: 14,
+            position: { latitude: 44.28923, longitude: -78.31552 },
+          },
+        ],
+        traceroutes: [],
+        neighborInfo: [],
+        channels: [],
+      },
+    ]);
+    const n = merged.nodes[0] as any;
+    expect(n.position).toEqual({ latitude: 44.28923, longitude: -78.31552 });
+    expect(n.positionPrecisionBits).toBe(14);
+    // lastHeard still reports the freshest contact across sources.
+    expect(n.lastHeard).toBe(9000);
+  });
+
+  it('still takes a genuinely newer fix even when it is coarser (#5292)', () => {
+    // The other half of the rule: a node that moved and was re-heard only by
+    // the coarse source must not keep rendering its older, finer position.
+    const merged = mergeUnifiedSourceData([
+      {
+        nodes: [
+          {
+            nodeNum: 301,
+            lastHeard: 1000,
+            positionTimestamp: 1_760_000_000_000,
+            positionPrecisionBits: 16,
+            position: { latitude: 35.0, longitude: -80.0 },
+          },
+        ],
+        traceroutes: [],
+        neighborInfo: [],
+        channels: [],
+      },
+      {
+        nodes: [
+          {
+            nodeNum: 301,
+            lastHeard: 2000,
+            positionTimestamp: 1_760_000_000_000 + 3_600_000,
+            positionPrecisionBits: 13,
+            position: { latitude: 36.0, longitude: -81.0 },
+          },
+        ],
+        traceroutes: [],
+        neighborInfo: [],
+        channels: [],
+      },
+    ]);
+    const n = merged.nodes[0] as any;
+    expect(n.position).toEqual({ latitude: 36.0, longitude: -81.0 });
+    expect(n.positionPrecisionBits).toBe(13);
+  });
+
   it('ignores a Null-Island position from the freshest source and uses a real one (#02ecd5e0 Jupiter Dad)', () => {
     // Two MQTT sources report the node most recently with the 2^15 garbage
     // default (0.0032768, 0.0032768) — just outside the old 0.001 radius — while

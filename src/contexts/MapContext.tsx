@@ -2,6 +2,13 @@ import React, { createContext, useContext, useState, useEffect, useMemo, ReactNo
 import { DbTraceroute, DbNeighborInfo } from '../services/database';
 import api from '../services/api';
 import { useCsrf } from './CsrfContext';
+import {
+  isAircraftDisplayMode,
+  DEFAULT_AIRCRAFT_DISPLAY_MODE,
+  type AircraftDisplayMode,
+} from '../utils/aircraftClassification';
+import { DEFAULT_AIRCRAFT_TRAIL_HOURS, clampAircraftTrailHours } from '../components/map/aircraftTrails';
+import { readShowAgedOutAircraft, writeShowAgedOutAircraft } from '../components/map/agedOutAircraft';
 
 export interface PositionHistoryItem {
   latitude: number;
@@ -16,6 +23,9 @@ export interface PositionHistoryItem {
   snr?: number;
   hopStart?: number;
   hopLimit?: number;
+  // Tracked-asset trails (#5354 Phase 2): the first fix after a gap of more
+  // than 30 min. The trail is not drawn from the previous fix to this one.
+  segmentStart?: boolean;
 }
 
 export interface EnrichedNeighborInfo extends DbNeighborInfo {
@@ -69,6 +79,32 @@ interface MapContextType {
   spreadNodes: boolean;
   setSpreadNodes: (value: boolean) => void;
   /**
+   * Likely-aircraft display mode for the map (#5364/#5365 Phase 1 WP4):
+   * 'show' (no badge, no filtering), 'mark' (badge only, default), or 'hide'
+   * (marker suppressed, except favourites). Persisted server-side via
+   * `user_map_preferences.aircraft_display_mode`, with a localStorage mirror
+   * for anonymous viewers.
+   */
+  aircraftDisplayMode: AircraftDisplayMode;
+  setAircraftDisplayMode: (mode: AircraftDisplayMode) => void;
+  /**
+   * "Show aged-out" (#5364/#5365 Phase 2): draw likely aircraft the age-out
+   * sweep ignored (`isIgnored && aircraftAgedOutAt != null`), dimmed. Per
+   * viewer, localStorage only.
+   */
+  showAgedOutAircraft: boolean;
+  setShowAgedOutAircraft: (value: boolean) => void;
+  /**
+   * Flight trails for visible likely aircraft (#5364/#5365 Phase 3, D4). Off
+   * by default; persisted per user in
+   * `user_map_preferences.show_aircraft_trails`.
+   */
+  showAircraftTrails: boolean;
+  setShowAircraftTrails: (value: boolean) => void;
+  /** Flight trail lookback in hours, 1..168 (default 6). */
+  aircraftTrailHours: number;
+  setAircraftTrailHours: (hours: number) => void;
+  /**
    * A "centre the map on this node" request, by nodeNum (#5177). Distinct from
    * `mapCenterTarget`, which is a raw lat/lng: a low-precision node's MARKER is
    * drawn at an offset inside its accuracy cell, and only the map surface knows
@@ -113,6 +149,12 @@ interface MapContextType {
   setNeighborInfo: (info: EnrichedNeighborInfo[]) => void;
   positionHistory: PositionHistoryItem[];
   setPositionHistory: (history: PositionHistoryItem[]) => void;
+  /**
+   * Tracked asset (#5354 Phase 2): distinct fixes in the window before the
+   * server thinned them. null for a non-asset trail.
+   */
+  positionHistoryTotalFixes: number | null;
+  setPositionHistoryTotalFixes: (total: number | null) => void;
   selectedNodeId: string | null;
   setSelectedNodeId: (id: string | null) => void;
   positionHistoryHours: number | null;
@@ -156,6 +198,21 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
   const [unreadIndicatorEnabled, setUnreadIndicatorEnabledState] = useState<boolean>(true);
   // #5177: default true = preserve the existing within-cell offset behaviour.
   const [spreadNodes, setSpreadNodesState] = useState<boolean>(true);
+  // #5364/#5365 Phase 1 WP4: localStorage-first (validated), else 'mark',
+  // overridden by the server preference once it loads (see the loader below).
+  const [aircraftDisplayMode, setAircraftDisplayModeState] = useState<AircraftDisplayMode>(() => {
+    try {
+      const saved = localStorage.getItem('aircraftDisplayMode');
+      return isAircraftDisplayMode(saved) ? saved : DEFAULT_AIRCRAFT_DISPLAY_MODE;
+    } catch {
+      return DEFAULT_AIRCRAFT_DISPLAY_MODE;
+    }
+  });
+  // #5364/#5365 Phase 2: per-viewer "Show aged-out" map toggle (localStorage only).
+  const [showAgedOutAircraft, setShowAgedOutAircraftState] = useState<boolean>(readShowAgedOutAircraft);
+  // #5364/#5365 Phase 3: flight trails, server-persisted (off, 6 h by default).
+  const [showAircraftTrails, setShowAircraftTrailsState] = useState<boolean>(false);
+  const [aircraftTrailHours, setAircraftTrailHoursState] = useState<number>(DEFAULT_AIRCRAFT_TRAIL_HOURS);
   // #5177: transient (not persisted) cross-tab centre-on-node request.
   const [pendingCenterNodeNum, setPendingCenterNodeNum] = useState<number | null>(null);
   const [showMeshCoreNodes, setShowMeshCoreNodesState] = useState<boolean>(true);
@@ -198,6 +255,7 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
   const [traceroutes, setTraceroutes] = useState<DbTraceroute[]>([]);
   const [neighborInfo, setNeighborInfo] = useState<EnrichedNeighborInfo[]>([]);
   const [positionHistory, setPositionHistory] = useState<PositionHistoryItem[]>([]);
+  const [positionHistoryTotalFixes, setPositionHistoryTotalFixes] = useState<number | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [positionHistoryHours, setPositionHistoryHoursState] = useState<number | null>(null);
   const [mapMaxAgeHours, setMapMaxAgeHoursState] = useState<number | null>(null);
@@ -250,6 +308,35 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
   // eslint-disable-next-line react-hooks/exhaustive-deps -- #5177 same temporal-dead-zone reason as the sibling setters: `savePreferenceToServer` is declared below this callback
   }, []);
 
+  const setAircraftDisplayMode = React.useCallback((value: AircraftDisplayMode) => {
+    setAircraftDisplayModeState(value);
+    try {
+      localStorage.setItem('aircraftDisplayMode', value);
+    } catch {
+      // best-effort mirror only; the server preference (below) is authoritative
+    }
+    void savePreferenceToServer({ aircraftDisplayMode: value });
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- #5365 same temporal-dead-zone reason as the sibling setters: `savePreferenceToServer` is declared below this callback
+  }, []);
+
+  const setShowAgedOutAircraft = React.useCallback((value: boolean) => {
+    setShowAgedOutAircraftState(value);
+    writeShowAgedOutAircraft(value);
+  }, []);
+
+  const setShowAircraftTrails = React.useCallback((value: boolean) => {
+    setShowAircraftTrailsState(value);
+    void savePreferenceToServer({ showAircraftTrails: value });
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- #5365 same temporal-dead-zone reason as the sibling setters: `savePreferenceToServer` is declared below this callback
+  }, []);
+
+  const setAircraftTrailHours = React.useCallback((hours: number) => {
+    const clamped = clampAircraftTrailHours(hours);
+    setAircraftTrailHoursState(clamped);
+    void savePreferenceToServer({ aircraftTrailHours: clamped });
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- #5365 same temporal-dead-zone reason as the sibling setters: `savePreferenceToServer` is declared below this callback
+  }, []);
+
   const setShowRfNodes = React.useCallback((value: boolean) => {
     setShowRfNodesState(value);
     void savePreferenceToServer({ showRfNodes: value });
@@ -298,7 +385,7 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
   }, []);
 
   // Helper function to save preference to server
-  const savePreferenceToServer = React.useCallback(async (preference: Record<string, boolean | number | null>, isRetry = false) => {
+  const savePreferenceToServer = React.useCallback(async (preference: Record<string, boolean | number | string | null>, isRetry = false) => {
     try {
       const baseUrl = await api.getBaseUrl();
       const csrfToken = getCsrfToken();
@@ -434,6 +521,17 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
             if (preferences.mapMaxAgeHours !== undefined) {
               setMapMaxAgeHoursState(preferences.mapMaxAgeHours);
             }
+            // Server preference wins over localStorage/default once it loads;
+            // an invalid stored value is ignored (keeps whatever local state has).
+            if (isAircraftDisplayMode(preferences.aircraftDisplayMode)) {
+              setAircraftDisplayModeState(preferences.aircraftDisplayMode);
+            }
+            if (typeof preferences.showAircraftTrails === 'boolean') {
+              setShowAircraftTrailsState(preferences.showAircraftTrails);
+            }
+            if (typeof preferences.aircraftTrailHours === 'number') {
+              setAircraftTrailHoursState(clampAircraftTrailHours(preferences.aircraftTrailHours));
+            }
           }
           // If preferences is null (anonymous user), initial defaults are already set
         }
@@ -527,12 +625,22 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
     setNeighborInfo,
     positionHistory,
     setPositionHistory,
+    positionHistoryTotalFixes,
+    setPositionHistoryTotalFixes,
     selectedNodeId,
     setSelectedNodeId,
     positionHistoryHours,
     setPositionHistoryHours,
     mapMaxAgeHours,
     setMapMaxAgeHours,
+    aircraftDisplayMode,
+    setAircraftDisplayMode,
+    showAgedOutAircraft,
+    setShowAgedOutAircraft,
+    showAircraftTrails,
+    setShowAircraftTrails,
+    aircraftTrailHours,
+    setAircraftTrailHours,
   }), [
     showPaths, setShowPaths,
     showNeighborInfo, setShowNeighborInfo,
@@ -560,9 +668,14 @@ export const MapProvider: React.FC<MapProviderProps> = ({ children }) => {
     traceroutes, setTraceroutes,
     neighborInfo, setNeighborInfo,
     positionHistory, setPositionHistory,
+    positionHistoryTotalFixes, setPositionHistoryTotalFixes,
     selectedNodeId, setSelectedNodeId,
     positionHistoryHours, setPositionHistoryHours,
     mapMaxAgeHours, setMapMaxAgeHours,
+    aircraftDisplayMode, setAircraftDisplayMode,
+    showAgedOutAircraft, setShowAgedOutAircraft,
+    showAircraftTrails, setShowAircraftTrails,
+    aircraftTrailHours, setAircraftTrailHours,
   ]);
 
   return (

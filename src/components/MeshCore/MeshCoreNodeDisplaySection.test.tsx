@@ -48,12 +48,12 @@ const MESHTASTIC_ONLY_IDS = [
 // ---------------------------------------------------------------------------
 // Mocks
 // ---------------------------------------------------------------------------
-vi.mock('react-i18next', () => ({
-  useTranslation: () => ({
-    t: (key: string, fallback?: string | Record<string, unknown>) =>
-      typeof fallback === 'string' ? fallback : key,
-  }),
-}));
+vi.mock('react-i18next', async () => {
+  const { createReactI18nextMock } = await import('../../test/mockI18n');
+  const t = (key: string, fallback?: string | Record<string, unknown>) =>
+    typeof fallback === 'string' ? fallback : key;
+  return createReactI18nextMock(t);
+});
 
 const { hasPermissionMock } = vi.hoisted(() => ({ hasPermissionMock: vi.fn() }));
 vi.mock('../../contexts/AuthContext', () => ({
@@ -91,6 +91,11 @@ const { writeNodeDisplayLocalMock } = vi.hoisted(() => ({
 }));
 vi.mock('../../utils/nodeDisplayStorage', () => ({
   writeNodeDisplayLocal: writeNodeDisplayLocalMock,
+}));
+
+// #5363: the section reads the user's distance unit for the sign-flip range.
+vi.mock('../../contexts/SettingsContext', () => ({
+  useSettingsOptional: () => ({ distanceUnit: 'km' }),
 }));
 
 vi.mock('../../services/api', () => ({
@@ -201,7 +206,7 @@ describe('MeshCoreNodeDisplaySection', () => {
     await waitFor(() => expect(saveBarCapture.current?.hasChanges).toBe(false));
   });
 
-  it('(6) onSave() POSTs to /api/settings?sourceId=<id> with exactly the five keys, as strings', async () => {
+  it('(6) onSave() POSTs to /api/settings?sourceId=<id> with exactly the five keys plus the four sign-flip keys (#5363), as strings', async () => {
     renderSection(makeQueryClient());
     await waitForHydration();
 
@@ -218,10 +223,41 @@ describe('MeshCoreNodeDisplaySection', () => {
       'inactiveNodeThresholdHours',
       'maxInfraNodeAgeHours',
       'maxNodeAgeHours',
+      'signFlipCorrectionEnabled',
+      'signFlipCorrectionRangeKm',
+      'signFlipReferenceLatitude',
+      'signFlipReferenceLongitude',
     ]);
     for (const v of Object.values(body)) {
       expect(typeof v).toBe('string');
     }
+  });
+
+  it('(6c) hydrates the sign-flip settings (#5363) and saves an edit per source', async () => {
+    vi.mocked(apiService.get).mockResolvedValue({
+      ...SERVED_VALUES,
+      signFlipCorrectionEnabled: 'true',
+      signFlipCorrectionRangeKm: '250',
+    });
+    renderSection(makeQueryClient());
+    await waitForHydration();
+    const toggle = document.getElementById('signFlipCorrectionEnabled') as HTMLInputElement;
+    await waitFor(() => expect(toggle.checked).toBe(true));
+    expect((document.getElementById('signFlipCorrectionRange') as HTMLInputElement).value).toBe('250');
+
+    fireEvent.change(document.getElementById('signFlipReferenceLatitude') as HTMLInputElement, { target: { value: '27.95' } });
+    fireEvent.change(document.getElementById('signFlipReferenceLongitude') as HTMLInputElement, { target: { value: '-82.46' } });
+    await waitFor(() => expect(saveBarCapture.current?.hasChanges).toBe(true));
+    await saveBarCapture.current!.onSave();
+
+    await waitFor(() => expect(csrfFetchMock).toHaveBeenCalled());
+    const body = JSON.parse(csrfFetchMock.mock.calls[0][1].body);
+    expect(body).toMatchObject({
+      signFlipCorrectionEnabled: 'true',
+      signFlipCorrectionRangeKm: '250',
+      signFlipReferenceLatitude: '27.95',
+      signFlipReferenceLongitude: '-82.46',
+    });
   });
 
   it('(6b) clearing a field does not produce NaN in the saved payload (#4433 review)', async () => {
@@ -289,6 +325,8 @@ describe('MeshCoreNodeDisplaySection', () => {
     for (const id of MESHCORE_KEYS) {
       expect((document.getElementById(id) as HTMLInputElement).disabled).toBe(true);
     }
+    // #5363: the sign-flip toggle is read-only too.
+    expect((document.getElementById('signFlipCorrectionEnabled') as HTMLInputElement).disabled).toBe(true);
     expect(hasPermissionMock).toHaveBeenCalledWith('settings', 'write', { sourceId: SOURCE_ID });
   });
 

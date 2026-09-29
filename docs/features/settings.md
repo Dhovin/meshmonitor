@@ -25,9 +25,13 @@ See [Multi-Source → Connection Types](/features/multi-source) for the full lis
 
 ## Node Display
 
-### Maximum Age of Active Nodes
+### Node list & map window
 
-**Description**: Controls which nodes appear in the Node List based on their last activity.
+**Description**: The default time window for the Nodes list and the map. Nodes not heard within it are hidden. The Nodes list header shows the active window (for example `Nodes (122) · Setting (last 24h)`, or `Setting (all)` at `0`). The map's **Map age filter** can narrow this window but never widen it.
+
+**Quick age filter**: the window picker in the Nodes list header lets you view a different window (last 24h, 3d, 7d, 30d, or all) without changing this setting. It overrides the setting for the Nodes list and its map, wider or narrower, and only for you: the choice is kept in your browser and never saved to the server. Pick **Setting** to go back. On MeshCore sources it replaces both the companion and the repeater/room server windows. Background jobs, the Messages tab, and the Dashboard map keep using this setting.
+
+*Formerly labeled "Maximum Age of Active Nodes".*
 
 **Range**: 0-168 hours (`0` = show all, no age cap)
 
@@ -36,6 +40,26 @@ See [Multi-Source → Connection Types](/features/multi-source) for the full lis
 **Effect**: Nodes that haven't been heard from in longer than this period will not appear in the Node List. This helps keep the list focused on currently active nodes in your mesh network. Setting the value to `0` disables the cap entirely so every node stays visible, useful for post-mortem review of a mesh you don't intend to prune.
 
 **Side Effects**: Setting this too low may cause frequently-active nodes to disappear from the list temporarily. Setting it too high (or `0`) may clutter the list with offline nodes.
+
+### Nodes list header
+
+![Nodes list header](/images/features/compact-node-list-header.png)
+
+The header holds the title, the age window picker, and one row of icon buttons. Hover over a button to see its tooltip.
+
+- **Filter** (filter icon, tooltip "Filter nodes"): opens the filter popup described below.
+- **Group by Role** (list icon, tooltip "Group nodes by role"): groups the list by device role. Each group has a header with a count. Click a header to collapse or expand its group. A summary bar shows how the nodes split across roles. Grouping applies to the nodes that pass your filters. Your browser remembers the choice.
+- **Add node from URL** (plus icon): see below. It appears when you view a single source.
+
+#### Add a node from a contact URL
+
+Paste a `https://meshtastic.org/v/#...` contact link, the kind [Share a Meshtastic Contact](#share-a-meshtastic-contact) creates, and MeshMonitor adds that node to the source. You can then message the node before it sends any packet. MeshMonitor sends nothing over the mesh.
+
+The row shows an **Imported** badge until the source hears the node. Importing a node the source already knows updates its name and key, and does not add the badge. You need write permission on **nodes** for that source.
+
+#### First Heard
+
+MeshMonitor records **First Heard** for each node on each source. It sets the value once, from the first believable reception, and never overwrites it. You see it in Node Details, in map popups, and in the node export. For nodes that existed before 4.16.2, the upgrade fills it with the earlier of the node's creation time and Last Heard.
 
 ### Hide Incomplete Nodes
 
@@ -159,7 +183,7 @@ See [Multi-Source → Connection Types](/features/multi-source) for the full lis
 
 **Description**: Filter nodes based on detected security issues, allowing you to focus on nodes with security problems or hide them from view.
 
-**Location**: Filter Modal popup (click "Filter" button in Nodes or Messages tab sidebar)
+**Location**: Filter Modal popup (click the filter icon, tooltip "Filter nodes", in the Nodes list header)
 
 **Filter Options**:
 - **All Nodes**: Show all nodes regardless of security status (default)
@@ -184,6 +208,65 @@ See [Multi-Source → Connection Types](/features/multi-source) for the full lis
 **Effect**: When "⚠️ Flagged Only" is selected, the node count updates to show "X/Total" format (e.g., "8/156 nodes"). This filter works alongside other filters (text search, device role, unknown nodes) and applies to both Nodes and Messages tabs.
 
 **Learn More**: See [Security Features](/features/security) for detailed information about security monitoring, detection methods, and best practices.
+
+### Likely-Aircraft Detection
+
+**Description**: Flags a node as a likely aircraft (plane, balloon, drone) when its reported altitude sits far above the ground at its position. Flagged nodes get a badge on the map (see [Map Features](/features/maps#map-features)) and can be excluded from Auto-Favorite (see [Automation → Auto Favorite](/features/automation#auto-favorite)).
+
+**Location**: Settings → Node Display, per source. Meshtastic sources only (including MQTT bridge/broker sources) — MeshCore does not report altitude the same way and is not classified.
+
+**Fields**:
+- **Detect likely aircraft** — turns classification on or off for this source. Enabled by default.
+- **Height above ground threshold (m)** — the main basis. A node is flagged when its reported altitude is more than this height above the terrain at its position, read from ground-elevation tiles. Default **500 m**, range 50–20000 m.
+- **Fallback: altitude above sea level (m)** — used only when terrain elevation is off, or the terrain sample is unavailable, for that node's position. Default **5000 m**, range 500–20000 m.
+
+**How it works**: The height-above-ground basis needs the same ground-elevation data as [Elevation / Terrain](#elevation-terrain-link-profile) — outbound tile fetches for classification only happen while that global setting is enabled. When it's off, or a fetch fails, classification silently falls back to the sea-level basis. A warning appears under the thresholds when terrain elevation is off, since only the fallback applies in that case.
+
+To avoid a node flapping in and out of the flag near the threshold, a small hysteresis band protects the *exit* only: once flagged, a node needs to drop back below the threshold by 10% (minimum 50 m) before it clears. Entering the flagged state still happens exactly at the threshold.
+
+**Effect**: Saving these settings recomputes existing nodes on this source immediately, from their already-stored altitude and ground elevation — no new tile fetches. Turning detection off clears the flag for every node on the source (the stored ground elevation itself is kept).
+
+#### Age-out and reclassify as fixed
+
+Aircraft pass through and do not come back, so their nodes pile up. Age-out cleans them up.
+
+**Fields** (same section, per source):
+- **Age out likely aircraft** — off by default. Needs detection on.
+- **Age out after (hours)** — a flagged node not heard for this long is aged out. Default **24**, range 6–168.
+- **Action** — **Ignore** (default) or **Delete**.
+  - **Ignore** puts the node on the [Ignored Nodes](/features/automation#ignored-nodes) list with the reason **Aged-out aircraft**. This happens in MeshMonitor's database only: nothing is sent to any radio. You can un-ignore it there, or with **Un-ignore Node** on its Node Details page. An aircraft you un-ignore by hand is not aged out again until it has been heard and then gone quiet once more.
+  - **Delete** removes the node and all its history, including positions. It cannot be undone.
+- **Last run** — when the sweep last ran on this source, and how many nodes it aged out, reclassified as fixed, and returned.
+
+**How it works**: A sweep runs about once an hour for each source. Favorites and the source's own node are never aged out, and a node that is already ignored for another reason is left alone. Saving settings or restarting MeshMonitor does not trigger a sweep.
+
+When an ignored aircraft sends a new live position, its ignore is lifted and it is classified again. This works on MQTT sources too. Manual and geo ignores are never lifted this way, and replayed or retained MQTT frames never lift an ignore.
+
+The same sweep also looks for nodes that were flagged but sit still: a flagged node heard in the last 24 hours with at least 3 position fixes, all within 200 m of each other, is **reclassified as fixed**. Its flag is cleared and it stays unflagged while it is within 1 km of that spot. If it moves further than 1 km, it is classified normally again. This check runs whenever detection is on, even with age-out off.
+
+## Sign-flipped Position Correction
+
+**Description**: Some operators type their coordinates without the minus sign, which puts the node on the other side of the globe. This setting shows such a node at its corrected point.
+
+**Location**: Settings → Node Display, per source (Meshtastic, MQTT, and MeshCore). Off by default.
+
+**Options**:
+- **Correct sign-flipped positions**: turns the correction on for this source.
+- **Range**: how close a mirror point must be. Default 500 km. Allowed: 10 to 2000 km.
+- **Reference point (optional)**: a latitude and longitude to measure from. Leave it blank to use the source's own node. An MQTT source has no node of its own, so it needs a reference point or nothing gets corrected.
+
+**How it works**: If a node sits outside the range but exactly one mirror of its position (latitude negated, longitude negated, or both) sits inside it, MeshMonitor shows the mirror point. If more than one mirror fits, or none, the node stays where it reported. Node Details then shows "Position auto-corrected (sign flip)" and the coordinates the node reported.
+
+**Stored data never changes.** The correction only affects what MeshMonitor displays and judges. While it is on, these features use the corrected point:
+- Distance-based auto-delete
+- MQTT geo-ignore
+- Automation geofences
+- Traceroute snapshots
+- MeshCore contacts
+
+::: warning Keep the range small
+A wide range can move a real far-away node, for example one heard over MQTT, whose mirror point happens to fall inside it.
+:::
 
 ## Node Details Block
 
@@ -402,6 +485,20 @@ separate from channel sharing, which uses Meshtastic's `/e/#` URL format.
 
 Raise the threshold if your nodes sit close together and you keep opening the wrong popup; lower it (or zero it) if you mostly view a sparse mesh and want one-click popups when zoomed out.
 
+When **Cluster overlapping markers** is on, this zoom also sets where clustering stops: below it, crowded markers group into numbered circles. A value of `0` turns off both the gate and clustering.
+
+**Location**: Settings → Map Settings
+
+### Cluster Overlapping Markers
+
+**Description**: Groups crowded map markers into one numbered circle while you are zoomed out below the Map Click Zoom Gate level. Clicking a circle zooms in until its markers split apart.
+
+**Default**: Enabled
+
+**Effect**: Turn it off to draw every marker at every zoom, as MeshMonitor did before clustering arrived. The Map Click Zoom Gate keeps working either way, so you can keep the zoom-in-first click behavior without the numbered circles, or drop both.
+
+Clustering makes large node sets much faster to draw. On a busy mesh, expect the map to feel slower with clustering off.
+
 **Location**: Settings → Map Settings
 
 ### Discard Invalid Positions
@@ -527,6 +624,17 @@ Description: Offline OpenStreetMap tiles via TileServer GL
 ::: tip Also powers the 3D terrain view (New in 4.14)
 This same elevation source drives Map Analysis's [3D terrain view](/features/map-analysis#3d-terrain-view). A **tile-template** URL (the default Terrarium source, or a custom one) works for both the 2D Link Profile chart and the 3D pitched-terrain map. A **JSON point API** source only supports the 2D Link Profile — there are no tiles to build a 3D surface from, so the 3D toggle stays disabled with an explanatory tooltip for that configuration (no fallback to the default tile source is attempted).
 :::
+
+## Flight matching (ADS-B) {#flight-matching-ads-b}
+
+**Description**: Looks up a node that becomes a [likely aircraft](#likely-aircraft-detection) on a free, public ADS-B feed and shows the flight in its popup and details. Admin-only, global (not per source); under **Settings → Flight matching (ADS-B)**, next to Elevation / Terrain. Off by default.
+
+**Fields**:
+- **Look up likely aircraft on a public ADS-B feed** — the on/off switch. Off means no outside calls at all.
+- **Feed** — **adsb.lol** (default, ODbL open data) or **adsb.fi** (personal, non-commercial use only). airplanes.live is not offered in this version.
+- **API key (optional)** — for adsb.lol's announced future key. Sent only when set; never shown to non-admins.
+
+At most two lookups per flagging, no packets over the mesh. See [Flight matching (ADS-B)](/features/maps#flight-matching-ads-b) for how matches are chosen and shown.
 
 ## Display Preferences
 
@@ -767,6 +875,14 @@ These actions are **irreversible** and can result in data loss. Use with extreme
 - The page will automatically refresh after purging
 
 **When to use**: When your database has grown too large or you want to start fresh telemetry collection.
+
+### Clean Telemetry Outliers
+
+**Description**: Removes bad readings for one metric and keeps the rest of the history. Admin-only.
+
+**Location**: Settings → Danger Zone → **Clean outliers…** (sweeps every node on one source), or **Clean outliers…** in a telemetry chart's menu (checks that one node). See [Telemetry outliers](/features/telemetry-widgets#clean-telemetry-outliers).
+
+**Effect**: Nothing is deleted until you review a preview and confirm. Each purge is written to the audit log.
 
 ### Purge Messages
 

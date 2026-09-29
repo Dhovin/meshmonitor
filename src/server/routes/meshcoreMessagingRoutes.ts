@@ -13,11 +13,14 @@
 import { Router, Request, Response } from 'express';
 import databaseService from '../../services/database.js';
 import { logger } from '../../utils/logger.js';
+import { meshcoreMessageFilter } from '../services/meshcoreMessageFilter.js';
 import { requireAuth, optionalAuth, requirePermission } from '../auth/authMiddleware.js';
 import { meshcoreDeviceLimiter, messageLimiter } from '../middleware/rateLimiters.js';
 import { getMeshCoreCredentialStore } from '../services/meshcoreCredentialStore.js';
-import { managerFor, VALIDATION, isValidPublicKey, isValidMessage, auditMeshcoreEvent,
-  requireMeshcoreChannelAccess, canAccessMeshcoreChannel, requireMeshcoreTx, failIfTxDisabled } from './meshcoreRouteShared.js';
+import { failContactNotOnDevice, managerFor, VALIDATION, isValidPublicKey, isValidMessage, auditMeshcoreEvent,
+  requireMeshcoreChannelAccess, canAccessMeshcoreChannel, requireMeshcoreTx, failIfTxDisabled,
+  startTrackedLogin, respondLoginCancelled } from './meshcoreRouteShared.js';
+import type { MeshCoreLoginRetryOutcome } from '../meshcoreManager.js';
 
 const router = Router({ mergeParams: true });
 
@@ -36,10 +39,13 @@ router.get('/messages', optionalAuth(), requirePermission('messages', 'read', { 
     }
     const sinceRaw = req.query.since as string | undefined;
     const since = sinceRaw ? parseInt(sinceRaw, 10) : undefined;
-    let messages = managerFor(req, res).getRecentMessages(limit);
+    const manager = managerFor(req, res);
+    let messages = manager.getRecentMessages(limit);
     if (since !== undefined && !isNaN(since)) {
       messages = messages.filter(m => m.timestamp > since);
     }
+    // Ignore / Block (#5408): computed from the current lists at read time.
+    messages = meshcoreMessageFilter.annotate(req.params.id, messages, manager.getLocalNode?.()?.publicKey);
     res.json({
       success: true,
       data: messages,
@@ -83,12 +89,17 @@ router.get('/messages/channel/:idx', optionalAuth(), requireMeshcoreChannelAcces
     // (see MeshCoreManager.getChannelMessages), so `page` here is ascending.
     // Fetch limit+1 to detect whether an older page exists without a
     // separate COUNT query.
-    const page = await managerFor(req, res).getChannelMessages(idx, limit + 1, offset);
+    const manager = managerFor(req, res);
+    const page = await manager.getChannelMessages(idx, limit + 1, offset);
     const hasMore = page.length > limit;
     // The extra lookahead row is the oldest one in this ascending array —
     // i.e. index 0 — so drop it to send exactly `limit` messages, still
     // oldest-first, to the client.
-    const messages = hasMore ? page.slice(1) : page;
+    const messages = meshcoreMessageFilter.annotate(
+      req.params.id,
+      hasMore ? page.slice(1) : page,
+      manager.getLocalNode?.()?.publicKey,
+    );
     res.json({
       success: true,
       data: messages,
@@ -100,6 +111,34 @@ router.get('/messages/channel/:idx', optionalAuth(), requireMeshcoreChannelAcces
     res.status(500).json({ success: false, error: 'Failed to get channel messages' });
   }
 });
+
+/**
+ * Unread counts exclude ignored messages (#5408). The per-channel latest
+ * timestamp is a DB aggregate that knows nothing of the lists, so when this
+ * source has any entries, look at each channel's newest page and take the
+ * newest message that is not filtered. A channel whose newest page is all
+ * ignored drops out of the map (no unread dot).
+ */
+const IGNORE_SCAN_PAGE = 50;
+async function latestExcludingIgnored(
+  sourceId: string,
+  manager: { getChannelMessages(idx: number, limit: number, offset: number): Promise<Array<{ timestamp: number; fromPublicKey: string; fromName?: string; text: string; messageType?: string; filtered?: 'ignore' | 'block' }>>; getLocalNode(): { publicKey?: string } | null },
+  latest: Record<number, number>,
+): Promise<Record<number, number>> {
+  if (!sourceId || !meshcoreMessageFilter.hasEntries(sourceId)) return latest;
+  const selfKey = manager.getLocalNode?.()?.publicKey;
+  const out: Record<number, number> = {};
+  await Promise.all(Object.keys(latest).map(async (k) => {
+    const idx = Number(k);
+    const page = meshcoreMessageFilter.annotate(sourceId, await manager.getChannelMessages(idx, IGNORE_SCAN_PAGE, 0), selfKey);
+    let newest = 0;
+    for (const m of page) {
+      if (!m.filtered && m.timestamp > newest) newest = m.timestamp;
+    }
+    if (newest > 0) out[idx] = newest;
+  }));
+  return out;
+}
 
 /**
  * GET /api/meshcore/messages/channel-counts?channels=0,1,2
@@ -137,12 +176,17 @@ router.get('/messages/channel-counts', optionalAuth(), async (req: Request, res:
         )).filter((idx): idx is number => idx !== null);
 
     const manager = managerFor(req, res);
-    const [counts, latestTimestamps] = unique.length > 0
+    const [counts, rawLatest] = unique.length > 0
       ? await Promise.all([
           manager.getChannelMessageCounts(unique),
           manager.getChannelLatestTimestamps(unique),
         ])
       : [{}, {}];
+    const latestTimestamps = await latestExcludingIgnored(
+      sourceId ?? '',
+      manager,
+      rawLatest as Record<number, number>,
+    );
     res.json({ success: true, counts, latestTimestamps });
   } catch (error) {
     logger.error('[API] Error getting channel message counts:', error);
@@ -359,9 +403,12 @@ router.get('/rooms/servers', optionalAuth(), requirePermission('messages', 'read
 /**
  * POST /api/meshcore/rooms/login
  * Login to a room server to receive posts and (if permitted) submit new ones.
- * Body: { publicKey: string, password: string, rememberPassword?: boolean }
+ * Body: { publicKey: string, password: string, rememberPassword?: boolean, requestId?: string }
  *   - `password` may be empty for guest/read-only access.
  *   - `rememberPassword: true` persists the password (AES-256-GCM via credential store).
+ *   - `requestId` enables live progress / cancel through the
+ *     /admin/login-progress and /admin/login-cancel endpoints (#5400).
+ *     A cancelled login answers 409 LOGIN_CANCELLED and saves nothing.
  */
 router.post('/rooms/login', meshcoreDeviceLimiter, requireAuth(), requirePermission('messages', 'write', { sourceIdFrom: 'params.id' }), requireMeshcoreTx(), async (req: Request, res: Response) => {
   try {
@@ -390,7 +437,16 @@ router.post('/rooms/login', meshcoreDeviceLimiter, requireAuth(), requirePermiss
       });
     }
 
-    const outcome = await managerFor(req, res).loginToRoomWithOutcome(publicKey, password);
+    const tracked = startTrackedLogin(req, res);
+    if (!tracked) return;
+    let outcome: MeshCoreLoginRetryOutcome = 'no_reply';
+    try {
+      outcome = await managerFor(req, res).loginToRoomWithOutcome(publicKey, password, tracked.opts);
+    } finally {
+      tracked.finish(outcome);
+    }
+    if (outcome === 'cancelled') return respondLoginCancelled(res);
+    if (outcome === 'not_on_device') return failContactNotOnDevice(res);
     if (outcome === 'rejected') {
       // Worth saying plainly: "login failed" sent people hunting for a radio
       // problem when the room server had simply refused the password.
@@ -440,7 +496,7 @@ router.post('/rooms/login', meshcoreDeviceLimiter, requireAuth(), requirePermiss
 /**
  * POST /api/meshcore/rooms/login-with-saved
  * Login to a room server using a previously saved credential.
- * Body: { publicKey: string }
+ * Body: { publicKey: string, requestId?: string } (requestId: see /rooms/login)
  */
 router.post('/rooms/login-with-saved', meshcoreDeviceLimiter, requireAuth(), requirePermission('messages', 'write', { sourceIdFrom: 'params.id' }), requireMeshcoreTx(), async (req: Request, res: Response) => {
   try {
@@ -460,7 +516,16 @@ router.post('/rooms/login-with-saved', meshcoreDeviceLimiter, requireAuth(), req
       return res.status(409).json({ success: false, error: 'Saved credential was encrypted with a different key', code: 'CREDENTIAL_KEY_ROTATED' });
     }
 
-    const outcome = await managerFor(req, res).loginToRoomWithOutcome(publicKey, result.password);
+    const tracked = startTrackedLogin(req, res);
+    if (!tracked) return;
+    let outcome: MeshCoreLoginRetryOutcome = 'no_reply';
+    try {
+      outcome = await managerFor(req, res).loginToRoomWithOutcome(publicKey, result.password, tracked.opts);
+    } finally {
+      tracked.finish(outcome);
+    }
+    if (outcome === 'cancelled') return respondLoginCancelled(res);
+    if (outcome === 'not_on_device') return failContactNotOnDevice(res);
     if (outcome === 'rejected') {
       // The room server answered and said no. Distinguished from silence so
       // the UI can offer to forget the password rather than suggest retrying.

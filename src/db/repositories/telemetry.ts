@@ -4,7 +4,7 @@
  * Handles all telemetry-related database operations.
  * Supports SQLite, PostgreSQL, and MySQL through Drizzle ORM.
  */
-import { eq, lt, gte, and, desc, inArray, isNull, or, not, SQL, count, sql } from 'drizzle-orm';
+import { eq, lt, lte, gt, gte, and, asc, desc, inArray, notInArray, isNull, or, not, SQL, count, sql } from 'drizzle-orm';
 import { ALL_SOURCES, BaseRepository, DrizzleDatabase, SourceScope } from './base.js';
 import { DatabaseType, DbTelemetry } from '../types.js';
 import { logger } from '../../utils/logger.js';
@@ -72,6 +72,49 @@ export interface TelemetryFavorite {
    * `favoriteTelemetryStorageDays` values.
    */
   cutoffTimestamp?: number;
+}
+
+/**
+ * A tracked asset's retention for the telemetry purge (#5354). All telemetry
+ * for `nodeNum` — every type, every source — is kept until `cutoff` (epoch ms),
+ * then purged. Unlike favorites, the cutoff is NOT clamped to the regular
+ * window: a 1-day asset keeps 1 day, because the owner chose it.
+ */
+export interface AssetRetention {
+  nodeNum: number;
+  cutoff: number;
+}
+
+/** Counts returned by the favorite/asset-aware purge. */
+export interface RetentionPurgeResult {
+  nonFavoritesDeleted: number;
+  favoritesDeleted: number;
+  /** Rows removed from tracked assets past their own window (#5354). */
+  assetsDeleted: number;
+}
+
+/** Telemetry types that make up a position fix. */
+const POSITION_TELEMETRY_TYPES = ['latitude', 'longitude', 'altitude', 'ground_speed', 'ground_track'];
+
+/** One row of `getPositionRowsForNodeNumPage` (#5354 asset track). */
+export interface PositionTelemetryPageRow {
+  id: number;
+  sourceId: string | null;
+  telemetryType: string;
+  timestamp: number;
+  value: number;
+  rxSnr: number | null;
+  hopStart: number | null;
+  hopLimit: number | null;
+}
+
+/** Max nodeNums per IN / NOT IN list, so one purge never hits a parameter cap. */
+const ASSET_IN_CHUNK = 500;
+
+function chunkNodeNums(nums: number[]): number[][] {
+  const out: number[][] = [];
+  for (let i = 0; i < nums.length; i += ASSET_IN_CHUNK) out.push(nums.slice(i, i + ASSET_IN_CHUNK));
+  return out;
 }
 
 /**
@@ -202,6 +245,82 @@ export class TelemetryRepository extends BaseRepository {
     const { telemetry } = this.tables;
     const result = await this.db.select({ count: count() }).from(telemetry);
     return Number(result[0].count);
+  }
+
+  /**
+   * Count one node's telemetry rows since a timestamp, across the given sources
+   * (#5354 asset retention estimate). An empty source list counts nothing, so
+   * a caller with no permitted source learns nothing.
+   */
+  async countTelemetryForNodeNumSince(nodeNum: number, sinceTimestamp: number, sourceIds: string[]): Promise<number> {
+    if (sourceIds.length === 0) return 0;
+    const { telemetry } = this.tables;
+    const result = await this.db
+      .select({ cnt: count() })
+      .from(telemetry)
+      .where(and(
+        eq(telemetry.nodeNum, nodeNum),
+        gte(telemetry.timestamp, sinceTimestamp),
+        inArray(telemetry.sourceId, sourceIds),
+      ));
+    return Number(result[0]?.cnt ?? 0);
+  }
+
+  /**
+   * One page of a node's position telemetry rows across the given sources,
+   * oldest first (#5354 asset track). Rows are ordered by `(timestamp, id)`
+   * and the cursor is that pair, so a page boundary that falls inside one
+   * timestamp resumes on the very next row instead of skipping or repeating
+   * rows. Omit `afterTs` for the first page. An empty source list reads nothing.
+   */
+  async getPositionRowsForNodeNumPage(opts: {
+    nodeNum: number;
+    sourceIds: string[];
+    sinceMs: number;
+    afterTs?: number;
+    afterId?: number;
+    limit: number;
+  }): Promise<PositionTelemetryPageRow[]> {
+    const { nodeNum, sourceIds, sinceMs, afterTs, afterId, limit } = opts;
+    if (sourceIds.length === 0 || limit <= 0) return [];
+    const { telemetry } = this.tables;
+    const conditions: SQL[] = [
+      eq(telemetry.nodeNum, nodeNum),
+      inArray(telemetry.telemetryType, POSITION_TELEMETRY_TYPES),
+      inArray(telemetry.sourceId, sourceIds),
+      gte(telemetry.timestamp, sinceMs),
+    ];
+    if (afterTs !== undefined) {
+      const cursor = afterId !== undefined
+        ? or(gt(telemetry.timestamp, afterTs), and(eq(telemetry.timestamp, afterTs), gt(telemetry.id, afterId)))
+        : gt(telemetry.timestamp, afterTs);
+      if (cursor) conditions.push(cursor);
+    }
+    const rows = await this.db
+      .select({
+        id: telemetry.id,
+        sourceId: telemetry.sourceId,
+        telemetryType: telemetry.telemetryType,
+        timestamp: telemetry.timestamp,
+        value: telemetry.value,
+        rxSnr: telemetry.rxSnr,
+        hopStart: telemetry.hopStart,
+        hopLimit: telemetry.hopLimit,
+      })
+      .from(telemetry)
+      .where(and(...conditions))
+      .orderBy(asc(telemetry.timestamp), asc(telemetry.id))
+      .limit(limit);
+    return (rows as Array<Record<string, unknown>>).map((r) => ({
+      id: Number(r.id),
+      sourceId: (r.sourceId as string | null) ?? null,
+      telemetryType: r.telemetryType as string,
+      timestamp: Number(r.timestamp),
+      value: Number(r.value),
+      rxSnr: r.rxSnr == null ? null : Number(r.rxSnr),
+      hopStart: r.hopStart == null ? null : Number(r.hopStart),
+      hopLimit: r.hopLimit == null ? null : Number(r.hopLimit),
+    }));
   }
 
   /**
@@ -699,6 +818,116 @@ export class TelemetryRepository extends BaseRepository {
     }
   }
 
+  // ── Outlier purge (#5333) ────────────────────────────────────────────────
+  // These take a concrete sourceId (never ALL_SOURCES): an outlier purge is
+  // always one source's data. They read the RAW telemetry table, not the
+  // averaged API output, so the analysis sees exactly the rows it may delete.
+
+  /** Ids per DELETE statement; far below every backend's bound-parameter limit. */
+  static readonly OUTLIER_DELETE_BATCH_SIZE = 500;
+
+  /**
+   * Highest telemetry row id for (sourceId, telemetryType[, nodeId]), or null
+   * when the scope is empty. The preview returns this as its cutoff so the
+   * later delete only ever considers rows that existed at preview time.
+   */
+  async getMaxTelemetryIdForType(
+    sourceId: string,
+    telemetryType: string,
+    nodeId?: string,
+  ): Promise<number | null> {
+    const { telemetry } = this.tables;
+    const conditions = [eq(telemetry.sourceId, sourceId), eq(telemetry.telemetryType, telemetryType)];
+    if (nodeId) conditions.push(eq(telemetry.nodeId, nodeId));
+    const rows = await this.db
+      .select({ maxId: sql<number | string | null>`MAX(${telemetry.id})` })
+      .from(telemetry)
+      .where(and(...conditions));
+    const raw = rows[0]?.maxId;
+    return raw === null || raw === undefined ? null : Number(raw);
+  }
+
+  /** Distinct telemetry types stored for one source, sorted. */
+  async getTelemetryTypesForSource(sourceId: string): Promise<string[]> {
+    const { telemetry } = this.tables;
+    const rows = await this.db
+      .selectDistinct({ type: telemetry.telemetryType })
+      .from(telemetry)
+      .where(eq(telemetry.sourceId, sourceId));
+    return rows.map((r: { type: string }) => r.type).sort();
+  }
+
+  /** Distinct nodeIds with at least one (sourceId, telemetryType) row at or below `maxId`. */
+  async getTelemetryNodeIdsForType(
+    sourceId: string,
+    telemetryType: string,
+    maxId: number,
+  ): Promise<string[]> {
+    const { telemetry } = this.tables;
+    const rows = await this.db
+      .selectDistinct({ nodeId: telemetry.nodeId })
+      .from(telemetry)
+      .where(and(
+        eq(telemetry.sourceId, sourceId),
+        eq(telemetry.telemetryType, telemetryType),
+        lte(telemetry.id, maxId),
+      ));
+    return rows.map((r: { nodeId: string }) => r.nodeId).sort();
+  }
+
+  /**
+   * One node's raw series for (sourceId, telemetryType), rows with id <= maxId,
+   * oldest first. Returns only the columns the outlier analysis needs.
+   */
+  async getTelemetrySeriesForOutlierScan(
+    sourceId: string,
+    telemetryType: string,
+    nodeId: string,
+    maxId: number,
+  ): Promise<Array<{ id: number; value: number; timestamp: number }>> {
+    const { telemetry } = this.tables;
+    const rows = await this.db
+      .select({ id: telemetry.id, value: telemetry.value, timestamp: telemetry.timestamp })
+      .from(telemetry)
+      .where(and(
+        eq(telemetry.sourceId, sourceId),
+        eq(telemetry.telemetryType, telemetryType),
+        eq(telemetry.nodeId, nodeId),
+        lte(telemetry.id, maxId),
+      ))
+      .orderBy(telemetry.timestamp, telemetry.id);
+    return rows.map((r: { id: number; value: number; timestamp: number }) => ({
+      id: Number(r.id),
+      value: Number(r.value),
+      timestamp: Number(r.timestamp),
+    }));
+  }
+
+  /**
+   * Delete telemetry rows by id, fenced to (sourceId, telemetryType) so an id
+   * from another source or metric can never be removed. Runs in batches of
+   * {@link TelemetryRepository.OUTLIER_DELETE_BATCH_SIZE} ids to stay far
+   * below the bound-parameter limits (SQLite 32766, PostgreSQL/MySQL 65535).
+   * Returns the number of rows deleted.
+   */
+  async deleteTelemetryByIds(sourceId: string, telemetryType: string, ids: number[]): Promise<number> {
+    if (ids.length === 0) return 0;
+    const { telemetry } = this.tables;
+    const size = TelemetryRepository.OUTLIER_DELETE_BATCH_SIZE;
+    let deleted = 0;
+    for (let i = 0; i < ids.length; i += size) {
+      const result = await this.db
+        .delete(telemetry)
+        .where(and(
+          eq(telemetry.sourceId, sourceId),
+          eq(telemetry.telemetryType, telemetryType),
+          inArray(telemetry.id, ids.slice(i, i + size)),
+        ));
+      deleted += this.getAffectedRows(result);
+    }
+    return deleted;
+  }
+
   /**
    * Purge telemetry for a node, optionally scoped to a source.
    * Delegates to deleteTelemetryByNode.
@@ -839,75 +1068,141 @@ export class TelemetryRepository extends BaseRepository {
   }
 
   /**
-   * Delete old telemetry with special handling for favorites.
-   * Non-favorited telemetry is deleted if older than regularCutoff.
-   * Favorited telemetry is deleted if older than favoriteCutoff.
+   * Build the ordered delete steps for the favorite/asset-aware purge.
+   * Shared by the async (PostgreSQL/MySQL) and Sync (SQLite) executors so the
+   * two paths cannot drift.
+   *
+   * A row is deleted only when it is older than EVERY retention window that
+   * applies to it (#5354):
+   *  1. regular — older than the regular cutoff, not a favorite series, and
+   *     not a tracked asset;
+   *  2. favorite — per favorite cutoff group, older than that cutoff, unless a
+   *     tracked asset's window still covers the row;
+   *  3. asset — per asset cutoff group, older than that asset's cutoff, unless
+   *     a favorite window still covers the row.
+   * So a node that is both a favorite and an asset keeps the LONGER of the two
+   * windows for its favorited series, and the asset window for everything else.
+   */
+  private buildRetentionPurgePlan(
+    regularCutoffTimestamp: number,
+    favoriteCutoffTimestamp: number,
+    favorites: TelemetryFavorite[],
+    assets: AssetRetention[]
+  ): Array<{ kind: 'regular' | 'favorite' | 'asset'; where: SQL }> {
+    const { telemetry } = this.tables;
+    const favoritesCondition = this.buildFavoritesCondition(favorites);
+    const favoriteGroups = favorites.length > 0
+      ? this.groupFavoritesByCutoff(favorites, favoriteCutoffTimestamp, regularCutoffTimestamp)
+      : [];
+
+    // Assets grouped by cutoff, each group chunked for the IN list.
+    const assetByCutoff = new Map<number, number[]>();
+    const assetNums: number[] = [];
+    const seenAssets = new Set<number>();
+    for (const a of assets) {
+      const num = Number(a.nodeNum) >>> 0;
+      if (seenAssets.has(num)) continue;
+      seenAssets.add(num);
+      assetNums.push(num);
+      const bucket = assetByCutoff.get(a.cutoff);
+      if (bucket) bucket.push(num);
+      else assetByCutoff.set(a.cutoff, [num]);
+    }
+    const assetGroups = [...assetByCutoff.entries()].map(([cutoff, nums]) => ({ cutoff, chunks: chunkNodeNums(nums) }));
+
+    // Rows a tracked asset still protects: its nodeNum, younger than its cutoff.
+    const assetProtects = assetGroups.length > 0
+      ? or(...assetGroups.flatMap((g) =>
+          g.chunks.map((c) => and(inArray(telemetry.nodeNum, c), gte(telemetry.timestamp, g.cutoff))!)))!
+      : null;
+    // Rows a favorite still protects: its series, younger than its cutoff.
+    const favoriteProtects = favoriteGroups.length > 0
+      ? or(...favoriteGroups.map((g) => and(g.condition, gte(telemetry.timestamp, g.cutoff))!))!
+      : null;
+
+    const plan: Array<{ kind: 'regular' | 'favorite' | 'asset'; where: SQL }> = [];
+
+    plan.push({
+      kind: 'regular',
+      where: and(
+        lt(telemetry.timestamp, regularCutoffTimestamp),
+        favoritesCondition ? not(favoritesCondition) : undefined,
+        ...chunkNodeNums(assetNums).map((c) => notInArray(telemetry.nodeNum, c)),
+      )!,
+    });
+
+    for (const group of favoriteGroups) {
+      plan.push({
+        kind: 'favorite',
+        where: and(
+          lt(telemetry.timestamp, group.cutoff),
+          group.condition,
+          assetProtects ? not(assetProtects) : undefined,
+        )!,
+      });
+    }
+
+    for (const group of assetGroups) {
+      for (const c of group.chunks) {
+        plan.push({
+          kind: 'asset',
+          where: and(
+            inArray(telemetry.nodeNum, c),
+            lt(telemetry.timestamp, group.cutoff),
+            favoriteProtects ? not(favoriteProtects) : undefined,
+          )!,
+        });
+      }
+    }
+    return plan;
+  }
+
+  /**
+   * Delete old telemetry with special handling for favorites and tracked assets.
+   * Non-favorited, non-asset telemetry is deleted if older than regularCutoff.
+   * Favorited telemetry is deleted if older than its favorite cutoff.
+   * Asset telemetry is deleted if older than its asset cutoff (#5354).
+   * See `buildRetentionPurgePlan` for how overlapping windows combine.
    *
    * Keeps branching: MySQL doesn't support .returning().
    */
   async deleteOldTelemetryWithFavorites(
     regularCutoffTimestamp: number,
     favoriteCutoffTimestamp: number,
-    favorites: TelemetryFavorite[]
-  ): Promise<{ nonFavoritesDeleted: number; favoritesDeleted: number }> {
-    // If no favorites, just delete everything older than regularCutoff
-    if (favorites.length === 0) {
+    favorites: TelemetryFavorite[],
+    assets: AssetRetention[] = []
+  ): Promise<RetentionPurgeResult> {
+    // No favorites and no assets: just delete everything older than regularCutoff
+    if (favorites.length === 0 && assets.length === 0) {
       const count = await this.deleteOldTelemetry(regularCutoffTimestamp);
-      return { nonFavoritesDeleted: count, favoritesDeleted: 0 };
+      return { nonFavoritesDeleted: count, favoritesDeleted: 0, assetsDeleted: 0 };
     }
 
     const { telemetry } = this.tables;
-    const favoritesCondition = this.buildFavoritesCondition(favorites)!;
-    const groups = this.groupFavoritesByCutoff(
-      favorites,
-      favoriteCutoffTimestamp,
-      regularCutoffTimestamp
-    );
+    const result: RetentionPurgeResult = { nonFavoritesDeleted: 0, favoritesDeleted: 0, assetsDeleted: 0 };
+    const plan = this.buildRetentionPurgePlan(regularCutoffTimestamp, favoriteCutoffTimestamp, favorites, assets);
 
-    let nonFavoritesDeleted = 0;
-    let favoritesDeleted = 0;
-
-    if (this.isMySQL()) {
-      // MySQL doesn't support .returning(), so count before deleting
-      const nonFavoritesCount = await this.db
-        .select({ cnt: count() })
-        .from(telemetry)
-        .where(and(lt(telemetry.timestamp, regularCutoffTimestamp), not(favoritesCondition)));
-      nonFavoritesDeleted = Number(nonFavoritesCount[0]?.cnt ?? 0);
-
-      await this.db
-        .delete(telemetry)
-        .where(and(lt(telemetry.timestamp, regularCutoffTimestamp), not(favoritesCondition)));
-
-      for (const group of groups) {
-        const favoritesCount = await this.db
-          .select({ cnt: count() })
-          .from(telemetry)
-          .where(and(lt(telemetry.timestamp, group.cutoff), group.condition));
-        favoritesDeleted += Number(favoritesCount[0]?.cnt ?? 0);
-
-        await this.db
+    for (const step of plan) {
+      let deleted: number;
+      if (this.isMySQL()) {
+        // MySQL doesn't support .returning(), so count before deleting
+        const counted = await this.db.select({ cnt: count() }).from(telemetry).where(step.where);
+        deleted = Number(counted[0]?.cnt ?? 0);
+        await this.db.delete(telemetry).where(step.where);
+      } else {
+        // SQLite and PostgreSQL support .returning()
+        const rows = await (this.db as any)
           .delete(telemetry)
-          .where(and(lt(telemetry.timestamp, group.cutoff), group.condition));
-      }
-    } else {
-      // SQLite and PostgreSQL support .returning()
-      const deletedNonFavorites = await (this.db as any)
-        .delete(telemetry)
-        .where(and(lt(telemetry.timestamp, regularCutoffTimestamp), not(favoritesCondition)))
-        .returning({ id: telemetry.id });
-      nonFavoritesDeleted = deletedNonFavorites.length;
-
-      for (const group of groups) {
-        const deletedFavorites = await (this.db as any)
-          .delete(telemetry)
-          .where(and(lt(telemetry.timestamp, group.cutoff), group.condition))
+          .where(step.where)
           .returning({ id: telemetry.id });
-        favoritesDeleted += deletedFavorites.length;
+        deleted = rows.length;
       }
+      if (step.kind === 'regular') result.nonFavoritesDeleted += deleted;
+      else if (step.kind === 'favorite') result.favoritesDeleted += deleted;
+      else result.assetsDeleted += deleted;
     }
 
-    return { nonFavoritesDeleted, favoritesDeleted };
+    return result;
   }
 
   /**
@@ -1164,6 +1459,11 @@ export class TelemetryRepository extends BaseRepository {
     'numPacketsTx', 'numPacketsRx', 'numPacketsRxBad',
     'numRxDupe', 'numTxRelay', 'numTxRelayCanceled', 'numTxDropped',
     'systemNodeCount', 'systemDirectNodeCount',
+    // #5101 P3: MeshMonitor-computed per-transport series. Integer counters
+    // per 5-minute bin — averaging them is as meaningless as the device
+    // counters above. See src/utils/transportSeries.ts.
+    'systemNodesHeardRf', 'systemNodesHeardUdp', 'systemNodesHeardMqtt',
+    'systemPacketsRxRf', 'systemPacketsRxUdp', 'systemPacketsRxMqtt',
     'paxcounterWifi', 'paxcounterBle',
     'particles03um', 'particles05um', 'particles10um',
     'particles25um', 'particles50um', 'particles100um',
@@ -1532,12 +1832,13 @@ export class TelemetryRepository extends BaseRepository {
    * Synchronously get all nodes with their telemetry types (SQLite only).
    * Returns Map<nodeId, string[]>.
    */
-  getAllNodesTelemetryTypesSync(): Map<string, string[]> {
+  getAllNodesTelemetryTypesSync(sourceId: SourceScope): Map<string, string[]> {
     const db = this.getSqliteDb();
     const { telemetry } = this.tables;
     const rows = db
       .selectDistinct({ nodeId: telemetry.nodeId, telemetryType: telemetry.telemetryType })
       .from(telemetry)
+      .where(this.withSourceScope(telemetry, sourceId))
       .all();
     const map = new Map<string, string[]>();
     for (const r of rows as any[]) {
@@ -1550,46 +1851,35 @@ export class TelemetryRepository extends BaseRepository {
 
 
   /**
-   * Synchronously delete old telemetry with favorites retention (SQLite only).
-   * Non-favorited telemetry older than regularCutoffTimestamp is deleted.
-   * Favorited telemetry older than favoriteCutoffTimestamp is deleted.
-   * Returns { nonFavoritesDeleted, favoritesDeleted }.
+   * Synchronously delete old telemetry with favorites and tracked-asset
+   * retention (SQLite only). Same plan as the async variant — see
+   * `buildRetentionPurgePlan`.
    */
   deleteOldTelemetryWithFavoritesSync(
     regularCutoffTimestamp: number,
     favoriteCutoffTimestamp: number,
-    favorites: TelemetryFavorite[]
-  ): { nonFavoritesDeleted: number; favoritesDeleted: number } {
-    if (favorites.length === 0) {
+    favorites: TelemetryFavorite[],
+    assets: AssetRetention[] = []
+  ): RetentionPurgeResult {
+    if (favorites.length === 0 && assets.length === 0) {
       const nonFavoritesDeleted = this.deleteOldTelemetrySync(regularCutoffTimestamp);
-      return { nonFavoritesDeleted, favoritesDeleted: 0 };
+      return { nonFavoritesDeleted, favoritesDeleted: 0, assetsDeleted: 0 };
     }
 
     const db = this.getSqliteDb();
     const { telemetry } = this.tables;
-    const favoritesCondition = this.buildFavoritesCondition(favorites)!;
-    const groups = this.groupFavoritesByCutoff(
-      favorites,
-      favoriteCutoffTimestamp,
-      regularCutoffTimestamp
-    );
+    const result: RetentionPurgeResult = { nonFavoritesDeleted: 0, favoritesDeleted: 0, assetsDeleted: 0 };
+    const plan = this.buildRetentionPurgePlan(regularCutoffTimestamp, favoriteCutoffTimestamp, favorites, assets);
 
-    const nonFavoritesResult = db
-      .delete(telemetry)
-      .where(and(lt(telemetry.timestamp, regularCutoffTimestamp), not(favoritesCondition)))
-      .run();
-    const nonFavoritesDeleted = Number((nonFavoritesResult as any).changes ?? 0);
-
-    let favoritesDeleted = 0;
-    for (const group of groups) {
-      const favoritesResult = db
-        .delete(telemetry)
-        .where(and(lt(telemetry.timestamp, group.cutoff), group.condition))
-        .run();
-      favoritesDeleted += Number((favoritesResult as any).changes ?? 0);
+    for (const step of plan) {
+      const res = db.delete(telemetry).where(step.where).run();
+      const deleted = Number((res as any).changes ?? 0);
+      if (step.kind === 'regular') result.nonFavoritesDeleted += deleted;
+      else if (step.kind === 'favorite') result.favoritesDeleted += deleted;
+      else result.assetsDeleted += deleted;
     }
 
-    return { nonFavoritesDeleted, favoritesDeleted };
+    return result;
   }
 
   /**

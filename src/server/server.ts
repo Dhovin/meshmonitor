@@ -11,7 +11,7 @@ import { fallbackManager } from './meshtasticManager.js';
 import { MeshtasticManager } from './meshtasticManager.js';
 import { sourceManagerRegistry } from './sourceManagerRegistry.js';
 import { getPrimaryMeshtasticManager } from './sourceManagerTypes.js';
-import { resolveSourceManager } from './utils/resolveSourceManager.js';
+import { resolveOwnMeshtasticManager } from './utils/resolveSourceManager.js';
 import { createRequire } from 'module';
 import { logger } from '../utils/logger.js';
 import { setDiscardInvalidPositions, parseDiscardInvalidPositions } from '../utils/positionIngestConfig.js';
@@ -30,8 +30,11 @@ import { appriseNotificationService } from './services/appriseNotificationServic
 import { backupSchedulerService } from './services/backupSchedulerService.js';
 import { databaseMaintenanceService } from './services/databaseMaintenanceService.js';
 import { positionEstimationScheduler } from './services/positionEstimationScheduler.js';
+import { autoEnrichmentScheduler } from './services/autoEnrichmentScheduler.js';
 import { meshIssuesScheduler } from './services/meshIssuesScheduler.js';
 import { autoFavoriteManagementScheduler } from './services/autoFavoriteManagementService.js';
+import { aircraftClassificationService, BACKFILL_DELAY_MS as AIRCRAFT_BACKFILL_DELAY_MS } from './services/aircraftClassificationService.js';
+import { aircraftAgeOutScheduler } from './services/aircraftAgeOutScheduler.js';
 import { systemRestoreService } from './services/systemRestoreService.js';
 import { duplicateKeySchedulerService } from './services/duplicateKeySchedulerService.js';
 import { waypointRebroadcastSchedulerService } from './services/waypointRebroadcastSchedulerService.js';
@@ -43,9 +46,11 @@ import { lowBatteryNotificationService } from './services/lowBatteryNotification
 import { cotFeedService } from './services/cotFeedService.js';
 import { serverEventNotificationService } from './services/serverEventNotificationService.js';
 import { versionCheckService } from './services/versionCheckService.js';
+import { coverageRetentionService } from './services/coverageRetentionService.js';
 import { dynamicCspMiddleware, refreshTileHostnameCache } from './middleware/dynamicCsp.js';
 import settingsRoutes, { setSettingsCallbacks } from './routes/settingsRoutes.js';
 import { bootstrapSources } from './bootstrapSources.js';
+import { transportTrafficService } from './services/transportTrafficService.js';
 import { migrateAutoResponderTriggers } from './services/autoResponderTriggerMigration.js';
 import { configureStaticServing, invalidateHtmlCache } from './staticServing.js';
 // Re-exported for backward compatibility — server.ts used to define
@@ -314,6 +319,16 @@ setTimeout(async () => {
     // Wait for database initialization (critical for PostgreSQL/MySQL where repos are async)
     await databaseService.waitForReady();
 
+    // #5101 P3 WP3: restore/recover the transport-traffic writer's checkpoints
+    // BEFORE any source manager can receive a packet (R10 — a later refactor
+    // moving this past bootstrapSources would undercount the recovered bin's
+    // nodes). Never blocks boot: log and continue on failure.
+    try {
+      await transportTrafficService.start();
+    } catch (error) {
+      logger.error('Failed to start transportTrafficService (continuing boot):', error);
+    }
+
     // Bootstrap all enabled sources (auto-creating a Default source from env
     // only when none exist AND MESHTASTIC_NODE_IP was explicitly set).
     // Extracted into bootstrapSources() for testability — see WP1 of issue
@@ -373,9 +388,29 @@ setTimeout(async () => {
     meshIssuesScheduler.initialize();
     logger.debug('Mesh issues scheduler initialized');
 
+    // Initialize auto-enrichment scheduler (global, opt-in — issue #5287). Arms a
+    // once-a-minute check only; a run fires only when enabled AND due against
+    // the persisted last-run time, so a restart never triggers one.
+    autoEnrichmentScheduler.initialize();
+    logger.debug('Auto-enrichment scheduler initialized');
+
     // Initialize automated remote favorites management scheduler (issue #2608)
     autoFavoriteManagementScheduler.initialize();
     logger.debug('Auto-favorite management scheduler initialized');
+
+    // One-time silent likely-aircraft backfill (#5364/#5365 D11): classifies
+    // every already-stored position that predates this feature, ~2 minutes
+    // after boot so it doesn't compete with startup traffic. Silent — no
+    // automation event fires for a backfill job.
+    setTimeout(() => {
+      void aircraftClassificationService.backfillAll().catch((e) =>
+        logger.warn('Aircraft backfill failed:', e));
+    }, AIRCRAFT_BACKFILL_DELAY_MS).unref?.();
+
+    // Aircraft age-out + reclassify-as-fixed sweep (#5364/#5365 Phase 2):
+    // hourly, first tick 5 min after boot. The per-source last run is
+    // persisted, so a restart never counts as (or forces) a run.
+    aircraftAgeOutScheduler.initialize();
 
     // Start the Automation Engine (#3653) — loads enabled automations and
     // subscribes to the event bus so they fire on live mesh traffic.
@@ -385,6 +420,10 @@ setTimeout(async () => {
     // same event, so offers are recorded for the invitation card even when no
     // automation references beacons.
     startMeshBeaconOfferIngestion();
+
+    // ADS-B flight matching for likely aircraft (#5374). Subscribes to the
+    // Phase 1 transition event; does nothing unless adsbMatchEnabled is on.
+    startAdsbFlightMatching();
 
     // Seed the global "discard invalid GPS positions" ingest gate from settings
     // (default ON = discard, the historical behavior). Refreshed live on save via
@@ -504,6 +543,21 @@ setTimeout(async () => {
     logger.error('Error during initial telemetry purge:', error);
   }
 }, 5000); // Wait 5 seconds after startup
+
+// Coverage Report retention sweep (#5277 Phase 1 WP2): hourly purge of RF
+// receptions older than the configured coverage_retention_days. The service
+// does not auto-start in its constructor (so importing it in a test never
+// spins up a live timer) — start() must be called explicitly, here, once,
+// after the DB is ready. It schedules its own first sweep 30s after start,
+// then hourly (see coverageRetentionService.ts).
+setTimeout(async () => {
+  try {
+    await databaseService.waitForReady();
+    coverageRetentionService.start();
+  } catch (error) {
+    logger.error('Error starting Coverage Report retention sweep:', error);
+  }
+}, 5000);
 
 // ==========================================
 // MeshCore local-node telemetry poller
@@ -640,6 +694,7 @@ import automationRoutes from './routes/automationRoutes.js';
 import autoAckConverterRoutes from './routes/autoAckConverterRoutes.js';
 import { startAutomationEngine } from './services/automation/automationEngineSingleton.js';
 import { startMeshBeaconOfferIngestion } from './services/meshBeaconOfferService.js';
+import { startAdsbFlightMatching } from './services/adsbMatchService.js';
 import userRoutes from './routes/userRoutes.js';
 import auditRoutes from './routes/auditRoutes.js';
 import securityRoutes from './routes/securityRoutes.js';
@@ -656,7 +711,9 @@ import newsRoutes from './routes/newsRoutes.js';
 import tileServerRoutes from './routes/tileServerTest.js';
 import v1Router from './routes/v1/index.js';
 import meshcoreRoutes from './routes/meshcoreRoutes.js';
+import { meshcoreMessageFilter } from './services/meshcoreMessageFilter.js';
 import mqttPacketRoutes from './routes/mqttPacketRoutes.js';
+import forwardingRoutes from './routes/forwardingRoutes.js';
 import atakRoutes from './routes/atakRoutes.js';
 import surveyRoutes from './routes/surveyRoutes.js';
 import beaconOfferRoutes from './routes/beaconOfferRoutes.js';
@@ -688,7 +745,10 @@ import firmwareUpdateRoutes from './routes/firmwareUpdateRoutes.js';
 import sourceRoutes from './routes/sourceRoutes.js';
 import unifiedRoutes from './routes/unifiedRoutes.js';
 import analysisRoutes from './routes/analysisRoutes.js';
+import aircraftRoutes from './routes/aircraftRoutes.js';
+import assetRoutes from './routes/assetRoutes.js';
 import meshIssuesRoutes from './routes/meshIssuesRoutes.js';
+import coverageRoutes from './routes/coverageRoutes.js';
 import elevationRoutes from './routes/elevationRoutes.js';
 import gnssRoutes from './routes/gnssRoutes.js';
 import rfCoverageRoutes from './routes/rfCoverageRoutes.js';
@@ -802,6 +862,9 @@ apiRouter.use('/sources/:id/meshcore', meshcoreRoutes);
 // docs/internal/dev-notes/MQTT_PACKET_MONITOR_PHASE1_SPEC.md §2.11/§2.12.
 apiRouter.use('/sources/:id/mqtt/packets', mqttPacketRoutes);
 
+// Message Forwarding rules (#5446) — per-source, Meshtastic + MeshCore.
+apiRouter.use('/sources/:id/forwarding', forwardingRoutes);
+
 // ATAK Contacts routes — nested under `/api/sources/:id/atak` so each
 // request resolves the contact table bound to a specific source. No
 // source-type check (mirrors meshcore/mqtt): a non-Meshtastic or
@@ -870,8 +933,20 @@ apiRouter.use('/unified', unifiedRoutes);
 // NOTE: More specific route must come BEFORE general /analysis router
 apiRouter.use('/analysis/mesh-issues', meshIssuesRoutes);
 
+// Coverage Report (#5277 Phase 1 WP3) — RF-reception query API. Also more
+// specific than /analysis and must be mounted before it; does not collide
+// with /analysis/coverage-grid since Express mount paths match whole
+// segments.
+apiRouter.use('/analysis/coverage', coverageRoutes);
+
 // Cross-source analysis workspace
 apiRouter.use('/analysis', analysisRoutes);
+
+// Likely-aircraft flight trails (#5364/#5365 Phase 3) — stored telemetry only.
+apiRouter.use('/aircraft', aircraftRoutes);
+
+// Asset Tracking (#5354) — global per-node asset flag + telemetry retention.
+apiRouter.use('/assets', assetRoutes);
 
 // Terrain link elevation profile (#4111 Phase 1)
 apiRouter.use('/elevation', elevationRoutes);
@@ -947,8 +1022,9 @@ setSettingsCallbacks({
   setTracerouteInterval: (interval) =>
     (getPrimaryMeshtasticManager(sourceManagerRegistry) ?? fallbackManager).setTracerouteInterval(interval),
   setRemoteAdminScannerInterval: (interval, sourceId) => {
-    const mgr = resolveSourceManager(sourceId);
-    mgr.setRemoteAdminScannerInterval(interval);
+    // Own radio only: the scanner transmits admin probes, so a non-Meshtastic
+    // source must never re-arm the primary's scanner (#5375).
+    resolveOwnMeshtasticManager(sourceId)?.setRemoteAdminScannerInterval(interval);
   },
   setLocalStatsInterval: (interval, sourceId) => {
     const mgr = sourceId
@@ -1136,7 +1212,13 @@ function gracefulShutdown(reason: string, exitCode = 0): void {
   isShuttingDown = true;
   logger.info(`🛑 Initiating graceful shutdown: ${reason} (exit ${exitCode})`);
 
-  const shutdownDependencies = (): void => {
+  // #5101 P3 WP3: start the transport-traffic writer's stop() right away,
+  // while the DB is still open. Do NOT wait for server.close() first — it
+  // waits for every open client connection (R11), which could starve the
+  // writer's final checkpoint of its 3s budget below.
+  const trafficStopped = transportTrafficService.stop();
+
+  const shutdownDependencies = async (): Promise<void> => {
     // Stop the ATAK/CoT feed server (issue #3691 Phase 3): closes the TCP
     // listener and destroys connected client sockets. Fire-and-forget —
     // stop() is async (waits on server.close()'s callback) but shutdown must
@@ -1148,6 +1230,8 @@ function gracefulShutdown(reason: string, exitCode = 0): void {
       logger.error('Error stopping CoT feed server:', error);
     }
 
+    aircraftAgeOutScheduler.shutdown();
+
     // Disconnect from Meshtastic
     try {
       (getPrimaryMeshtasticManager(sourceManagerRegistry) ?? fallbackManager).disconnect();
@@ -1155,6 +1239,22 @@ function gracefulShutdown(reason: string, exitCode = 0): void {
     } catch (error) {
       logger.error('Error disconnecting from Meshtastic:', error);
     }
+
+    // #5408: write pending MeshCore Ignore / Block hit counts before the DB
+    // closes. Bounded; a few lost counts are acceptable.
+    try {
+      await Promise.race([
+        meshcoreMessageFilter.flushAsync(),
+        new Promise((resolve) => setTimeout(resolve, 2000)),
+      ]);
+    } catch (error) {
+      logger.warn('Error flushing MeshCore filter hit counts:', error);
+    }
+
+    // #5101 P3 WP3: give the transport-traffic writer's final checkpoint up
+    // to 3s to land before the DB closes. The outer 10s forced-exit timer
+    // below still bounds the whole shutdown sequence regardless.
+    await Promise.race([trafficStopped, new Promise((resolve) => setTimeout(resolve, 3000))]);
 
     // Close database connections
     try {
@@ -1174,11 +1274,11 @@ function gracefulShutdown(reason: string, exitCode = 0): void {
   if (server) {
     server.close(() => {
       logger.debug('✅ HTTP server closed');
-      shutdownDependencies();
+      void shutdownDependencies();
     });
   } else {
     logger.info('HTTP server not yet started — skipping server.close()');
-    shutdownDependencies();
+    void shutdownDependencies();
   }
 
   // Force shutdown after 10 seconds if graceful shutdown hangs

@@ -46,9 +46,10 @@ import { NodeFilters } from './types/ui';
 import { getHashTabRedirectTarget } from './utils/tabHashRedirect';
 import { ResourceType } from './types/permission';
 import api, { type ChannelDatabaseEntry } from './services/api';
+import { fetchAssetTrack } from './hooks/useAssetTracking';
 import { getPacketStats } from './services/packetApi';
 import { logger } from './utils/logger';
-import { MAX_ACCUMULATED_POSITION_FIXES } from './utils/positionHistoryDownsample';
+import { MAX_ACCUMULATED_POSITION_FIXES, flattenAssetTrack } from './utils/positionHistoryDownsample';
 import { isTxDisabledBody } from './utils/txDisabled';
 import { resolveNeighborInfoErrorToast } from './utils/neighborInfoError';
 // generateArrowMarkers moved to useTraceroutePaths hook
@@ -280,7 +281,11 @@ function App() {
   // instead so the banner stays honest about how packets leave (#4394).
   const { isTxDisabled, isUdpRelay } = useTxStatus({ baseUrl, sourceId });
   // MQTT-bridge sources are never gated (different transport, not affected by radio TX state)
-  const txGated = isTxDisabled && !isMqttBridge;
+  // MQTT broker/bridge sources have no local radio, so every send is gated.
+  // The server refuses them with SOURCE_NOT_MESHTASTIC rather than sending
+  // through the primary TCP radio (#5375); disabling the controls here says
+  // why up front instead of failing on click.
+  const txGated = isTxDisabled || isMqtt;
 
   // MeshCore has no LoRa Configuration screen, so the Meshtastic-worded
   // tooltip/toast point a MeshCore operator at a remedy that does not exist
@@ -290,7 +295,9 @@ function App() {
   // unchanged.
   const isMeshCoreSource = sourceType === 'meshcore';
   const txDisabledTooltip = t(
-    isMeshCoreSource ? 'meshcore.receive_only.control_tooltip' : 'tx_disabled.control_tooltip'
+    isMqtt
+      ? 'tx_disabled.no_local_radio_tooltip'
+      : isMeshCoreSource ? 'meshcore.receive_only.control_tooltip' : 'tx_disabled.control_tooltip'
   );
 
   // Check for version updates. TanStack Query's refetchInterval replaces the
@@ -373,6 +380,7 @@ function App() {
     setTraceroutes,
     setNeighborInfo,
     setPositionHistory,
+    setPositionHistoryTotalFixes,
     selectedNodeId,
     setSelectedNodeId,
   } = useMapContext();
@@ -716,11 +724,13 @@ function App() {
       // mirrors checkPermissionAsync's union branch for the same routes.
       settings: () => hasPermission('settings', 'read', { anySource: true }),
       automation: () => !isMqttBridge && hasPermission('automation', 'read'),
-      configuration: () => !isMqttBridge && hasPermission('configuration', 'read'),
+      // An MQTT broker has no local radio either: Device Config and Remote
+      // Admin there would reach the primary TCP source's device (#5367).
+      configuration: () => !isMqtt && hasPermission('configuration', 'read'),
       'mqtt-config': () => isMqttBridge && hasPermission('sources', 'read'),
       notifications: () => isAuthenticated,
       users: () => isAdmin,
-      admin: () => !isMqttBridge && isAdmin,
+      admin: () => !isMqtt && isAdmin,
       audit: () => hasPermission('audit', 'read'),
       security: () => hasPermission('security', 'read'),
       packetmonitor: () => isMqtt
@@ -927,6 +937,7 @@ function App() {
   // these same handlers) work; see src/hooks/useSourceView.ts.
   const {
     processedNodes,
+    agedOutAircraftNodes,
     shouldShowData,
     centerMapOnNode,
     toggleFavorite,
@@ -1296,20 +1307,54 @@ function App() {
     }
   }, [connectionStatus, sourceId]);
 
+  // Signature of the asset track last put on the map (#5354 Phase 2), so a
+  // node poll that returns the same (cached) track doesn't redraw 2,000 points.
+  const assetTrackSignatureRef = useRef<string | null>(null);
+
   // Fetch position history when a mobile node is selected
   useEffect(() => {
     if (!selectedNodeId) {
+      assetTrackSignatureRef.current = null;
+      setPositionHistoryTotalFixes(null);
       setPositionHistory([]);
       return;
     }
 
     const selectedNode = nodes.find(n => n.user?.id === selectedNodeId);
     if (!selectedNode || !selectedNode.isMobile) {
+      assetTrackSignatureRef.current = null;
+      setPositionHistoryTotalFixes(null);
       setPositionHistory([]);
       return;
     }
 
     let cancelled = false;
+
+    // Tracked asset (#5354 Phase 2): one request for the server-thinned trail
+    // across the whole retention window, instead of the paged loop and its
+    // 5,000-fix cap. The server returns at most 2,000 points in gap segments.
+    if (selectedNode.asset) {
+      const nodeNum = selectedNode.nodeNum;
+      const fetchAssetTrail = async () => {
+        try {
+          const track = await fetchAssetTrack(nodeNum);
+          if (cancelled) return;
+          const items = flattenAssetTrack(track.segments);
+          const last = items.length > 0 ? items[items.length - 1].timestamp : 0;
+          const signature = `${nodeNum}|${track.totalFixes}|${items.length}|${last}`;
+          if (signature === assetTrackSignatureRef.current) return;
+          assetTrackSignatureRef.current = signature;
+          setPositionHistoryTotalFixes(track.totalFixes);
+          setPositionHistory(items);
+        } catch (error) {
+          if (!cancelled) logger.error('Error fetching asset track:', error);
+        }
+      };
+      void fetchAssetTrail();
+      return () => { cancelled = true; };
+    }
+    assetTrackSignatureRef.current = null;
+    setPositionHistoryTotalFixes(null);
 
     // Progressively load the ENTIRE position history in bounded pages (#3791).
     // The server caps each response at 1500 telemetry rows (~300 fixes), so we
@@ -3385,14 +3430,18 @@ function App() {
         onFetchSystemStatus={fetchSystemStatus}
         onShowLoginModal={() => setShowLoginModal(true)}
         onLogout={() => setActiveTab('nodes')}
-        onNodeClick={handleNodeClick}
+        // The node-info modal shows and edits a TCP node address; an MQTT
+        // source has none (#5375).
+        onNodeClick={isMqtt ? undefined : handleNodeClick}
         sourceName={sourceName}
         onBackToSources={sourceId ? () => navigate('/', { state: { showList: true } }) : undefined}
         mqttReadOnly={isMqttBridge}
       />
 
       <AppBanners
-        isTxDisabled={isTxDisabled}
+        // The TX-disabled banner blames the LoRa config; an MQTT source has no
+        // radio at all, so the disabled controls' tooltip explains it instead.
+        isTxDisabled={isTxDisabled && !isMqtt}
         isUdpRelay={isUdpRelay}
         isMeshCore={isMeshCoreSource}
         configIssues={configIssues}
@@ -3522,6 +3571,7 @@ function App() {
         onConfigSearchClick={() => openConfigSearchRef.current?.()}
         hasReadableVirtualChannels={channelDatabaseEntries.length > 0}
         mqttReadOnly={isMqttBridge}
+        hideDeviceConfig={isMqtt}
       />
 
       <main id="main-content" className="app-main">
@@ -3629,6 +3679,7 @@ function App() {
                   timeFormat={timeFormat}
                   dateFormat={dateFormat}
                   isAuthenticated={authStatus?.authenticated || false}
+                  maxNodeAgeHours={maxNodeAgeHours}
                 />
               </ErrorBoundary>
             }
@@ -3675,6 +3726,7 @@ function App() {
               <ErrorBoundary fallbackTitle="Nodes failed to load">
                 <NodesTab
                   processedNodes={processedNodes}
+                  agedOutAircraftNodes={agedOutAircraftNodes}
                   shouldShowData={shouldShowData}
                   centerMapOnNode={centerMapOnNode}
                   toggleFavorite={toggleFavorite}
@@ -3703,7 +3755,7 @@ function App() {
             path="automation"
             element={
               <ErrorBoundary fallbackTitle="Automation failed to load">
-                <AutomationTab baseUrl={baseUrl} channels={channels} nodes={nodes} currentNodeId={currentNodeId} />
+                <AutomationTab baseUrl={baseUrl} channels={channels} nodes={nodes} currentNodeId={currentNodeId} txDisabled={txGated} />
               </ErrorBoundary>
             }
           />
@@ -3983,7 +4035,9 @@ function App() {
         systemStatus={systemStatus}
         onClose={() => setShowStatusModal(false)}
         connectionStatus={connectionStatus}
-        canManageConnection={hasPermission('connection', 'write')}
+        // An MQTT source has no radio link of its own; disconnect/reconnect
+        // would act on the primary radio, so the server refuses them (#5375).
+        canManageConnection={hasPermission('connection', 'write') && !isMqtt}
         onDisconnect={handleDisconnect}
         onReconnect={handleReconnect}
       />

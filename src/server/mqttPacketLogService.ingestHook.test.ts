@@ -25,6 +25,8 @@ vi.mock('../services/database.js', () => ({
     insertTracerouteAsync: vi.fn(async () => undefined),
     insertRouteSegment: vi.fn(),
     insertRouteSegmentAsync: vi.fn(async () => undefined),
+    // #5101 (finding 2): persistRouteSegments now also calls this per stored segment.
+    updateRecordHolderSegmentAsync: vi.fn(async () => undefined),
     nodes: {
       getNode: vi.fn(async () => null),
       getNodesByNums: vi.fn(async () => new Map()),
@@ -36,6 +38,8 @@ vi.mock('../services/database.js', () => ({
       addGeoIgnoreAsync: vi.fn(async () => true),
       liftGeoIgnoreAsync: vi.fn(async () => false),
     },
+    // #5354 tracked assets — none unless a test says so.
+    getAssetNodeAsync: vi.fn(async () => null),
     deleteNodeAsync: vi.fn(async () => ({
       messagesDeleted: 0, broadcastMessagesDeleted: 0, traceroutesDeleted: 0,
       telemetryDeleted: 0, nodeDeleted: true,

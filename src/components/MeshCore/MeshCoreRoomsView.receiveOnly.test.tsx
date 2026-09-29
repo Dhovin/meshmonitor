@@ -16,16 +16,10 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { MeshCoreRoomsView } from './MeshCoreRoomsView';
 import type { MeshCoreContact } from '../../utils/meshcoreHelpers';
 
-vi.mock('react-i18next', () => ({
-  useTranslation: () => ({
-    t: (key: string, fallback?: string | Record<string, unknown>) => {
-      if (typeof fallback === 'string') return fallback;
-      return key;
-    },
-  }),
-  Trans: ({ children }: { children?: unknown }) => children,
-  initReactI18next: { type: '3rdParty', init: () => {} },
-}));
+vi.mock('react-i18next', async () => {
+  const { createReactI18nextMock } = await import('../../test/mockI18n');
+  return createReactI18nextMock();
+});
 
 vi.mock('../../contexts/AuthContext', () => ({
   useAuth: () => ({ hasPermission: () => true }),
@@ -121,7 +115,7 @@ describe('MeshCoreRoomsView receive-only mode', () => {
       />,
     );
 
-    await waitFor(() => expect(actions.loginRoomWithSaved).toHaveBeenCalledWith(ROOM_PK));
+    await waitFor(() => expect(actions.loginRoomWithSaved).toHaveBeenCalledWith(ROOM_PK, { requestId: expect.any(String) }));
   });
 
   it('disables the send box (with a tooltip) once logged in, when receiveOnly', async () => {

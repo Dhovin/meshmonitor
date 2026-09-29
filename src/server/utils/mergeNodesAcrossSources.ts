@@ -17,6 +17,8 @@
  * honored in the unified view.
  */
 import type { DbNode } from '../../db/types.js';
+import { pickPositionRecord } from '../../utils/positionSelection.js';
+import { isBogusPosition } from '../../utils/nullIsland.js';
 
 const isEmpty = (v: unknown): boolean =>
   v === null || v === undefined || (typeof v === 'string' && v.trim() === '');
@@ -55,6 +57,41 @@ export function mergeNodesAcrossSources(rows: DbNode[]): DbNode[] {
       }
     }
 
+    /*
+     * Position is chosen on its own terms rather than inherited from the
+     * newest-`lastHeard` winner (#5292). `lastHeard` moves on ANY traffic, so
+     * a source holding an older, coarser fix became "newest" as soon as it
+     * heard unrelated chatter, and the unified row flipped to the coarser grid
+     * cell with no new position packet behind it. Coordinates, altitude,
+     * precision and position timestamp all come from the SAME row, so the
+     * merged row never describes a fix that is half one source's and half
+     * another's.
+     */
+    const positioned = group.filter(
+      (n) => n.latitude != null && n.longitude != null && !isBogusPosition(n.latitude, n.longitude),
+    );
+    const bestPosition = pickPositionRecord(positioned);
+    if (bestPosition) {
+      winner.latitude = bestPosition.latitude;
+      winner.longitude = bestPosition.longitude;
+      winner.altitude = bestPosition.altitude;
+      winner.positionPrecisionBits = bestPosition.positionPrecisionBits;
+      winner.positionTimestamp = bestPosition.positionTimestamp;
+      // #5364/#5365: the aircraft flag describes THIS position, so it comes
+      // from the same row — unconditionally, including null. Otherwise the
+      // empty-field backfill loop above could splice in another source's
+      // flag for a source that hasn't been classified yet.
+      winner.likelyAircraft = bestPosition.likelyAircraft ?? null;
+      winner.aircraftBasis = bestPosition.aircraftBasis ?? null;
+      winner.groundElevation = bestPosition.groundElevation ?? null;
+      winner.heightAboveGround = bestPosition.heightAboveGround ?? null;
+      // Phase 2: the aged-out and fixed marks travel with the same row too.
+      winner.aircraftAgedOutAt = bestPosition.aircraftAgedOutAt ?? null;
+      winner.aircraftFixedAt = bestPosition.aircraftFixedAt ?? null;
+      winner.aircraftFixedLatitude = bestPosition.aircraftFixedLatitude ?? null;
+      winner.aircraftFixedLongitude = bestPosition.aircraftFixedLongitude ?? null;
+    }
+
     winner.isFavorite = group.some((n) => n.isFavorite === true);
     winner.isIgnored = group.some((n) => n.isIgnored === true);
     winner.favoriteLocked = group.some((n) => n.favoriteLocked === true);
@@ -70,6 +107,12 @@ export function mergeNodesAcrossSources(rows: DbNode[]): DbNode[] {
       0,
     );
     if (maxLastHeard > 0) winner.lastHeard = maxLastHeard;
+
+    // #5390: the unified view's First Heard is the earliest any source heard it.
+    const firstHeards = group
+      .map((n) => Number(n.firstHeard))
+      .filter((v) => Number.isFinite(v) && v > 0);
+    if (firstHeards.length > 0) winner.firstHeard = Math.min(...firstHeards);
 
     const maxUpdatedAt = group.reduce(
       (max, n) => Math.max(max, n.updatedAt ?? 0),

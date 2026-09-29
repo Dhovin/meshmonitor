@@ -16,8 +16,8 @@
  * Covers the phase's centrepiece assertions (spec §5.1):
  *  1. mode="source" inside a SourceProvider GETs /api/settings?sourceId=X.
  *  2. Save in source mode issues two POSTs; the scoped one carries exactly
- *     the ten NODE_DISPLAY_SETTING_KEYS (by count AND name against the
- *     constant itself), the unscoped one carries none of them.
+ *     NODE_DISPLAY_SETTING_KEYS (by count AND name against the constant
+ *     itself), the unscoped one carries none of them.
  *  3. mode="global" issues one POST with all keys (byte-identical shape to
  *     pre-split behaviour).
  *  4. Editing a dimming input marks the SaveBar dirty; saving clears it.
@@ -29,13 +29,21 @@
  * so the branch was dead code and its test passed vacuously. MeshCore's Node
  * Display settings now live in MeshCoreNodeDisplaySection, covered by
  * MeshCoreNodeDisplaySection.test.tsx.
+ *
+ * #5364/#5365 Phase 1 WP5: NODE_DISPLAY_SETTING_KEYS grew from ten to
+ * thirteen (the frozen seeded ten + three unseeded likely-aircraft keys,
+ * spec §4.6). Items 2/3 above still assert against the imported constant
+ * itself, so they cover the new count automatically with no code change.
+ * The new "Likely aircraft detection" describe block below covers the
+ * aircraft-specific behaviour: load/save, range clamping, and the
+ * elevation-off warning.
  */
 import React from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, within, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, within, fireEvent, waitFor } from '@testing-library/react';
 import SettingsTab from './SettingsTab';
 import { SourceProvider } from '../contexts/SourceContext';
-import { NODE_DISPLAY_SETTING_KEYS } from '../constants/nodeDisplayDefaults';
+import { NODE_DISPLAY_SETTING_KEYS, SETTINGS_TAB_PER_SOURCE_KEYS } from '../constants/nodeDisplayDefaults';
 
 // ---------------------------------------------------------------------------
 // Contexts / hooks — same isolation strategy as SettingsTab.elevation.test.tsx
@@ -133,8 +141,10 @@ vi.mock('../contexts/SettingsContext', () => ({
       setDefaultMapCenterZoom: vi.fn(),
       mapCenterTargetZoom: 10,
       mapZoomGateThreshold: 13,
+      mapClusteringEnabled: true,
       setMapCenterTargetZoom: vi.fn(),
       setMapZoomGateThreshold: vi.fn(),
+      setMapClusteringEnabled: vi.fn(),
       defaultLandingPage: 'dashboard',
       setDefaultLandingPage: vi.fn(),
       appearanceMode: 'system',
@@ -300,6 +310,36 @@ describe('SettingsTab — scoped GET (#4412 Phase 3 WP4a)', () => {
   });
 });
 
+describe('SettingsTab — TX-target window when the node window is 0 (#5376)', () => {
+  it('loads the stored per-source value, shows the TX warning, and saves an edit on the scoped POST', async () => {
+    serverSettings = { txTargetMaxAgeHoursWhenUnlimited: '72' };
+    render(
+      <SourceProvider sourceId="source-a" sourceType="meshtastic_tcp">
+        <SettingsTab {...baseProps} mode="source" />
+      </SourceProvider>
+    );
+
+    const input = await waitFor(() => {
+      const el = document.getElementById('txTargetMaxAgeHoursWhenUnlimited') as HTMLInputElement;
+      expect(el.value).toBe('72');
+      return el;
+    });
+    expect(input.min).toBe('1');
+    expect(input.max).toBe('720');
+    expect(document.querySelector('[data-testid="tx-target-window-warning"]')).not.toBeNull();
+
+    fireEvent.change(input, { target: { value: '12' } });
+    expect(saveBarCapture.current).not.toBeNull();
+    await saveBarCapture.current!.onSave();
+
+    const calls = csrfFetchMock.mock.calls as [string, RequestInit][];
+    const scopedCall = calls.find(([url]) => url.includes('sourceId='));
+    const globalCall = calls.find(([url]) => !url.includes('sourceId='));
+    expect(JSON.parse(scopedCall![1].body as string).txTargetMaxAgeHoursWhenUnlimited).toBe('12');
+    expect(JSON.parse(globalCall![1].body as string)).not.toHaveProperty('txTargetMaxAgeHoursWhenUnlimited');
+  });
+});
+
 describe('SettingsTab — split save (#4412 Phase 3 WP4b)', () => {
   it('save in source mode issues two POSTs: the scoped one carries exactly the ten Node Display keys, the unscoped one carries none of them', async () => {
     serverSettings = { localStatsIntervalMinutes: '45' };
@@ -332,10 +372,15 @@ describe('SettingsTab — split save (#4412 Phase 3 WP4b)', () => {
     // The non-negotiable assertion (spec §2.2 R6 / §4.4): by COUNT and by
     // NAME against NODE_DISPLAY_SETTING_KEYS itself, not a hand-copied list —
     // a key silently dropping from the scoped POST must fail this.
-    expect(Object.keys(scopedBody).sort()).toEqual([...NODE_DISPLAY_SETTING_KEYS].sort());
+    // #5376 adds the per-source TX-target window to the scoped body.
+    expect(Object.keys(scopedBody).sort()).toEqual([...SETTINGS_TAB_PER_SOURCE_KEYS].sort());
     for (const key of NODE_DISPLAY_SETTING_KEYS) {
+      expect(scopedBody).toHaveProperty(key);
+    }
+    for (const key of SETTINGS_TAB_PER_SOURCE_KEYS) {
       expect(globalBody).not.toHaveProperty(key);
     }
+    expect(scopedBody.txTargetMaxAgeHoursWhenUnlimited).toBe('24');
     // Sanity: the unscoped body still carries ordinary global keys.
     expect(globalBody).toHaveProperty('temperatureUnit');
   });
@@ -438,5 +483,247 @@ describe('SettingsTab — dimming trio dirty-tracking (#4412 Phase 3 WP4c)', () 
 
     await saveBarCapture.current!.onSave();
     await waitFor(() => expect(saveBarCapture.current!.hasChanges).toBe(false));
+  });
+});
+
+// #5364/#5365 Phase 1 WP5, spec §5.10/§6.
+describe('SettingsTab — likely-aircraft detection (#5364/#5365 Phase 1 WP5)', () => {
+  it('an unset source shows the hardcoded defaults: detection on, AGL 500, MSL 5000', async () => {
+    render(
+      <SourceProvider sourceId="source-a" sourceType="meshtastic_tcp">
+        <SettingsTab {...baseProps} mode="source" />
+      </SourceProvider>
+    );
+
+    await waitFor(() => {
+      const enabled = document.getElementById('aircraftDetectionEnabled') as HTMLInputElement;
+      const agl = document.getElementById('aircraftAglThresholdMeters') as HTMLInputElement;
+      const msl = document.getElementById('aircraftMslThresholdMeters') as HTMLInputElement;
+      expect(enabled.checked).toBe(true);
+      expect(agl.value).toBe('500');
+      expect(msl.value).toBe('5000');
+    });
+  });
+
+  it('loading source A with a stored aircraftAglThresholdMeters shows that value', async () => {
+    serverSettings = { aircraftAglThresholdMeters: '800' };
+    render(
+      <SourceProvider sourceId="source-a" sourceType="meshtastic_tcp">
+        <SettingsTab {...baseProps} mode="source" />
+      </SourceProvider>
+    );
+
+    await waitFor(() => {
+      const agl = document.getElementById('aircraftAglThresholdMeters') as HTMLInputElement;
+      expect(agl.value).toBe('800');
+    });
+  });
+
+  it('editing a threshold and saving sends it on the scoped POST only', async () => {
+    render(
+      <SourceProvider sourceId="source-a" sourceType="meshtastic_tcp">
+        <SettingsTab {...baseProps} mode="source" />
+      </SourceProvider>
+    );
+
+    const agl = await waitFor(() => {
+      const el = document.getElementById('aircraftAglThresholdMeters') as HTMLInputElement;
+      expect(el.value).toBe('500');
+      return el;
+    });
+
+    fireEvent.change(agl, { target: { value: '900' } });
+    await waitFor(() => expect(agl.value).toBe('900'));
+    expect(saveBarCapture.current!.hasChanges).toBe(true);
+
+    await saveBarCapture.current!.onSave();
+
+    const calls = csrfFetchMock.mock.calls as [string, RequestInit][];
+    const scopedCall = calls.find(([url]) => url.includes('sourceId='));
+    const globalCall = calls.find(([url]) => !url.includes('sourceId='));
+    expect(scopedCall).toBeDefined();
+    expect(globalCall).toBeDefined();
+    const scopedBody = JSON.parse(scopedCall![1].body as string);
+    const globalBody = JSON.parse(globalCall![1].body as string);
+    expect(scopedBody.aircraftAglThresholdMeters).toBe('900');
+    expect(globalBody).not.toHaveProperty('aircraftAglThresholdMeters');
+  });
+
+  it('clamps an out-of-range AGL threshold into AIRCRAFT_AGL_RANGE on change', async () => {
+    render(<SettingsTab {...baseProps} mode="source" />);
+
+    const agl = await waitFor(() => {
+      const el = document.getElementById('aircraftAglThresholdMeters') as HTMLInputElement;
+      expect(el.value).toBe('500');
+      return el;
+    });
+
+    fireEvent.change(agl, { target: { value: '10' } });
+    await waitFor(() => expect(agl.value).toBe('50')); // below min (50) -> clamped up
+
+    fireEvent.change(agl, { target: { value: '99999' } });
+    await waitFor(() => expect(agl.value).toBe('20000')); // above max (20000) -> clamped down
+  });
+
+  it('clamps an out-of-range MSL threshold into AIRCRAFT_MSL_RANGE on change', async () => {
+    render(<SettingsTab {...baseProps} mode="source" />);
+
+    const msl = await waitFor(() => {
+      const el = document.getElementById('aircraftMslThresholdMeters') as HTMLInputElement;
+      expect(el.value).toBe('5000');
+      return el;
+    });
+
+    fireEvent.change(msl, { target: { value: '10' } });
+    await waitFor(() => expect(msl.value).toBe('500')); // below min (500) -> clamped up
+
+    fireEvent.change(msl, { target: { value: '99999' } });
+    await waitFor(() => expect(msl.value).toBe('20000')); // above max (20000) -> clamped down
+  });
+
+  it('disables the threshold inputs when detection is off', async () => {
+    serverSettings = { aircraftDetectionEnabled: 'false' };
+    render(<SettingsTab {...baseProps} mode="source" />);
+
+    await waitFor(() => {
+      const enabled = document.getElementById('aircraftDetectionEnabled') as HTMLInputElement;
+      expect(enabled.checked).toBe(false);
+    });
+    const agl = document.getElementById('aircraftAglThresholdMeters') as HTMLInputElement;
+    const msl = document.getElementById('aircraftMslThresholdMeters') as HTMLInputElement;
+    expect(agl.disabled).toBe(true);
+    expect(msl.disabled).toBe(true);
+  });
+
+  it('shows the elevation-off warning when the global elevationEnabled setting is false', async () => {
+    serverSettings = { elevationEnabled: 'false' };
+    render(<SettingsTab {...baseProps} mode="source" />);
+
+    await waitFor(() => {
+      const section = document.getElementById('settings-node-display')!;
+      expect(within(section).getByText('settings.aircraft.warn_elevation_disabled')).toBeInTheDocument();
+    });
+  });
+
+  it('hides the elevation-off warning when elevationEnabled is on (or unset)', async () => {
+    render(<SettingsTab {...baseProps} mode="source" />);
+
+    await waitFor(() => {
+      const section = document.getElementById('settings-node-display')!;
+      expect(within(section).queryByText('settings.aircraft.warn_elevation_disabled')).not.toBeInTheDocument();
+    });
+  });
+
+  it('the aircraft controls render only inside #settings-node-display', async () => {
+    render(<SettingsTab {...baseProps} mode="source" />);
+
+    await waitFor(() => {
+      expect(document.getElementById('aircraftDetectionEnabled')).not.toBeNull();
+    });
+    const section = document.getElementById('settings-node-display')!;
+    expect(within(section).getByText('settings.aircraft.title')).toBeInTheDocument();
+    // Sanity: nothing with the same id exists twice (would indicate a leak
+    // outside the Node Display section).
+    expect(document.querySelectorAll('#aircraftDetectionEnabled').length).toBe(1);
+  });
+});
+
+describe('SettingsTab — aircraft age-out (#5364/#5365 Phase 2)', () => {
+  const byId = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
+
+  it('an unset source shows the defaults: off, 24 h, Ignore, and "not yet" for the last run', async () => {
+    render(
+      <SourceProvider sourceId="source-a" sourceType="meshtastic_tcp">
+        <SettingsTab {...baseProps} mode="source" />
+      </SourceProvider>
+    );
+
+    await waitFor(() => {
+      expect(byId<HTMLInputElement>('aircraftAgeOutEnabled').checked).toBe(false);
+      expect(byId<HTMLInputElement>('aircraftAgeOutHours').value).toBe('24');
+      expect(byId<HTMLSelectElement>('aircraftAgeOutAction').value).toBe('ignore');
+    });
+    // Hours and action are inactive while age-out is off.
+    expect(byId<HTMLInputElement>('aircraftAgeOutHours').disabled).toBe(true);
+    expect(byId<HTMLSelectElement>('aircraftAgeOutAction').disabled).toBe(true);
+    expect(screen.getByTestId('aircraft-age-out-last-run')).toHaveTextContent('settings.aircraft.age_out_last_run_never');
+    expect(screen.queryByTestId('aircraft-age-out-delete-warning')).not.toBeInTheDocument();
+  });
+
+  it('loads stored values and the read-only last-run line', async () => {
+    serverSettings = {
+      aircraftAgeOutEnabled: 'true',
+      aircraftAgeOutHours: '48',
+      aircraftAgeOutAction: 'delete',
+      aircraftAgeOutLastRunAt: String(Date.UTC(2026, 8, 26, 12, 0, 0)),
+      aircraftAgeOutLastResult: JSON.stringify({ agedOut: 2, fixed: 1, lifted: 3, deleted: 0 }),
+    };
+    render(<SettingsTab {...baseProps} mode="source" />);
+
+    await waitFor(() => {
+      expect(byId<HTMLInputElement>('aircraftAgeOutEnabled').checked).toBe(true);
+      expect(byId<HTMLInputElement>('aircraftAgeOutHours').value).toBe('48');
+      expect(byId<HTMLSelectElement>('aircraftAgeOutAction').value).toBe('delete');
+    });
+    // Delete carries its warning next to the select.
+    expect(screen.getByTestId('aircraft-age-out-delete-warning')).toHaveTextContent('settings.aircraft.age_out_delete_warning');
+    expect(screen.getByTestId('aircraft-age-out-last-run')).toHaveTextContent('settings.aircraft.age_out_last_run');
+    expect(screen.getByTestId('aircraft-age-out-last-run')).not.toHaveTextContent('never');
+  });
+
+  it('clamps hours into 6-168 on change', async () => {
+    serverSettings = { aircraftAgeOutEnabled: 'true' };
+    render(<SettingsTab {...baseProps} mode="source" />);
+
+    const hours = await waitFor(() => {
+      const el = byId<HTMLInputElement>('aircraftAgeOutHours');
+      expect(el.disabled).toBe(false);
+      return el;
+    });
+    fireEvent.change(hours, { target: { value: '2' } });
+    await waitFor(() => expect(hours.value).toBe('6'));
+    fireEvent.change(hours, { target: { value: '500' } });
+    await waitFor(() => expect(hours.value).toBe('168'));
+  });
+
+  it('saving sends the three postable keys on the scoped POST only, never the server-written pair', async () => {
+    serverSettings = {
+      aircraftAgeOutLastRunAt: '1700000000000',
+      aircraftAgeOutLastResult: JSON.stringify({ agedOut: 1, fixed: 0, lifted: 0, deleted: 0 }),
+    };
+    render(
+      <SourceProvider sourceId="source-a" sourceType="meshtastic_tcp">
+        <SettingsTab {...baseProps} mode="source" />
+      </SourceProvider>
+    );
+
+    const enabled = await waitFor(() => {
+      const el = byId<HTMLInputElement>('aircraftAgeOutEnabled');
+      expect(el).not.toBeNull();
+      return el;
+    });
+    fireEvent.click(enabled);
+    await waitFor(() => expect(byId<HTMLInputElement>('aircraftAgeOutHours').disabled).toBe(false));
+    fireEvent.change(byId<HTMLInputElement>('aircraftAgeOutHours'), { target: { value: '72' } });
+    fireEvent.change(byId<HTMLSelectElement>('aircraftAgeOutAction'), { target: { value: 'delete' } });
+    await waitFor(() => expect(byId<HTMLSelectElement>('aircraftAgeOutAction').value).toBe('delete'));
+    expect(saveBarCapture.current!.hasChanges).toBe(true);
+
+    await saveBarCapture.current!.onSave();
+
+    const calls = csrfFetchMock.mock.calls as [string, RequestInit][];
+    const scopedCall = calls.find(([url]) => url.includes('sourceId='));
+    const globalCall = calls.find(([url]) => !url.includes('sourceId='));
+    const scopedBody = JSON.parse(scopedCall![1].body as string);
+    const globalBody = JSON.parse(globalCall![1].body as string);
+    expect(scopedBody.aircraftAgeOutEnabled).toBe('true');
+    expect(scopedBody.aircraftAgeOutHours).toBe('72');
+    expect(scopedBody.aircraftAgeOutAction).toBe('delete');
+    for (const key of ['aircraftAgeOutEnabled', 'aircraftAgeOutHours', 'aircraftAgeOutAction',
+      'aircraftAgeOutLastRunAt', 'aircraftAgeOutLastResult']) {
+      expect(globalBody).not.toHaveProperty(key);
+    }
+    expect(scopedBody).not.toHaveProperty('aircraftAgeOutLastRunAt');
+    expect(scopedBody).not.toHaveProperty('aircraftAgeOutLastResult');
   });
 });

@@ -7,7 +7,7 @@
  */
 import { HOP_COUNT_EMOJIS, HOP_EMOJI_MAX, MQTT_SOURCE_EMOJI } from '../../utils/hopEmoji';
 
-export type FieldKind = 'text' | 'number' | 'nodeNum' | 'textarea' | 'select' | 'checkbox' | 'variable' | 'emoji' | 'fieldselect' | 'sourceMulti' | 'sendSourceMulti' | 'channelMulti' | 'geofence' | 'scriptselect' | 'regionSelect' | 'nodeMulti';
+export type FieldKind = 'text' | 'number' | 'nodeNum' | 'textarea' | 'select' | 'checkbox' | 'variable' | 'emoji' | 'fieldselect' | 'sourceMulti' | 'sendSourceMulti' | 'channelMulti' | 'geofence' | 'scriptselect' | 'regionSelect' | 'nodeMulti' | 'automationSelect';
 
 export interface FieldOpt { value: string; label: string; }
 export interface FieldGroup { label: string; options: FieldOpt[]; }
@@ -26,6 +26,15 @@ export interface FieldDef {
    */
   placeholderByTrigger?: Record<string, string>;
   help?: string;
+  /**
+   * `select` only: the option shown when the param is ABSENT (a block saved
+   * before the field existed), so the UI shows what the server will actually
+   * do instead of the browser's first option. New blocks are still seeded with
+   * the first option by defaultParams().
+   */
+  absentValue?: string;
+  /** `select` only: a warning rendered next to the control while the (effective) value matches a key. */
+  warningByValue?: Record<string, string>;
   advanced?: boolean;
   /** This `text`/`textarea` field accepts `{{ }}` tokens → highlight + typo-check. */
   tokens?: boolean;
@@ -255,6 +264,15 @@ export const TRIGGERS: BlockDef[] = [
     ],
   },
   {
+    type: 'trigger.becameLikelyAircraft',
+    label: 'A node becomes a likely aircraft',
+    description: 'Fires once when a node’s reported altitude puts it more than the source’s AGL threshold above the terrain (or above the MSL fallback when terrain elevation is unavailable). Sends nothing to the mesh; fires again only after the node drops back below the threshold. Meshtastic only. A wide MQTT feed can see many aircraft at once — narrow it with “Source is one of…”.',
+    fields: [
+      COOLDOWN,
+      COOLDOWN_SCOPE,
+    ],
+  },
+  {
     type: 'trigger.leftHome',
     label: 'A watched node leaves its home position',
     description: 'Fires when a hand-selected node moves farther than a threshold from its home/anchor position. Home is seeded from position-history inliers when available (else the first live fix), then gently averaged while within half the threshold. Use “Reset homes from history” on a saved automation to clear and re-seed. Default threshold is 300 m.',
@@ -327,7 +345,7 @@ export const TRIGGERS: BlockDef[] = [
 
 // ─── Comparison field registry (event / node / latest-telemetry) ─────────────
 
-const SUBJECT_NODE_TRIGGERS = ['trigger.message', 'trigger.nodeDiscovered', 'trigger.nodeUpdated', 'trigger.telemetry', 'trigger.geofence', 'trigger.becameMobile', 'trigger.leftHome', 'trigger.meshBeacon', 'trigger.nodeStale', 'trigger.nodeOnline', 'trigger.nodeRebooted', 'trigger.nodePowerChanged', 'trigger.batteryTrend'];
+const SUBJECT_NODE_TRIGGERS = ['trigger.message', 'trigger.nodeDiscovered', 'trigger.nodeUpdated', 'trigger.telemetry', 'trigger.geofence', 'trigger.becameMobile', 'trigger.leftHome', 'trigger.meshBeacon', 'trigger.nodeStale', 'trigger.nodeOnline', 'trigger.nodeRebooted', 'trigger.nodePowerChanged', 'trigger.batteryTrend', 'trigger.becameLikelyAircraft'];
 const hasSubjectNode = (t: string) => SUBJECT_NODE_TRIGGERS.includes(t);
 
 const EVENT_NUMERIC: Record<string, FieldOpt[]> = {
@@ -389,6 +407,13 @@ const EVENT_NUMERIC: Record<string, FieldOpt[]> = {
     { value: 'latestLevel', label: 'Latest battery (%)' },
   ],
   'trigger.becameMobile': [{ value: 'nodeNum', label: 'Node #' }, { value: 'mobile', label: 'Mobile flag (1)' }, { value: 'previousMobile', label: 'Previous mobile flag' }],
+  'trigger.becameLikelyAircraft': [
+    { value: 'nodeNum', label: 'Node #' },
+    { value: 'altitude', label: 'Altitude (m MSL)' },
+    { value: 'heightAboveGround', label: 'Height above ground (m, AGL basis only)' },
+    { value: 'groundElevation', label: 'Ground elevation (m)' },
+    { value: 'thresholdM', label: 'Threshold crossed (m)' },
+  ],
   'trigger.leftHome': [
     { value: 'nodeNum', label: 'Node #' },
     { value: 'distanceMeters', label: 'Distance from home (m)' },
@@ -605,6 +630,7 @@ export const CONDITIONS: BlockDef[] = [
 const MOVEMENT_MESSAGE_HINTS: Record<string, string> = {
   'trigger.leftHome': 'A quiet little node {{ node.longName }} has left the Shire and gone off on an unexpected adventure.',
   'trigger.becameMobile': 'A wild stationary node {{ node.longName }} just uprooted itself and headed towards Isengard!',
+  'trigger.becameLikelyAircraft': '{{ node.longName }} is {{ trigger.heightAboveGround }} m above the ground, probably flying.',
 };
 
 // ─── Actions (THEN) ──────────────────────────────────────────────────────────
@@ -714,6 +740,22 @@ export const ACTIONS: BlockDef[] = [
         ],
         help: 'Used when Request = Telemetry (Meshtastic). e.g. "Environment" for a remote weather sensor (#3835).',
       },
+      {
+        name: 'advertMode', label: 'Advert reach (MeshCore)', kind: 'select',
+        // Values mirror MeshCoreAdvertMode in src/types/meshcoreAdvert.ts.
+        // 'zero_hop' MUST be first: defaultParams() seeds it on new blocks.
+        options: [
+          { value: 'zero_hop', label: 'Zero-hop (nearby nodes only)' },
+          { value: 'flood', label: 'Flood (whole mesh)' },
+        ],
+        // Actions saved before this field existed have always flooded.
+        absentValue: 'flood',
+        showIf: { field: 'op', equals: 'advert' },
+        warningByValue: {
+          flood: 'Flood adverts are repeated by every repeater within 8 hops: with 20 repeaters in reach about 9 s (US) / 25 s (EU) of channel time each. Automated flood adverts run at most once per hour per source; extra floods are skipped and the step fails.',
+        },
+        help: 'Zero-hop reaches nodes in direct radio range; flood crosses the whole mesh. Meshtastic ignores this.',
+      },
       { name: 'sourceIds', label: 'Via sources', kind: 'sendSourceMulti', help: 'Which radio(s) to send the request through. Leave none to use the triggering source — but a source IS required for source-less triggers (Schedule / System).' },
       { name: 'to', label: 'Target node', kind: 'text', tokens: true, advanced: true, placeholder: 'blank = triggering node; {{ trigger.from }}', help: 'Node # (Meshtastic) or contact public key (MeshCore). Leave blank to target the triggering node. Not used for "Announce self".' },
       { name: 'channel', label: 'Channel #', kind: 'number', advanced: true, placeholder: 'blank = triggering channel', help: 'Meshtastic: which channel to send the request on — e.g. a private sensor channel. Ignored by MeshCore.' },
@@ -727,6 +769,37 @@ export const ACTIONS: BlockDef[] = [
       { name: 'sourceIds', label: 'Reboot which node(s)', kind: 'sendSourceMulti', help: 'The connected node(s) to reboot. Leave none to use the source that triggered the automation — but a source IS required for source-less triggers like Schedules and System events. (MQTT sources have no physical device and are excluded.)' },
       { name: 'targetNodeNum', label: 'Remote target node #', kind: 'nodeNum', advanced: true, placeholder: 'blank = locally-connected node; 1017730782 or !3ca956de', help: 'Meshtastic remote-admin reboot: leave blank to reboot the locally-connected node; set a node number to reboot a remote node over the mesh (uses the session-passkey admin mechanism — the target must have granted admin access). Setting the connected node’s own number is treated as a local reboot, not a remote one. Accepts a decimal node number or a hex id (!3ca956de). Ignored by MeshCore.' },
       { name: 'seconds', label: 'Reboot delay (seconds)', kind: 'number', advanced: true, placeholder: '10', help: 'Meshtastic: how long the device waits before rebooting (default 10s). Ignored by MeshCore.' },
+    ],
+  },
+  {
+    type: 'action.setAutomationEnabled',
+    label: 'Enable or disable an automation',
+    description: 'Turn another automation (or this one) on or off. Sends nothing on the mesh. If an automation disables itself, the rest of its actions are skipped.',
+    fields: [
+      {
+        name: 'automationId', label: 'Automation', kind: 'automationSelect',
+        help: 'Pick an automation, or choose "Enter an id or template" to type an id such as {{ var.targetAutomation }}. An id that matches no automation fails the step. Avoid building the id from message text: anyone who can message this node could then switch your automations.',
+      },
+      {
+        name: 'mode', label: 'Change', kind: 'select',
+        // Values mirror AutomationEnableMode in src/types/automation.ts.
+        // 'set' MUST be first: defaultParams() seeds it on new blocks.
+        options: [
+          { value: 'set', label: 'Set to' },
+          { value: 'toggle', label: 'Toggle (flip its current state)' },
+        ],
+        absentValue: 'set',
+      },
+      {
+        name: 'enabled', label: 'New state', kind: 'select',
+        // Stored as the strings 'true'/'false'; the engine coerces them. JSON
+        // mode also accepts a boolean or a {{ }} template.
+        options: [
+          { value: 'false', label: 'Disabled' },
+          { value: 'true', label: 'Enabled' },
+        ],
+        showIf: { field: 'mode', notEquals: 'toggle' },
+      },
     ],
   },
   {

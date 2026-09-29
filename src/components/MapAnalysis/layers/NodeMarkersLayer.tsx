@@ -12,6 +12,9 @@ import { markerAgeOpacity, MIN_MARKER_OPACITY } from '../../../utils/markerAgeOp
 import { isNodeEmphasized, selectionOpacity } from '../../../utils/nodeIdentity';
 import DashboardNodePopup, { type NodeSourceRef } from '../../Dashboard/DashboardNodePopup';
 import { NodeMarkersLayer as SharedNodeMarkersLayer, type NodeMarkerDescriptor } from '../../map/layers/NodeMarkersLayer';
+import { useMapContextOptional } from '../../../contexts/MapContext';
+import { DEFAULT_AIRCRAFT_DISPLAY_MODE } from '../../../utils/aircraftClassification';
+import { isAgedOutAircraft, AGED_OUT_AIRCRAFT_OPACITY } from '../../map/agedOutAircraft';
 import '../../../styles/nodes.css'; // `.node-popup-*` classes used by DashboardNodePopup
 
 interface HopEntry {
@@ -86,6 +89,9 @@ export default function NodeMarkersLayer() {
   // predicate the node picker (NodeMultiSelect) uses, so the two surfaces
   // never disagree about which nodes exist/are shown.
   const filteredNodes = useAnalysisNodes();
+  // #5364/#5365 Phase 1 WP4: same mode useAnalysisNodes already used for the
+  // Hide filter — 'show' never marks the badge either.
+  const aircraftMode = useMapContextOptional()?.aircraftDisplayMode ?? DEFAULT_AIRCRAFT_DISPLAY_MODE;
 
   // #3886: when the time slider is on, fade markers by recency across its
   // window — fully opaque at the window's newest edge, fading toward a floor as
@@ -116,20 +122,27 @@ export default function NodeMarkersLayer() {
     const isRouter = roleNum === 2;
     const roleCategory = getNodeTypeCategory(n);
     const markerKey = keyOf(n);
+    // Likely-aircraft badge (#5364/#5365 Phase 1 WP4): 'show' never marks.
+    // Aged-out aircraft (Phase 2) are only here when "Show aged-out" is on:
+    // always badged, and dimmed below.
+    const agedOut = isAgedOutAircraft(n);
+    const markAircraft = agedOut || (aircraftMode !== 'show' && n.likelyAircraft === true);
     // Reuse cached icon/position unless an input changed, so a poll that
     // returns identical data doesn't churn the marker and collapse an active
     // spiderfy fan. Selection IS part of the signature, so highlighting the
     // chosen node still re-renders just that marker.
-    const iconSig = `${hops}|${isSelected ? 1 : 0}|${isRouter ? 1 : 0}|${roleCategory}|${n.isUnmessagable ? 1 : 0}|${n.shortName ?? ''}|${mapPinStyle}|${mapPinColorMode}`;
+    const iconSig = `${hops}|${isSelected ? 1 : 0}|${isRouter ? 1 : 0}|${roleCategory}|${n.isUnmessagable ? 1 : 0}|${markAircraft ? 1 : 0}|${n.shortName ?? ''}|${mapPinStyle}|${mapPinColorMode}`;
     // A missing lastHeard sits at the floor here (treated as "oldest
     // visible"), intentionally diverging from DashboardMap where a missing
     // timestamp stays fully opaque — that surface age-gates upstream, this
     // one fades every marker across the raw slider window instead.
-    const markerOpacity = !fadeByAge
-      ? 1
-      : n.lastHeard != null
-        ? markerAgeOpacity(windowEndMs, windowStartMs, n.lastHeard * 1000)
-        : MIN_MARKER_OPACITY;
+    const markerOpacity = agedOut
+      ? AGED_OUT_AIRCRAFT_OPACITY
+      : !fadeByAge
+        ? 1
+        : n.lastHeard != null
+          ? markerAgeOpacity(windowEndMs, windowStartMs, n.lastHeard * 1000)
+          : MIN_MARKER_OPACITY;
     // Selection dimming (issue #3788 WP-C): applied via the leaflet `opacity`
     // prop only — NOT folded into `iconSig`/the divIcon — so the spiderfy fan
     // and icon cache don't churn when the selection changes. Empty selection
@@ -149,6 +162,7 @@ export default function NodeMarkersLayer() {
           isRouter,
           roleCategory,
           isUnmessagable: !!n.isUnmessagable,
+          isLikelyAircraft: markAircraft,
           shortName: n.shortName ?? undefined,
           showLabel: true,
           pinStyle: mapPinStyle,

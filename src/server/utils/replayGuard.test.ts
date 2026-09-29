@@ -2,8 +2,12 @@ import { describe, it, expect } from 'vitest';
 import {
   isStaleReplayRxTime,
   resolveLastHeardSec,
+  isLiveReception,
   MIN_PLAUSIBLE_UNIX_SEC,
   STALE_REPLAY_THRESHOLD_SEC,
+  LIVE_RECEPTION_WINDOW_SEC,
+  resolvePositionObservedAtMs,
+  resolveNodeDbPositionObservedAtMs,
 } from './replayGuard.js';
 
 // A fixed "now" well after the 2020 floor: 2026-06-19T00:00:00Z.
@@ -64,5 +68,96 @@ describe('resolveLastHeardSec', () => {
 
   it('returns now when rx_time is absent', () => {
     expect(resolveLastHeardSec(undefined, NOW_MS)).toBe(NOW_SEC);
+  });
+});
+
+describe('isLiveReception (#5101 P3 counter fix)', () => {
+  it('treats absent rx_time as live (node has no clock, cannot be a replay)', () => {
+    expect(isLiveReception(undefined, NOW_MS)).toBe(true);
+    expect(isLiveReception(null, NOW_MS)).toBe(true);
+    expect(isLiveReception(NaN, NOW_MS)).toBe(true);
+  });
+
+  it('treats an implausible (boot-relative) rx_time as live', () => {
+    expect(isLiveReception(0, NOW_MS)).toBe(true);
+    expect(isLiveReception(244027, NOW_MS)).toBe(true);
+    expect(isLiveReception(MIN_PLAUSIBLE_UNIX_SEC - 1, NOW_MS)).toBe(true);
+  });
+
+  it('treats a packet received roughly now as live', () => {
+    expect(isLiveReception(NOW_SEC, NOW_MS)).toBe(true);
+    expect(isLiveReception(NOW_SEC - 5, NOW_MS)).toBe(true);
+  });
+
+  it('tolerates ordinary delivery jitter just under the window', () => {
+    const justUnder = NOW_SEC - (LIVE_RECEPTION_WINDOW_SEC - 1);
+    expect(isLiveReception(justUnder, NOW_MS)).toBe(true);
+  });
+
+  it('is not live exactly past the window boundary', () => {
+    const atBoundary = NOW_SEC - LIVE_RECEPTION_WINDOW_SEC;
+    expect(isLiveReception(atBoundary, NOW_MS)).toBe(true); // <=, inclusive
+    const justOver = NOW_SEC - (LIVE_RECEPTION_WINDOW_SEC + 1);
+    expect(isLiveReception(justOver, NOW_MS)).toBe(false);
+  });
+
+  it('rejects a #5034-shaped replay: rx_time frozen 30 minutes in the past', () => {
+    const rxTime = NOW_SEC - 30 * 60;
+    expect(isLiveReception(rxTime, NOW_MS)).toBe(false);
+    // The same packet is still NOT flagged as a stale replay for lastHeard
+    // purposes — well under STALE_REPLAY_THRESHOLD_SEC (6h) — confirming
+    // this is a stricter, separate gate from resolveLastHeardSec/#4192.
+    expect(isStaleReplayRxTime(rxTime, NOW_SEC)).toBe(false);
+  });
+
+  it('rejects a multi-day/week-old replay (the original #4192 field report)', () => {
+    const rxTime = NOW_SEC - 20 * 24 * 60 * 60;
+    expect(isLiveReception(rxTime, NOW_MS)).toBe(false);
+  });
+
+  it('accepts small future skew (receiving node clock slightly ahead)', () => {
+    expect(isLiveReception(NOW_SEC + 5, NOW_MS)).toBe(true);
+    expect(isLiveReception(NOW_SEC + 60, NOW_MS)).toBe(true);
+  });
+});
+
+describe('resolvePositionObservedAtMs (#5401)', () => {
+  it('a live packet is stamped now', () => {
+    expect(resolvePositionObservedAtMs(NOW_SEC - 5, NOW_MS)).toBe(NOW_MS);
+  });
+
+  it('a packet with no or an implausible rx_time is treated as live', () => {
+    expect(resolvePositionObservedAtMs(undefined, NOW_MS)).toBe(NOW_MS);
+    expect(resolvePositionObservedAtMs(12_345, NOW_MS)).toBe(NOW_MS);
+  });
+
+  it('a replayed packet keeps its original reception time, not now', () => {
+    const rx = NOW_SEC - 3 * 3600;
+    expect(resolvePositionObservedAtMs(rx, NOW_MS)).toBe(rx * 1000);
+  });
+
+  it('just past the live window counts as a replay', () => {
+    const rx = NOW_SEC - LIVE_RECEPTION_WINDOW_SEC - 1;
+    expect(resolvePositionObservedAtMs(rx, NOW_MS)).toBe(rx * 1000);
+  });
+});
+
+describe('resolveNodeDbPositionObservedAtMs (#5401)', () => {
+  it("prefers the fix's own GPS time", () => {
+    expect(resolveNodeDbPositionObservedAtMs(NOW_SEC - 86_400, NOW_SEC - 60, NOW_MS)).toBe((NOW_SEC - 86_400) * 1000);
+  });
+
+  it("falls back to the radio's lastHeard for the node", () => {
+    expect(resolveNodeDbPositionObservedAtMs(0, NOW_SEC - 600, NOW_MS)).toBe((NOW_SEC - 600) * 1000);
+    expect(resolveNodeDbPositionObservedAtMs(undefined, NOW_SEC - 600, NOW_MS)).toBe((NOW_SEC - 600) * 1000);
+  });
+
+  it('never returns a time in the future', () => {
+    expect(resolveNodeDbPositionObservedAtMs(NOW_SEC + 3600, undefined, NOW_MS)).toBe(NOW_MS);
+  });
+
+  it('returns undefined when neither time is plausible, so the stored stamp is kept', () => {
+    expect(resolveNodeDbPositionObservedAtMs(0, 0, NOW_MS)).toBeUndefined();
+    expect(resolveNodeDbPositionObservedAtMs(MIN_PLAUSIBLE_UNIX_SEC - 1, null, NOW_MS)).toBeUndefined();
   });
 });

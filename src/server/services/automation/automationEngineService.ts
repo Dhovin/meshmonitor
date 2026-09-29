@@ -42,6 +42,7 @@ import {
   buildNodeOnlineContext,
   buildNodeRebootedContext,
   buildNodePowerChangedContext,
+  buildBecameLikelyAircraftContext,
   buildBatteryTrendContext,
   buildScheduleContext,
   messageMatchesFilter,
@@ -56,12 +57,13 @@ import {
 } from './triggerContext.js';
 import type { MeshCoreMessage } from '../../meshcoreManager.js';
 import type { ReticulumMessageRow } from '../../../db/repositories/reticulum.js';
+import type { NodeAircraftData } from '../dataEventEmitter.js';
 import { scheduleCron, validateCron } from '../../utils/cronScheduler.js';
 import { haversineKm, geofenceFires, pointInShape, geofenceCenter, normalizeGeofenceParams, normalizeGeofenceAnchor, shapeFromWaypoint, type GeofenceMode, type GeofenceShape } from './geo.js';
 import { evaluateGraph, type EvaluatorHooks } from './graphEvaluator.js';
 import { automationTraceBus } from './automationTraceBus.js';
 import { evaluateCondition } from './conditionEvaluator.js';
-import { executeAction, type ActionDeps } from './actionExecutor.js';
+import { executeAction, actionStepDetail, type ActionDeps, type SetAutomationEnabledResult } from './actionExecutor.js';
 import {
   type EngineEvalContext,
   type NodeDataProvider,
@@ -289,6 +291,13 @@ export class AutomationEngineService {
 
   /** triggerType → loaded automations. */
   private index = new Map<TriggerType, LoadedAutomation[]>();
+  /**
+   * Ids in the current {@link index} (#5445). A dispatch loop iterates the list it
+   * read before it started, so when an action reloads the engine mid-dispatch
+   * (action.setAutomationEnabled), a rule disabled a moment ago can still be
+   * ahead in that list. fireAutomation checks this set to skip it.
+   */
+  private liveIds = new Set<string>();
   /** automationId → cooldown key → last fired ms. Inner key shape: cooldownKeyFor(). */
   private lastFired = new Map<string, Map<string, number>>();
   /** automationId → fire timestamps (ms) within the current rate-limit window (#4577 Phase 2). */
@@ -311,7 +320,13 @@ export class AutomationEngineService {
   constructor(opts: EngineServiceOptions) {
     this.automationsRepo = opts.automationsRepo;
     this.vars = opts.varResolver;
-    this.deps = opts.deps;
+    // The engine owns action.setAutomationEnabled (#5445): it holds the repo and
+    // the reload. Layered over the caller's deps via the prototype chain so every
+    // mesh action still resolves to the caller's own implementation.
+    this.deps = Object.assign(Object.create(opts.deps) as ActionDeps, {
+      setAutomationEnabled: (a: Parameters<NonNullable<ActionDeps['setAutomationEnabled']>>[0]) =>
+        this.setAutomationEnabled(a),
+    });
     this.data = opts.data;
     this.homeAnchorsRepo = opts.homeAnchorsRepo ?? null;
     this.estimateHomeFromHistory = opts.estimateHomeFromHistory;
@@ -366,6 +381,7 @@ export class AutomationEngineService {
       index.get(entry.triggerType)!.push(entry);
     }
     this.index = index;
+    this.liveIds = new Set([...index.values()].flatMap((list) => list.map((a) => a.id)));
     // Drop cooldown state for automations that are no longer loaded (deleted or
     // disabled). They are unreachable — runTrigger/onSchedule/checkGeofences only
     // iterate `this.index` — so this is unobservable while they stay out of the
@@ -526,7 +542,7 @@ export class AutomationEngineService {
     if (!rateGate.ok) return { ran: false, reason: 'ratelimited', detail: rateGate.reason };
     this.markFired(a, gate.key, now);
     this.markRateLimited(a, now);
-    const fr = await this.fireAutomation(a, ctx, now);
+    const fr = await this.fireAutomation(a, ctx, now, { manual: true });
     return { ran: true, status: fr.status, actions: fr.actions, steps: fr.steps };
   }
 
@@ -540,7 +556,37 @@ export class AutomationEngineService {
       evaluateCondition: (node, ctx) => evaluateCondition(node, ctx),
       executeAction: (node, ctx) => executeAction(node, ctx, this.deps),
       applySetVar: (node, ctx) => this.applySetVar(node, ctx),
+      stepDetail: (node, value) => actionStepDetail(node, value),
+      haltReason: (ctx) => ctx.halt?.reason,
     };
+  }
+
+  /**
+   * action.setAutomationEnabled (#5445): write the new state, then reload the
+   * engine exactly as the /enable and /disable routes do. Skips the write and the
+   * reload when the state would not change. Returns null for an unknown id.
+   *
+   * Reloading mid-run is safe: load() swaps in a NEW index map rather than
+   * mutating the old one, and the in-flight run holds its own LoadedAutomation
+   * (graph included), so the run finishes against what it started with. The
+   * only thing that can go stale is the rest of the current dispatch loop,
+   * which {@link liveIds} covers.
+   */
+  private async setAutomationEnabled(a: {
+    automationId: string;
+    mode: 'set' | 'toggle';
+    enabled?: boolean;
+  }): Promise<SetAutomationEnabledResult | null> {
+    const row = await this.automationsRepo.getAutomation(a.automationId);
+    if (!row) return null;
+    const previous = Boolean(row.enabled);
+    const enabled = a.mode === 'toggle' ? !previous : Boolean(a.enabled);
+    if (enabled !== previous) {
+      await this.automationsRepo.setEnabled(row.id, enabled);
+      logger.info(`[AutomationEngine] automation "${row.name}" ${enabled ? 'enabled' : 'disabled'} by an automation action`);
+      await this.load();
+    }
+    return { automationId: row.id, name: row.name, previous, enabled };
   }
 
   /** flow.setVar handling: set / clear / flag / increment a user variable. */
@@ -732,13 +778,26 @@ export class AutomationEngineService {
    * row. Returns a compact result the live trace reuses (the persisted run-log
    * shape is unchanged).
    */
-  private async fireAutomation(a: LoadedAutomation, ctx: TriggerContext, now: number): Promise<FireResult> {
+  private async fireAutomation(
+    a: LoadedAutomation,
+    ctx: TriggerContext,
+    now: number,
+    opts: { manual?: boolean } = {},
+  ): Promise<FireResult> {
+    // Disabled (or deleted) after this dispatch began — most often by an
+    // action.setAutomationEnabled in a rule that ran just before it on the same
+    // event (#5445). Run Now is exempt: it fires disabled automations on purpose.
+    if (!opts.manual && !this.liveIds.has(a.id)) {
+      logger.debug(`[AutomationEngine] automation "${a.name}" was disabled mid-dispatch; not firing`);
+      return { status: 'completed', conditionResults: {}, actions: [], steps: [] };
+    }
     const evalCtx: EngineEvalContext = {
       trigger: ctx,
       vars: this.vars,
       data: this.data,
       varCtx: varContextFromTrigger(ctx),
       now,
+      automationId: a.id,
     };
     try {
       const result = await evaluateGraph(a.graph, evalCtx, this.hooks(), { maxActions: this.maxActions });
@@ -993,6 +1052,23 @@ export class AutomationEngineService {
   }
 
   /**
+   * A node's altitude crossed into the likely-aircraft flagged state
+   * (`trigger.becameLikelyAircraft`, #5364/#5365 Phase 1 WP3). Detection
+   * (classification, hysteresis, and the `previous !== true && current ===
+   * true` transition check) already happened at the classification-queue
+   * seam (`aircraftClassificationService.ts`, only for `reason: 'position'`
+   * jobs — backfill and settings recomputes never reach here), so this is a
+   * pure event entry point: build the context and fire.
+   *
+   * No self-origin guard (#3914) here — same family as {@link onNodeRebooted}:
+   * no automation action can change a node's reported altitude, so there is no
+   * self-trigger loop to guard against.
+   */
+  async onBecameLikelyAircraft(d: NodeAircraftData, sourceId: string | null): Promise<number> {
+    return this.runTrigger(buildBecameLikelyAircraftContext(d, sourceId, this.now()));
+  }
+
+  /**
    * A node's power source flipped between external/USB power and battery
    * (`trigger.nodePowerChanged`, Device Health #4558 Phase C). Detection (reading
    * the prior batteryLevel from the DB and comparing against the firmware's > 100
@@ -1104,6 +1180,15 @@ export class AutomationEngineService {
     if (!entries || entries.length === 0) return 0;
     const node = await this.data.getNode(sourceId, nodeNum);
     if (!node || node.latitude == null || node.longitude == null) return 0;
+    // #5363: judge the sign-flip corrected point when correction is on for the
+    // node's source; otherwise (or on any failure) the reported point.
+    let lat = node.latitude;
+    let lng = node.longitude;
+    if (this.data.correctPosition) {
+      const bits = (node as { positionPrecisionBits?: number | null }).positionPrecisionBits;
+      const c = await this.data.correctPosition(sourceId, lat, lng, bits).catch(() => null);
+      if (c) { lat = c.latitude; lng = c.longitude; }
+    }
     const now = this.now();
     let fired = 0;
     for (const a of entries) {
@@ -1124,7 +1209,7 @@ export class AutomationEngineService {
           if (automationTraceBus.activeCount() > 0 && automationTraceBus.isTracing(a.id, now)) {
             this.emitTrace(
               a,
-              buildGeofenceContext(nodeNum, mode, node.latitude, node.longitude, 0, sourceId, now),
+              buildGeofenceContext(nodeNum, mode, lat, lng, 0, sourceId, now),
               now,
               { outcome: 'prefiltered', reason: `waypoint ${anchor.waypointId} not found on source ${anchor.sourceId} — fence cannot be resolved` },
             );
@@ -1137,16 +1222,16 @@ export class AutomationEngineService {
       }
       if (!shape) continue;
 
-      const inside = pointInShape(node.latitude, node.longitude, shape);
+      const inside = pointInShape(lat, lng, shape);
       // Distance to the region's reference point (circle center / polygon
       // centroid) so {{ trigger.distanceKm }} stays meaningful for both shapes.
       const center = geofenceCenter(shape);
-      const distanceKm = haversineKm(node.latitude, node.longitude, center.lat, center.lng);
+      const distanceKm = haversineKm(lat, lng, center.lat, center.lng);
       const prev = this.getGeofenceBaseline(a, nodeNum);
       this.setGeofenceBaseline(a, nodeNum, inside, now);
 
       const traced = automationTraceBus.activeCount() > 0 && automationTraceBus.isTracing(a.id, now);
-      const geoCtx = buildGeofenceContext(nodeNum, mode, node.latitude, node.longitude, distanceKm, sourceId, now);
+      const geoCtx = buildGeofenceContext(nodeNum, mode, lat, lng, distanceKm, sourceId, now);
 
       if (!geofenceFires(prev, inside, mode)) {
         if (traced) this.emitTrace(a, geoCtx, now, { outcome: 'prefiltered', reason: prev === undefined ? 'first sighting — baseline only' : `no ${mode} transition (node ${inside ? 'inside' : 'outside'})` });

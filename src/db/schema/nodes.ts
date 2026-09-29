@@ -39,6 +39,9 @@ export const nodesSqlite = sqliteTable('nodes', {
   channelUtilization: real('channelUtilization'),
   airUtilTx: real('airUtilTx'),
   lastHeard: integer('lastHeard'),
+  // #5390: earliest reception this source recorded for the node, Unix SECONDS
+  // (same unit as lastHeard). Set once from the first plausible lastHeard; never overwritten.
+  firstHeard: integer('firstHeard'),
   snr: real('snr'),
   rssi: integer('rssi'),
   lastTracerouteRequest: integer('lastTracerouteRequest'),
@@ -100,6 +103,23 @@ export const nodesSqlite = sqliteTable('nodes', {
   notes: text('notes'),
   // Time sync
   lastTimeSync: integer('lastTimeSync'),
+  // When this row was created by importing a contact URL rather than by
+  // hearing the node (#5317). NULL for every normally-discovered node.
+  importedAt: integer('importedAt'),
+  // Likely-aircraft classification (#5364/#5365, migration 175). No DEFAULT,
+  // no index. `upsertNode` never writes these — only the aircraft
+  // classification repository methods do (like mobile/notes).
+  likelyAircraft: integer('likelyAircraft', { mode: 'boolean' }),
+  aircraftBasis: text('aircraftBasis'),
+  groundElevation: real('groundElevation'),
+  heightAboveGround: real('heightAboveGround'),
+  aircraftClassifiedAt: integer('aircraftClassifiedAt'),
+  // Aircraft age-out + "confirmed fixed" mark (#5364/#5365 Phase 2,
+  // migration 177). Never written by `upsertNode`.
+  aircraftAgedOutAt: integer('aircraftAgedOutAt'),
+  aircraftFixedAt: integer('aircraftFixedAt'),
+  aircraftFixedLatitude: real('aircraftFixedLatitude'),
+  aircraftFixedLongitude: real('aircraftFixedLongitude'),
   // Timestamps
   createdAt: integer('createdAt').notNull(),
   updatedAt: integer('updatedAt').notNull(),
@@ -138,6 +158,9 @@ export const nodesPostgres = pgTable('nodes', {
   channelUtilization: pgReal('channelUtilization'),
   airUtilTx: pgReal('airUtilTx'),
   lastHeard: pgBigint('lastHeard', { mode: 'number' }),
+  // #5390: earliest reception this source recorded for the node, Unix SECONDS
+  // (same unit as lastHeard). Set once from the first plausible lastHeard; never overwritten.
+  firstHeard: pgBigint('firstHeard', { mode: 'number' }),
   snr: pgReal('snr'),
   rssi: pgInteger('rssi'),
   lastTracerouteRequest: pgBigint('lastTracerouteRequest', { mode: 'number' }),
@@ -198,6 +221,20 @@ export const nodesPostgres = pgTable('nodes', {
   notes: pgText('notes'),
   // Time sync
   lastTimeSync: pgBigint('lastTimeSync', { mode: 'number' }),
+  // See the SQLite table above (#5317).
+  importedAt: pgBigint('importedAt', { mode: 'number' }),
+  // Likely-aircraft classification (#5364/#5365, migration 175). See the
+  // SQLite table above.
+  likelyAircraft: pgBoolean('likelyAircraft'),
+  aircraftBasis: pgText('aircraftBasis'),
+  groundElevation: pgDoublePrecision('groundElevation'),
+  heightAboveGround: pgDoublePrecision('heightAboveGround'),
+  aircraftClassifiedAt: pgBigint('aircraftClassifiedAt', { mode: 'number' }),
+  // Aircraft age-out + fixed mark (migration 177). See the SQLite table above.
+  aircraftAgedOutAt: pgBigint('aircraftAgedOutAt', { mode: 'number' }),
+  aircraftFixedAt: pgBigint('aircraftFixedAt', { mode: 'number' }),
+  aircraftFixedLatitude: pgDoublePrecision('aircraftFixedLatitude'),
+  aircraftFixedLongitude: pgDoublePrecision('aircraftFixedLongitude'),
   // Timestamps
   createdAt: pgBigint('createdAt', { mode: 'number' }).notNull(),
   updatedAt: pgBigint('updatedAt', { mode: 'number' }).notNull(),
@@ -235,6 +272,9 @@ export const nodesMysql = mysqlTable('nodes', {
   channelUtilization: myDouble('channelUtilization'),
   airUtilTx: myDouble('airUtilTx'),
   lastHeard: myBigint('lastHeard', { mode: 'number' }),
+  // #5390: earliest reception this source recorded for the node, Unix SECONDS
+  // (same unit as lastHeard). Set once from the first plausible lastHeard; never overwritten.
+  firstHeard: myBigint('firstHeard', { mode: 'number' }),
   snr: myDouble('snr'),
   rssi: myInt('rssi'),
   lastTracerouteRequest: myBigint('lastTracerouteRequest', { mode: 'number' }),
@@ -295,6 +335,20 @@ export const nodesMysql = mysqlTable('nodes', {
   notes: myVarchar('notes', { length: 2000 }),
   // Time sync
   lastTimeSync: myBigint('lastTimeSync', { mode: 'number' }),
+  // See the SQLite table above (#5317).
+  importedAt: myBigint('importedAt', { mode: 'number' }),
+  // Likely-aircraft classification (#5364/#5365, migration 175). See the
+  // SQLite table above.
+  likelyAircraft: myBoolean('likelyAircraft'),
+  aircraftBasis: myVarchar('aircraftBasis', { length: 8 }),
+  groundElevation: myDouble('groundElevation'),
+  heightAboveGround: myDouble('heightAboveGround'),
+  aircraftClassifiedAt: myBigint('aircraftClassifiedAt', { mode: 'number' }),
+  // Aircraft age-out + fixed mark (migration 177). See the SQLite table above.
+  aircraftAgedOutAt: myBigint('aircraftAgedOutAt', { mode: 'number' }),
+  aircraftFixedAt: myBigint('aircraftFixedAt', { mode: 'number' }),
+  aircraftFixedLatitude: myDouble('aircraftFixedLatitude'),
+  aircraftFixedLongitude: myDouble('aircraftFixedLongitude'),
   // Timestamps
   createdAt: myBigint('createdAt', { mode: 'number' }).notNull(),
   updatedAt: myBigint('updatedAt', { mode: 'number' }).notNull(),

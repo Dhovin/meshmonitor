@@ -8,7 +8,8 @@ import { logger } from '../../utils/logger.js';
 import { RequestHandler } from 'express';
 import { ResourceType } from '../../types/permission.js';
 import { fallbackManager } from '../meshtasticManager.js';
-import { resolveSourceManager } from '../utils/resolveSourceManager.js';
+import { resolveSourceManager, resolveOwnMeshtasticManager } from '../utils/resolveSourceManager.js';
+import { refuseNonMeshtasticSource, isNonMeshtasticSource } from '../utils/requireMeshtasticDeviceSource.js';
 import { optionalAuth, requirePermission, hasPermission } from '../auth/authMiddleware.js';
 import {
   getUserReadableVirtualChannelIds,
@@ -17,11 +18,13 @@ import {
   virtualChannelDbId,
   hasAnyReadableVirtualChannel,
 } from '../utils/virtualChannelPermissions.js';
+import { resolveMessageReadAccess } from '../utils/messageReadAccess.js';
 import { parseDestinationNum } from '../utils/parseDestination.js';
 import { transformDbMessageToMeshMessage } from '../utils/transformDbMessage.js';
 import { filterNodesByChannelPermission } from '../utils/nodeEnhancer.js';
 import { ok, fail } from '../utils/apiResponse.js';
 import { isTxDisabledError } from '../errors/txDisabledError.js';
+import { PortNum } from '../constants/meshtastic.js';
 
 const router = express.Router();
 
@@ -920,17 +923,12 @@ router.get('/', optionalAuth(), async (req, res) => {
     // check keeps its original union-across-sources meaning.
     const messagesSourceId = req.query.sourceId as string | undefined;
 
-    // Check if user has either any channel permission or messages permission
-    const isAdmin = req.user?.isAdmin === true;
-    const hasChannelsRead = isAdmin || (req.user ? await hasPermission(req.user, 'channel_0', 'read', messagesSourceId) : false);
-    const hasMessagesRead = isAdmin || (req.user ? await hasPermission(req.user, 'messages', 'read', messagesSourceId) : false);
-    // Virtual (Channel Database) channels are gated by per-entry `canRead`
-    // grants, not the channel_0..7 RBAC resources. Load them so virtual-channel
-    // readers — including MQTT-bridge and anonymous users — can see their
-    // messages instead of getting a blanket 403 / empty list.
-    const readableVirtual = await getUserReadableVirtualChannelIds(req.user, isAdmin);
+    // Resolved once, shared with GET /api/messages/counts so the two cannot
+    // drift apart (#5101). See messageReadAccess.ts for the per-check
+    // comments carried over from this handler's pre-extraction form.
+    const access = await resolveMessageReadAccess(req.user, messagesSourceId);
 
-    if (!hasChannelsRead && !hasMessagesRead && !hasAnyReadableVirtualChannel(readableVirtual)) {
+    if (!access.canReadAny) {
       return res.status(403).json({
         error: 'Insufficient permissions',
         code: 'FORBIDDEN',
@@ -942,39 +940,7 @@ router.get('/', optionalAuth(), async (req, res) => {
     const defaultMgr = getPrimaryMeshtasticManager(sourceManagerRegistry) ?? fallbackManager;
     let messages = await defaultMgr.getRecentMessages(limit, messagesSourceId);
 
-    // MM-SEC-3: pre-compute the channels this caller may read so we can
-    // strip messages from hidden channels even when the caller has the
-    // generic `channel_0:read` permission.
-    const authorizedChannelIds = new Set<number>();
-    if (isAdmin) {
-      for (let id = 0; id <= 7; id++) authorizedChannelIds.add(id);
-    } else if (req.user) {
-      for (let id = 0; id <= 7; id++) {
-        const channelResource = `channel_${id}` as import('../../types/permission.js').ResourceType;
-        // Scoped for the same reason as the gates above — an un-scoped check
-        // here would let a channel grant on one source unhide that channel's
-        // messages on every other source.
-        if (await hasPermission(req.user, channelResource, 'read', messagesSourceId)) authorizedChannelIds.add(id);
-      }
-    }
-
-    // Filter messages based on permissions.
-    // - DMs (channel -1) require `messages:read`.
-    // - Virtual (Channel Database) channels require a per-entry `canRead`
-    //   grant — the channel_0..7 gate can never authorize a >= CHANNEL_DB_OFFSET
-    //   slot.
-    // - Physical channel messages require BOTH the legacy `channel_0:read` gate
-    //   above AND a per-channel `channel_${id}:read` for the message's actual
-    //   channel.
-    messages = messages.filter(msg => {
-      if (msg.channel === -1) return hasMessagesRead;
-      if (isVirtualChannelNumber(msg.channel)) {
-        // readableVirtual resolves to 'all' for admins, so this already grants
-        // them every virtual channel — no separate isAdmin short-circuit needed.
-        return canReadVirtualChannelNumber(msg.channel, readableVirtual);
-      }
-      return hasChannelsRead && (isAdmin || authorizedChannelIds.has(msg.channel));
-    });
+    messages = messages.filter(msg => access.canReadChannel(msg.channel));
 
     res.json(messages);
   } catch (error) {
@@ -1086,7 +1052,9 @@ router.get('/direct/:nodeId1/:nodeId2', requirePermission('messages', 'read'), a
 router.post('/mark-read', optionalAuth(), async (req, res) => {
   try {
     const { messageIds, channelId, nodeId, beforeTimestamp, allDMs, sourceId: markReadSourceId } = req.body;
-    const markReadManager = resolveSourceManager(markReadSourceId);
+    // The local node is THIS source's own node. A non-Meshtastic source has
+    // none; falling back to the primary would mark the primary's DMs (#5375).
+    const markReadManager = resolveOwnMeshtasticManager(markReadSourceId);
 
     // If marking by channelId, check per-channel read permission. Virtual
     // (Channel Database) channels use per-entry `canRead` grants rather than a
@@ -1135,8 +1103,11 @@ router.post('/mark-read', optionalAuth(), async (req, res) => {
       markedCount = messageIds.length;
     } else if (allDMs) {
       // Mark ALL DMs as read
-      const localNodeInfo = markReadManager.getLocalNodeInfo();
+      const localNodeInfo = markReadManager?.getLocalNodeInfo() ?? null;
       if (!localNodeInfo) {
+        // No local node on an MQTT/other non-Meshtastic source: there are no
+        // DMs to or from "us", so there is nothing to mark.
+        if (isNonMeshtasticSource(markReadSourceId)) return res.json({ marked: 0 });
         return res.status(500).json({ error: 'Local node not connected' });
       }
       markedCount = await databaseService.markAllDMMessagesAsReadAsync(localNodeInfo.nodeId, userId);
@@ -1145,8 +1116,11 @@ router.post('/mark-read', optionalAuth(), async (req, res) => {
       markedCount = await databaseService.markChannelMessagesAsReadAsync(channelId, userId, beforeTimestamp, markReadSourceId);
     } else if (nodeId) {
       // Mark all DMs with a node as read (permission already checked above)
-      const localNodeInfo = markReadManager.getLocalNodeInfo();
+      const localNodeInfo = markReadManager?.getLocalNodeInfo() ?? null;
       if (!localNodeInfo) {
+        // No local node on an MQTT/other non-Meshtastic source: there are no
+        // DMs to or from "us", so there is nothing to mark.
+        if (isNonMeshtasticSource(markReadSourceId)) return res.json({ marked: 0 });
         return res.status(500).json({ error: 'Local node not connected' });
       }
       markedCount = await databaseService.markDMMessagesAsReadAsync(localNodeInfo.nodeId, nodeId, userId, beforeTimestamp);
@@ -1158,6 +1132,48 @@ router.post('/mark-read', optionalAuth(), async (req, res) => {
   } catch (error) {
     logger.error('Error marking messages as read:', error);
     res.status(500).json({ error: 'Failed to mark messages as read' });
+  }
+});
+
+/**
+ * GET /api/messages/counts
+ * Total message count for one source, split RF/UDP/MQTT, for the Info tab's
+ * Total Messages breakdown (#5101). Shares its permission gate with
+ * `GET /api/messages` via `resolveMessageReadAccess` so the total can never
+ * drift from what the list endpoint would actually show the same caller.
+ *
+ * Excludes TRACEROUTE_APP, matching the poll's message-count window
+ * (`pollRoutes.ts` ~156) — traceroute rows aren't "messages" in the UI sense.
+ * `total === rf + udp + mqtt` always.
+ */
+router.get('/counts', optionalAuth(), async (req, res) => {
+  try {
+    const sourceId = typeof req.query.sourceId === 'string' && req.query.sourceId.length > 0
+      ? req.query.sourceId
+      : undefined;
+    if (!sourceId) {
+      return fail(res, 400, 'MISSING_SOURCE_ID', 'sourceId is required');
+    }
+
+    const access = await resolveMessageReadAccess(req.user, sourceId);
+    if (!access.canReadAny) {
+      return fail(res, 403, 'FORBIDDEN', 'Insufficient permissions', {
+        required: { resource: 'channel_0 or messages', action: 'read' },
+      });
+    }
+
+    const rows = await databaseService.getMessageCountsByChannelAndTransportAsync(sourceId, [PortNum.TRACEROUTE_APP]);
+
+    const byTransport = { rf: 0, udp: 0, mqtt: 0 };
+    for (const row of rows) {
+      if (!access.canReadChannel(row.channel)) continue;
+      byTransport[row.transportClass] += row.count;
+    }
+
+    return ok(res, { sourceId, total: byTransport.rf + byTransport.udp + byTransport.mqtt, byTransport });
+  } catch (error) {
+    logger.error('Error fetching message counts:', error);
+    return fail(res, 500, 'MESSAGE_COUNTS_FAILED', 'Failed to fetch message counts');
   }
 });
 
@@ -1214,8 +1230,11 @@ router.get('/unread-counts', optionalAuth(), async (req, res) => {
     // source can keep a badge lit for messages that aren't visible in the
     // current source's tab.
     const excludeMqtt = req.query.excludeMqtt === 'true';
+    // DMs count against THIS source's own node. A non-Meshtastic source has no
+    // local node, so DM-to-local counting is skipped rather than counting the
+    // primary TCP node's DMs (#5375).
     const unreadManager = resolveSourceManager(unreadSourceId);
-    const localNodeInfo = unreadManager.getLocalNodeInfo();
+    const localNodeInfo = resolveOwnMeshtasticManager(unreadSourceId)?.getLocalNodeInfo() ?? null;
 
     const result: {
       channels?: { [channelId: number]: number };
@@ -1561,7 +1580,8 @@ router.get('/first-unread', optionalAuth(), async (req, res) => {
     const userId = req.user?.id ?? null;
     const excludeMqtt = req.query.excludeMqtt === 'true';
     const manager = resolveSourceManager(scopedSourceId);
-    const localNodeInfo = manager.getLocalNodeInfo();
+    // THIS source's own node only; none on a non-Meshtastic source (#5375).
+    const localNodeInfo = resolveOwnMeshtasticManager(scopedSourceId)?.getLocalNodeInfo() ?? null;
 
     const raw = await databaseService.getFirstUnreadTimestampsAsync(
       userId,
@@ -1696,6 +1716,11 @@ router.post('/send', optionalAuth(), async (req, res) => {
         });
       }
     }
+
+    // An MQTT broker/bridge (or any non-Meshtastic) source has no radio of its
+    // own; resolveSourceManager() would hand back the PRIMARY TCP manager and
+    // transmit through a radio the user did not pick (#5375). Refuse instead.
+    if (await refuseNonMeshtasticSource(res, reqSourceId, 'message sends')) return;
 
     // Route to the correct source manager when sourceId is provided
     const activeManager = (resolveSourceManager(reqSourceId));

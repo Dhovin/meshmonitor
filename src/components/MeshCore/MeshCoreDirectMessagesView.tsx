@@ -1,4 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { MeshCoreIgnoreBlockControls } from './MeshCoreIgnoreBlockControls';
+import type { MeshCoreFilterMode } from '../../hooks/useMeshCoreFilters';
 import { useTranslation } from 'react-i18next';
 import {
   MeshCoreMessage, MeshCoreActions, ConnectionStatus, MeshCoreNode,
@@ -23,6 +25,7 @@ import {
   isChannelPseudoKey,
 } from './meshcoreUnreadStore';
 import { UiIcon } from '../icons';
+import { uniquePrefixMatch } from '../../utils/meshcoreKeyMatch';
 
 interface MeshCoreDirectMessagesViewProps {
   messages: MeshCoreMessage[];
@@ -51,6 +54,15 @@ interface MeshCoreDirectMessagesViewProps {
    *  Phase 2). Threaded to MeshCoreContactDetailPanel and
    *  MeshCoreNodeTelemetryConfig; WP3 wires the DM send-box gate itself. */
   receiveOnly?: boolean;
+  /**
+   * Ignore / Block entries for this source (#5408). Peers with an entry are
+   * hidden from the list (the selected one stays reachable so it can be
+   * taken off the list). When `onSetIgnoredNode` is given, the detail pane
+   * shows Ignore / Block controls.
+   */
+  ignoredNodes?: ReadonlyArray<{ publicKey: string; mode: MeshCoreFilterMode }>;
+  onSetIgnoredNode?: (publicKey: string, mode: MeshCoreFilterMode, name: string | null) => Promise<unknown>;
+  onRemoveIgnoredNode?: (publicKey: string) => Promise<unknown>;
 }
 
 /** True when the publicKey is a real 64-char hex (i.e. not a synthetic / prefix key). */
@@ -81,6 +93,9 @@ export const MeshCoreDirectMessagesView: React.FC<MeshCoreDirectMessagesViewProp
   sourceId,
   initialSelectedContact,
   receiveOnly = false,
+  ignoredNodes,
+  onSetIgnoredNode,
+  onRemoveIgnoredNode,
 }) => {
   const { t } = useTranslation();
   const { hasPermission } = useAuth();
@@ -137,6 +152,16 @@ export const MeshCoreDirectMessagesView: React.FC<MeshCoreDirectMessagesViewProp
   // contacts. Build a publicKey -> isFavorite lookup so favorited peers can be
   // pinned to the top of the DM list (issue #3620), mirroring the Meshtastic
   // DM list and the MeshCore node list.
+  // #5390: durable First Heard (epoch ms) lives on the node rows, not the
+  // live contact records, so the detail panel reads it from here.
+  const firstHeardByKey = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const n of nodes) {
+      if (n.publicKey && typeof n.firstHeard === 'number') map.set(n.publicKey, n.firstHeard);
+    }
+    return map;
+  }, [nodes]);
+
   const favoriteByKey = useMemo(() => {
     const map = new Map<string, boolean>();
     for (const n of nodes) {
@@ -153,10 +178,9 @@ export const MeshCoreDirectMessagesView: React.FC<MeshCoreDirectMessagesViewProp
     return (key: string): string => {
       if (!key) return key;
       if (contactsByKey.has(key)) return key;
-      for (const c of contacts) {
-        if (c.publicKey && c.publicKey.startsWith(key)) return c.publicKey;
-      }
-      return key;
+      // Unique match only (#5349): an ambiguous prefix keeps its own entry
+      // rather than merging into whichever colliding contact comes first.
+      return uniquePrefixMatch(contacts, key)?.publicKey ?? key;
     };
   }, [contacts, contactsByKey]);
 
@@ -165,6 +189,11 @@ export const MeshCoreDirectMessagesView: React.FC<MeshCoreDirectMessagesViewProp
     if (a === b) return true;
     return a.startsWith(b) || b.startsWith(a);
   };
+
+  const ignoredModeByKey = useMemo(
+    () => new Map((ignoredNodes ?? []).map((e) => [e.publicKey.toLowerCase(), e.mode] as const)),
+    [ignoredNodes],
+  );
 
   // Channel messages carry synthetic `channel-${idx}` keys (see the shared
   // `isChannelPseudoKey` in meshcoreUnreadStore) — they are NOT real DM peers
@@ -210,6 +239,12 @@ export const MeshCoreDirectMessagesView: React.FC<MeshCoreDirectMessagesViewProp
         if (keysMatch(key, selfKey)) peers.delete(key);
       }
     }
+    // Ignore / Block (#5408): hide listed peers, except the open one.
+    if (ignoredModeByKey.size > 0) {
+      for (const key of Array.from(peers)) {
+        if (ignoredModeByKey.has(key.toLowerCase()) && key !== selected) peers.delete(key);
+      }
+    }
     const peerNameFor = (key: string): string => {
       const c = contactsByKey.get(key);
       return c?.advName || c?.name || key;
@@ -228,7 +263,7 @@ export const MeshCoreDirectMessagesView: React.FC<MeshCoreDirectMessagesViewProp
       const bt = lastMessageAt.get(b) ?? 0;
       return (at - bt) * dir;
     });
-  }, [messages, contacts, selfKey, canonicalize, contactsByKey, favoriteByKey, sortField, sortDirection]);
+  }, [messages, contacts, selfKey, canonicalize, contactsByKey, favoriteByKey, sortField, sortDirection, ignoredModeByKey, selected]);
 
   // Issue #3922 (MeshCore): let the conversation filter match on message
   // *content*, not just the contact's name / public key. Precompute the set of
@@ -562,8 +597,14 @@ export const MeshCoreDirectMessagesView: React.FC<MeshCoreDirectMessagesViewProp
                 onPingZeroHop={actions.pingContactZeroHop}
                 onDiscoverPath={actions.discoverContactPath}
                 onRemoveContact={actions.removeContact}
+                onAddToDevice={actions.addContactToDevice}
                 onExportContact={actions.exportContact}
                 onGetNeighbours={actions.getNeighbours}
+                neighboursFetchActions={{
+                  startNeighboursFetch: actions.startNeighboursFetch,
+                  getNeighboursFetchProgress: actions.getNeighboursFetchProgress,
+                  cancelNeighboursFetch: actions.cancelNeighboursFetch,
+                }}
                 canWriteNodes={canWriteNodes && connected}
                 isCompanion={isCompanion}
                 repeaters={contacts}
@@ -571,13 +612,28 @@ export const MeshCoreDirectMessagesView: React.FC<MeshCoreDirectMessagesViewProp
                 remoteAdminActions={{
                   loginRemote: actions.loginRemote,
                   loginRemoteWithSaved: actions.loginRemoteWithSaved,
+                  getLoginProgress: actions.getLoginProgress,
+                  cancelLogin: actions.cancelLogin,
                   sendCliCommand: actions.sendCliCommand,
                   getRemoteAdminCapability: actions.getRemoteAdminCapability,
                   forgetRemoteCredential: actions.forgetRemoteCredential,
                   getRemoteStatus: actions.getRemoteStatus,
                 }}
                 receiveOnly={receiveOnly}
+                firstHeard={firstHeardByKey.get(selected)}
               />
+              {onSetIgnoredNode && onRemoveIgnoredNode && isRealNodeKey(selected) && (
+                <MeshCoreIgnoreBlockControls
+                  publicKey={selected}
+                  mode={ignoredModeByKey.get(selected.toLowerCase()) ?? null}
+                  canWrite={canWriteNodes}
+                  onSet={(mode) => {
+                    const c = contactsByKey.get(selected);
+                    return onSetIgnoredNode(selected, mode, c?.advName || c?.name || null);
+                  }}
+                  onRemove={() => onRemoveIgnoredNode(selected)}
+                />
+              )}
               {!!sourceId && typeof baseUrl === 'string' && isRealNodeKey(selected) && (
                 <>
                   <MeshCoreNodeTelemetryConfig

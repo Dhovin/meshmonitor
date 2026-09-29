@@ -914,6 +914,29 @@ describe('settingsRoutes', () => {
       });
     });
 
+    // (a1) #5376: TX-target window used when maxNodeAgeHours is 0. It bounds
+    // which nodes MeshMonitor transmits to, so 0 ("no bound") is rejected.
+    describe('(a1) txTargetMaxAgeHoursWhenUnlimited range validation (#5376)', () => {
+      it.each([0, -1, 721, 1.5, 'abc', ''])('rejects %s with 400 INVALID_TX_TARGET_MAX_AGE_HOURS', async (value) => {
+        const app = createApp(adminUser);
+        const res = await request(app)
+          .post('/api/settings')
+          .send({ txTargetMaxAgeHoursWhenUnlimited: value as any })
+          .expect(400);
+
+        expect(res.body.code).toBe('INVALID_TX_TARGET_MAX_AGE_HOURS');
+        expect(databaseService.settings.setSettings).not.toHaveBeenCalled();
+      });
+
+      it.each([1, 24, 168, 720])('accepts %s with 200', async (value) => {
+        const app = createApp(adminUser);
+        await request(app)
+          .post('/api/settings')
+          .send({ txTargetMaxAgeHoursWhenUnlimited: String(value) })
+          .expect(200);
+      });
+    });
+
     // (a2) automationAirtimeCutoffNeighborMaxHops range validation (#4801):
     // 0-7 inclusive is accepted; anything else 400s and the setter callback
     // must not run.
@@ -952,6 +975,23 @@ describe('settingsRoutes', () => {
       expect(calledSourceId).toBe('mqtt-broker-1');
       expect(calledSettings).not.toHaveProperty('cotFeedEnabled');
       expect(res.body.data.ignoredKeys).toContain('cotFeedEnabled');
+    });
+
+    // (b2) same GLOBAL_ONLY drop, for the Coverage Report retention setting
+    // (#5277 P1 WP2) — a source-scoped POST must never persist it per-source,
+    // per the §5080 bare-key trap the deny-list exists to prevent.
+    it('(b2) drops coverage_retention_days under ?sourceId= and reports it in ignoredKeys', async () => {
+      const app = createApp(adminUser);
+      const res = await request(app)
+        .post('/api/settings?sourceId=mqtt-broker-1')
+        .send({ coverage_retention_days: '30' })
+        .expect(200);
+
+      expect(databaseService.settings.setSourceSettings).toHaveBeenCalledTimes(1);
+      const [calledSourceId, calledSettings] = (databaseService.settings.setSourceSettings as any).mock.calls[0];
+      expect(calledSourceId).toBe('mqtt-broker-1');
+      expect(calledSettings).not.toHaveProperty('coverage_retention_days');
+      expect(res.body.data.ignoredKeys).toContain('coverage_retention_days');
     });
 
     // (c) the per-source branch now audits (§3.4) — it used to return before

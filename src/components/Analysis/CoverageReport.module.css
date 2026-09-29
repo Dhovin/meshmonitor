@@ -1,0 +1,84 @@
+.activePreset {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+
+/* Sender options are built from live node names + !id + fix count, which
+ * can be much wider than a phone viewport (e.g. "Car-01 (!b2a78cf0) — 42").
+ * A flex item's default `min-width: auto` refuses to shrink below its
+ * intrinsic content width — so on a narrow viewport this one field, not the
+ * shared `.reports-controls` flex row, was overflowing the page. Scoped
+ * here (not in the global reports-controls styles) since this is the only
+ * field in the app whose option text length is this unbounded. */
+.senderField {
+  min-width: 0;
+  max-width: 100%;
+  flex: 1 1 160px;
+}
+
+/* SearchableSelect (#5277 P4a WP4 — replaced the plain <select> here) already
+ * sets width: 100% / min-width: 150px on its own root in
+ * SearchableSelect.module.css; the wrapping field just needs to be free to
+ * shrink below that in the shared `.reports-controls` flex row, same
+ * reasoning as the rule above. */
+.senderField :global([data-searchable-select]) {
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* Dots/Grid view toggle (#5277 P4a WP4, spec §2a.7): two ghost buttons side
+ * by side, matching the time-range preset row's look. */
+.viewToggle {
+  display: flex;
+  gap: 6px;
+}
+
+.mqttNote {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--color-text-subtle);
+}
+
+.retentionNote {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--color-text-subtle);
+}
+
+.guidance {
+  margin-top: 12px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-text);
+}
+
+.guidance p {
+  margin: 0 0 10px 0;
+}
+
+.airtimeTable {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 10px;
+  font-size: 12px;
+}
+
+.airtimeTable th,
+.airtimeTable td {
+  border: 1px solid var(--color-surface-hover);
+  padding: 6px 10px;
+  text-align: left;
+}
+
+/* MeshCore guidance sub-block heading (#5277 P3 WP3, spec §2.6). */
+.guidanceSubheading {
+  margin: 4px 0 8px 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.guidanceFooter {
+  color: var(--color-text-subtle);
+  font-size: 12px;
+}

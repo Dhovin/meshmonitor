@@ -26,32 +26,10 @@ vi.mock('../../../contexts/SettingsContext', () => ({
 // i18next's behavior when a key's resources aren't loaded — and interpolate
 // any `{{token}}` placeholders still present from the options object. This
 // lets assertions read the same English text a real render would produce.
-vi.mock('react-i18next', () => ({
-  useTranslation: () => ({
-    t: (
-      key: string,
-      arg2?: string | Record<string, unknown>,
-      arg3?: Record<string, unknown>,
-    ) => {
-      let options: Record<string, unknown> | undefined;
-      let defaultValue: string | undefined;
-      if (typeof arg2 === 'string') {
-        defaultValue = arg2;
-        options = arg3;
-      } else {
-        options = arg2;
-        defaultValue = typeof options?.defaultValue === 'string' ? options.defaultValue : undefined;
-      }
-      let out = defaultValue ?? key;
-      if (options) {
-        for (const [k, v] of Object.entries(options)) {
-          out = out.replace(new RegExp(`{{${k}}}`, 'g'), String(v));
-        }
-      }
-      return out;
-    },
-  }),
-}));
+vi.mock('react-i18next', async () => {
+  const { createReactI18nextMock } = await import('../../../test/mockI18n');
+  return createReactI18nextMock();
+});
 
 describe('IdentityItems', () => {
   const model: NodeCardModel = toNodeCardModel(
@@ -140,6 +118,89 @@ describe('SignalItems', () => {
     expect(screen.getByText('42m')).toBeInTheDocument();
   });
 
+  it('renders the AGL aircraft summary row when flagged and showAltitude is set (#5364/#5365)', () => {
+    const model = toNodeCardModel(
+      { nodeNum: 1, position: { altitude: 3200 }, likelyAircraft: true, aircraftBasis: 'agl', heightAboveGround: 3000 },
+      'meshtastic',
+    );
+    const { unmount } = render(<><SignalItems model={model} /></>);
+    expect(screen.queryByText(/Likely aircraft/)).not.toBeInTheDocument();
+    unmount();
+
+    render(<><SignalItems model={model} showAltitude /></>);
+    expect(screen.getByText('Likely aircraft · 3.0 km above ground')).toBeInTheDocument();
+  });
+
+  it('renders the MSL aircraft summary row when the basis has no ground elevation', () => {
+    const model = toNodeCardModel(
+      { nodeNum: 1, position: { altitude: 6100 }, likelyAircraft: true, aircraftBasis: 'msl' },
+      'meshtastic',
+    );
+    render(<><SignalItems model={model} showAltitude /></>);
+    expect(screen.getByText('Likely aircraft · 6.1 km above sea level')).toBeInTheDocument();
+  });
+
+  it('shows the sign-flip notice with the reported coordinates on every popup (#5363)', () => {
+    const corrected = toNodeCardModel(
+      {
+        nodeNum: 1,
+        position: { latitude: 27.9, longitude: -82.5 },
+        positionSignFlipCorrected: true,
+        reportedLatitude: 27.9,
+        reportedLongitude: 82.5,
+      },
+      'meshtastic',
+    );
+    expect(corrected.signFlipReported).toEqual({ latitude: 27.9, longitude: 82.5 });
+    // Not gated on showAltitude: the NodesTab and Dashboard cards both show it.
+    const { unmount } = render(<><SignalItems model={corrected} /></>);
+    expect(screen.getByTestId('sign-flip-notice')).toHaveTextContent('Position auto-corrected (sign flip)');
+    expect(screen.getByTestId('sign-flip-notice')).toHaveTextContent('Reported: 27.90000, 82.50000');
+    unmount();
+
+    const plain = toNodeCardModel({ nodeNum: 1, position: { latitude: 27.9, longitude: 82.5 } }, 'meshtastic');
+    expect(plain.signFlipReported).toBeNull();
+    render(<><SignalItems model={plain} showAltitude /></>);
+    expect(screen.queryByTestId('sign-flip-notice')).not.toBeInTheDocument();
+  });
+
+  it('shows "Aged out (likely aircraft)" only for an age-out ignore (#5364/#5365 Phase 2)', () => {
+    const agedOut = toNodeCardModel(
+      { nodeNum: 1, position: { altitude: 3200 }, likelyAircraft: true, isIgnored: true, aircraftAgedOutAt: 1_700_000_000_000 },
+      'meshtastic',
+    );
+    const { unmount } = render(<><SignalItems model={agedOut} showAltitude /></>);
+    expect(screen.getByText('Aged out (likely aircraft)')).toBeInTheDocument();
+    unmount();
+
+    // A manual/geo ignore (no aircraftAgedOutAt), or a lifted node (not ignored), never shows it.
+    for (const raw of [
+      { nodeNum: 2, isIgnored: true, aircraftAgedOutAt: null },
+      { nodeNum: 3, isIgnored: false, aircraftAgedOutAt: 1_700_000_000_000 },
+    ]) {
+      const { unmount: u } = render(<><SignalItems model={toNodeCardModel(raw, 'meshtastic')} showAltitude /></>);
+      expect(screen.queryByText('Aged out (likely aircraft)')).not.toBeInTheDocument();
+      u();
+    }
+  });
+
+  it('shows "Reclassified as fixed" when the node carries the fixed mark', () => {
+    const fixed = toNodeCardModel({ nodeNum: 1, aircraftFixedAt: 1_700_000_000_000 }, 'meshtastic');
+    expect(fixed.aircraftFixed).toBe(true);
+    const { unmount } = render(<><SignalItems model={fixed} showAltitude /></>);
+    expect(screen.getByText('Reclassified as fixed')).toBeInTheDocument();
+    unmount();
+
+    render(<><SignalItems model={toNodeCardModel({ nodeNum: 2, aircraftFixedAt: null }, 'meshtastic')} showAltitude /></>);
+    expect(screen.queryByText('Reclassified as fixed')).not.toBeInTheDocument();
+  });
+
+  it('hides the aircraft summary row when the node is not flagged', () => {
+    const model = toNodeCardModel({ nodeNum: 1, position: { altitude: 100 } }, 'meshtastic');
+    render(<><SignalItems model={model} showAltitude /></>);
+    expect(screen.queryByText(/Likely aircraft/)).not.toBeInTheDocument();
+  });
+
   it('renders position accuracy from precision bits, unit-aware (#4176)', () => {
     const model = toNodeCardModel({ nodeNum: 1, positionPrecisionBits: 18 }, 'meshtastic');
     const { unmount } = render(<><SignalItems model={model} /></>);
@@ -210,6 +271,17 @@ describe('LastHeardFooter', () => {
     render(<LastHeardFooter lastHeard={lastHeard} mode="relative" timeFormat="24" dateFormat="MM/DD/YYYY" />);
     expect(screen.getByText(/minute|just now/)).toBeInTheDocument();
   });
+
+  it('adds a First Heard line only when firstHeard is known (#5390)', () => {
+    const now = Math.floor(Date.now() / 1000);
+    const { unmount } = render(
+      <LastHeardFooter lastHeard={now - 60} firstHeard={now - 2 * 3600} mode="relative" timeFormat="24" dateFormat="MM/DD/YYYY" />,
+    );
+    expect(screen.getByTestId('popup-first-heard')).toHaveTextContent(/First Heard: 2 hours ago/);
+    unmount();
+    render(<LastHeardFooter lastHeard={now - 60} firstHeard={null} mode="relative" timeFormat="24" dateFormat="MM/DD/YYYY" />);
+    expect(screen.queryByTestId('popup-first-heard')).not.toBeInTheDocument();
+  });
 });
 
 describe('SourcesList', () => {
@@ -257,6 +329,28 @@ describe('SourcesList', () => {
 });
 
 describe('MeshCoreDetails', () => {
+  it('shows the sign-flip notice for a corrected MeshCore contact (#5363)', () => {
+    const corrected = toNodeCardModel(
+      {
+        publicKey: 'ab'.repeat(32),
+        latitude: 27.9,
+        longitude: -82.5,
+        positionSignFlipCorrected: true,
+        reportedLatitude: 27.9,
+        reportedLongitude: 82.5,
+      },
+      'meshcore',
+    );
+    expect(corrected.signFlipReported).toEqual({ latitude: 27.9, longitude: 82.5 });
+    const { unmount } = render(<><MeshCoreDetails model={corrected} /></>);
+    expect(screen.getByTestId('sign-flip-notice')).toHaveTextContent('Reported: 27.90000, 82.50000');
+    unmount();
+
+    const plain = toNodeCardModel({ publicKey: 'ab'.repeat(32), latitude: 27.9, longitude: 82.5 }, 'meshcore');
+    render(<><MeshCoreDetails model={plain} /></>);
+    expect(screen.queryByTestId('sign-flip-notice')).not.toBeInTheDocument();
+  });
+
   it('renders nothing when the model has no meshcore data', () => {
     const model = toNodeCardModel({ nodeNum: 1, longName: 'x' }, 'meshtastic');
     const { container } = render(<><MeshCoreDetails model={model} /></>);

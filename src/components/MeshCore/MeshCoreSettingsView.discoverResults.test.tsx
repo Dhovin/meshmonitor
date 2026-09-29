@@ -13,19 +13,17 @@ import userEvent from '@testing-library/user-event';
 import { MeshCoreSettingsView } from './MeshCoreSettingsView';
 import type { DiscoveredNode } from './hooks/useMeshCore';
 
-vi.mock('react-i18next', () => ({
-  useTranslation: () => ({
-    t: (key: string, fallback?: string | Record<string, unknown>, opts?: Record<string, unknown>) => {
-      const base = typeof fallback === 'string' ? fallback : key;
-      const vars = (typeof fallback === 'object' ? fallback : opts) ?? {};
-      return base.replace(/\{\{(\w+)\}\}/g, (_m, k) => String((vars as Record<string, unknown>)[k] ?? ''));
-    },
-  }),
-}));
+vi.mock('react-i18next', async () => {
+  const { createReactI18nextMock } = await import('../../test/mockI18n');
+  return createReactI18nextMock();
+});
 
 vi.mock('../ToastContainer', () => ({ useToast: () => ({ showToast: vi.fn() }) }));
 vi.mock('../../contexts/AuthContext', () => ({ useAuth: () => ({ hasPermission: () => true }) }));
 // Not under test; it fetches on mount.
+// Ignore / Block sections (#5408) own TanStack queries; covered by their own tests.
+vi.mock('./MeshCoreIgnoredNodesSection', () => ({ MeshCoreIgnoredNodesSection: () => null }));
+vi.mock('./MeshCoreMessageFiltersSection', () => ({ MeshCoreMessageFiltersSection: () => null }));
 vi.mock('./MeshCoreNodeDisplaySection', () => ({
   MeshCoreNodeDisplaySection: () => null,
 }));

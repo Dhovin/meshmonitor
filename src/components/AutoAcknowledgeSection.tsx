@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { clampInt, COOLDOWN_SECONDS_MAX } from './automationInputLimits';
 import { useTranslation } from 'react-i18next';
 import { useToast } from './ToastContainer';
 import { useCsrfFetch } from '../hooks/useCsrfFetch';
@@ -128,15 +129,23 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
     }
   }, [enabled, regex, message, messageDirect, enabledChannels, skipIncompleteNodes, ignoredNodes, matrix, cooldownSeconds, preSendDelaySeconds, maxAttempts, hopLimit, testMessagesProp]);
 
-  // Check if any settings have changed
+  // Check if any settings have changed.
+  // Compare each local value against the SAME normalized baseline the local
+  // state was seeded with above (`regex || '^(test|ping)'`, etc.). Comparing
+  // against the raw prop made a blank stored string (the server reads '' as
+  // "use the default") look like an unsaved edit on load, so the SaveBar showed
+  // "Save changes to Auto Acknowledge" with no user edits.
   useEffect(() => {
-    const channelsChanged = JSON.stringify(localEnabledChannels.sort()) !== JSON.stringify(enabledChannels.sort());
+    // Sort copies: `.sort()` mutates in place, and these arrays are parent
+    // (AutomationContext) state.
+    const sortedIds = (ids: number[]) => JSON.stringify([...ids].sort((a, b) => a - b));
+    const channelsChanged = sortedIds(localEnabledChannels) !== sortedIds(enabledChannels);
     const cooldownChanged = localCooldownSeconds !== cooldownSeconds;
     const preSendDelayChanged = localPreSendDelaySeconds !== preSendDelaySeconds;
     const maxAttemptsChanged = localMaxAttempts !== maxAttempts;
     const hopLimitChanged = localHopLimit !== hopLimit;
     const matrixChanged = JSON.stringify(localMatrix) !== JSON.stringify(matrix);
-    const changed = localEnabled !== enabled || localRegex !== regex || localMessage !== message || localMessageDirect !== messageDirect || channelsChanged || localSkipIncompleteNodes !== skipIncompleteNodes || localIgnoredNodes !== (ignoredNodes || '') || matrixChanged || cooldownChanged || preSendDelayChanged || maxAttemptsChanged || hopLimitChanged || testMessages !== (testMessagesProp || 'test\nTest message\nping\nPING\nHello world\nTESTING 123');
+    const changed = localEnabled !== enabled || localRegex !== (regex || '^(test|ping)') || localMessage !== (message || DEFAULT_MESSAGE) || localMessageDirect !== (messageDirect || DEFAULT_MESSAGE_DIRECT) || channelsChanged || localSkipIncompleteNodes !== skipIncompleteNodes || localIgnoredNodes !== (ignoredNodes || '') || matrixChanged || cooldownChanged || preSendDelayChanged || maxAttemptsChanged || hopLimitChanged || testMessages !== (testMessagesProp || 'test\nTest message\nping\nPING\nHello world\nTESTING 123');
     setHasChanges(changed);
   }, [localEnabled, localRegex, localMessage, localMessageDirect, localEnabledChannels, localSkipIncompleteNodes, localIgnoredNodes, localMatrix, localCooldownSeconds, localPreSendDelaySeconds, localMaxAttempts, localHopLimit, testMessages, enabled, regex, message, messageDirect, enabledChannels, skipIncompleteNodes, ignoredNodes, matrix, cooldownSeconds, preSendDelaySeconds, maxAttempts, hopLimit, testMessagesProp]);
 
@@ -541,8 +550,9 @@ const AutoAcknowledgeSection: React.FC<AutoAcknowledgeSectionProps> = ({
               <input
                 type="number"
                 value={localCooldownSeconds}
-                onChange={(e) => setLocalCooldownSeconds(Math.max(0, parseInt(e.target.value) || 0))}
+                onChange={(e) => setLocalCooldownSeconds(clampInt(e.target.value, 0, COOLDOWN_SECONDS_MAX))}
                 min={0}
+                max={COOLDOWN_SECONDS_MAX}
                 disabled={!localEnabled}
                 style={{ width: '80px', padding: '2px 4px' }}
               />

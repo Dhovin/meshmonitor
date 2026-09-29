@@ -63,6 +63,8 @@ vi.mock('../services/database.js', () => ({
     insertTelemetryAsync: async (...a: unknown[]) => insertTelemetry(...a),
     insertTracerouteAsync: vi.fn(async () => undefined),
     insertRouteSegmentAsync: vi.fn(async () => undefined),
+    // #5101 (finding 2): persistRouteSegments now also calls this per stored segment.
+    updateRecordHolderSegmentAsync: vi.fn(async () => undefined),
     deleteNodeAsync: async (...a: unknown[]) => deleteNode(...a),
     nodes: {
       getNode: async (...a: unknown[]) => getNode(...a),
@@ -83,6 +85,7 @@ vi.mock('../services/database.js', () => ({
     // inline check is a no-op for this suite.
     settings: {
       getSettingForSource: async () => null,
+      getLocalNodeNumForSource: async () => null,
     },
     setNodeIgnoredAsync: vi.fn(async () => undefined),
   },

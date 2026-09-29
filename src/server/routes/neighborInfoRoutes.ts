@@ -3,7 +3,7 @@ import { requirePermission } from '../auth/authMiddleware.js';
 import { requireSourceId } from '../utils/requireSourceId.js';
 import databaseService from '../../services/database.js';
 import { logger } from '../../utils/logger.js';
-import { getEffectiveDbNodePosition } from '../utils/nodeEnhancer.js';
+import { loadSignFlipContext, getDisplayDbNodePosition } from '../services/signFlipCorrection.js';
 import { getMaxNodeAgeHours } from '../services/nodeDisplaySettings.js';
 
 const router = Router();
@@ -20,16 +20,21 @@ router.get('/', requirePermission('info', 'read'), async (req: Request, res: Res
       databaseService.settings,
       neighborInfoSourceId ?? null,
     );
-    const cutoffTime = Math.floor(Date.now() / 1000) - maxNodeAgeHours * 60 * 60;
+    // maxNodeAgeHours of 0 = "never / show all" (#4947, #5338): no cutoff.
+    const cutoffTime = maxNodeAgeHours <= 0
+      ? -Infinity
+      : Math.floor(Date.now() / 1000) - maxNodeAgeHours * 60 * 60;
 
     const linkKeys = new Set(neighborInfo.map(ni => `${ni.nodeNum}-${ni.neighborNodeNum}`));
+    // #5363: link endpoints at the same (sign-flip corrected) point as the marker.
+    const signFlipCtx = await loadSignFlipContext(neighborInfoSourceId);
 
     const enrichedNeighborInfo = (await Promise.all(neighborInfo
       .map(async ni => {
         const node = await databaseService.nodes.getNode(ni.nodeNum, neighborInfoSourceId);
         const neighbor = await databaseService.nodes.getNode(ni.neighborNodeNum, neighborInfoSourceId);
-        const nodePos = getEffectiveDbNodePosition(node);
-        const neighborPos = getEffectiveDbNodePosition(neighbor);
+        const nodePos = getDisplayDbNodePosition(node, signFlipCtx);
+        const neighborPos = getDisplayDbNodePosition(neighbor, signFlipCtx);
 
         return {
           ...ni,
@@ -71,10 +76,11 @@ router.get('/:nodeNum', requirePermission('info', 'read'), requireSourceId('quer
     // sourceId presence validated by requireSourceId('query')
     const neighborSourceId = req.query.sourceId as string;
     const neighborInfo = await databaseService.getNeighborsForNodeAsync(nodeNum, neighborSourceId);
+    const signFlipCtx = await loadSignFlipContext(neighborSourceId); // #5363
 
     const enrichedNeighborInfo = await Promise.all(neighborInfo.map(async ni => {
       const neighbor = await databaseService.nodes.getNode(ni.neighborNodeNum, neighborSourceId);
-      const neighborPos = getEffectiveDbNodePosition(neighbor);
+      const neighborPos = getDisplayDbNodePosition(neighbor, signFlipCtx);
 
       return {
         ...ni,

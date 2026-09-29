@@ -12,6 +12,9 @@
 import { describe, it, expect } from 'vitest';
 import {
   NODE_DISPLAY_SETTING_KEYS,
+  NODE_DISPLAY_SEEDED_KEYS,
+  AIRCRAFT_NODE_DISPLAY_KEYS,
+  SIGN_FLIP_NODE_DISPLAY_KEYS,
   NODE_DISPLAY_DEFAULT_STRINGS,
   NODE_DISPLAY_NUMERIC_DEFAULTS,
   NODE_DISPLAY_BOOLEAN_DEFAULTS,
@@ -21,6 +24,10 @@ import {
   MAX_INFRA_NODE_AGE_HOURS_DEFAULT,
   MAX_INFRA_NODE_AGE_HOURS_RANGE,
   parseMaxInfraNodeAgeHours,
+  parseTxTargetMaxAgeHoursWhenUnlimited,
+  resolveTxTargetMaxAgeHours,
+  SETTINGS_TAB_PER_SOURCE_KEYS,
+  TX_TARGET_MAX_AGE_HOURS_WHEN_UNLIMITED_DEFAULT,
 } from './nodeDisplayDefaults.js';
 import { NODE_DISPLAY_SEED } from '../server/migrations/131_seed_per_source_node_display.js';
 import {
@@ -28,26 +35,61 @@ import {
   VALID_SETTINGS_KEYS,
 } from '../server/constants/settings.js';
 
-describe('NODE_DISPLAY_SETTING_KEYS', () => {
+describe('NODE_DISPLAY_SEEDED_KEYS', () => {
   it('has exactly ten entries', () => {
-    expect(NODE_DISPLAY_SETTING_KEYS.length).toBe(10);
+    expect(NODE_DISPLAY_SEEDED_KEYS.length).toBe(10);
   });
 
   it('has no duplicates', () => {
-    expect(new Set(NODE_DISPLAY_SETTING_KEYS).size).toBe(NODE_DISPLAY_SETTING_KEYS.length);
+    expect(new Set(NODE_DISPLAY_SEEDED_KEYS).size).toBe(NODE_DISPLAY_SEEDED_KEYS.length);
   });
 
   it('is a subset of PER_SOURCE_SETTINGS_KEYS', () => {
     const perSource = new Set<string>(PER_SOURCE_SETTINGS_KEYS as readonly string[]);
-    for (const key of NODE_DISPLAY_SETTING_KEYS) {
+    for (const key of NODE_DISPLAY_SEEDED_KEYS) {
       expect(perSource.has(key)).toBe(true);
     }
   });
 
   it('is a subset of VALID_SETTINGS_KEYS', () => {
     const valid = new Set<string>(VALID_SETTINGS_KEYS as readonly string[]);
-    for (const key of NODE_DISPLAY_SETTING_KEYS) {
+    for (const key of NODE_DISPLAY_SEEDED_KEYS) {
       expect(valid.has(key)).toBe(true);
+    }
+  });
+});
+
+// #5364/#5365 Phase 1 WP5: the three unseeded likely-aircraft keys join the
+// routed set without touching the frozen ten above.
+// #5363: the four unseeded sign-flip keys follow them.
+describe('NODE_DISPLAY_SETTING_KEYS (seeded + aircraft + sign-flip)', () => {
+  it('equals NODE_DISPLAY_SEEDED_KEYS, then AIRCRAFT_NODE_DISPLAY_KEYS, then SIGN_FLIP_NODE_DISPLAY_KEYS', () => {
+    expect(NODE_DISPLAY_SETTING_KEYS).toEqual([
+      ...NODE_DISPLAY_SEEDED_KEYS,
+      ...AIRCRAFT_NODE_DISPLAY_KEYS,
+      ...SIGN_FLIP_NODE_DISPLAY_KEYS,
+    ]);
+  });
+
+  it('has exactly twenty entries with no duplicates', () => {
+    expect(NODE_DISPLAY_SETTING_KEYS.length).toBe(20);
+    expect(new Set(NODE_DISPLAY_SETTING_KEYS).size).toBe(NODE_DISPLAY_SETTING_KEYS.length);
+  });
+
+  it('is a subset of PER_SOURCE_SETTINGS_KEYS and VALID_SETTINGS_KEYS', () => {
+    const perSource = new Set<string>(PER_SOURCE_SETTINGS_KEYS as readonly string[]);
+    const valid = new Set<string>(VALID_SETTINGS_KEYS as readonly string[]);
+    for (const key of NODE_DISPLAY_SETTING_KEYS) {
+      expect(perSource.has(key)).toBe(true);
+      expect(valid.has(key)).toBe(true);
+    }
+  });
+
+  it('none of the three aircraft keys are in migration 131\'s frozen seed', () => {
+    const seedKeys = new Set(NODE_DISPLAY_SEED.map(([k]) => k));
+    for (const key of AIRCRAFT_NODE_DISPLAY_KEYS) {
+      expect(seedKeys.has(key)).toBe(false);
+      expect(NODE_DISPLAY_SEEDED_KEYS as readonly string[]).not.toContain(key);
     }
   });
 });
@@ -58,9 +100,9 @@ describe('NODE_DISPLAY_DEFAULT_STRINGS', () => {
     expect(NODE_DISPLAY_DEFAULT_STRINGS).toEqual(seedAsRecord);
   });
 
-  it('has an entry for every key in NODE_DISPLAY_SETTING_KEYS, and no extras', () => {
+  it('has an entry for every key in NODE_DISPLAY_SEEDED_KEYS, and no extras', () => {
     const stringKeys = Object.keys(NODE_DISPLAY_DEFAULT_STRINGS).sort();
-    expect(stringKeys).toEqual([...NODE_DISPLAY_SETTING_KEYS].sort());
+    expect(stringKeys).toEqual([...NODE_DISPLAY_SEEDED_KEYS].sort());
   });
 
   it('stores booleans as \'0\'/\'1\', never \'false\'/\'true\'', () => {
@@ -176,5 +218,36 @@ describe('maxInfraNodeAgeHours (#4899)', () => {
     expect(parseMaxInfraNodeAgeHours('-1')).toBe(720);         // below min → default
     expect(parseMaxInfraNodeAgeHours('99999')).toBe(720);      // above max → default
     expect(parseMaxInfraNodeAgeHours('48.9')).toBe(48);        // truncated to integer
+  });
+});
+
+describe('TX-target window when maxNodeAgeHours is 0 (#5376)', () => {
+  it('parseTxTargetMaxAgeHoursWhenUnlimited: default 24, range 1..720, 0 is NOT valid', () => {
+    expect(TX_TARGET_MAX_AGE_HOURS_WHEN_UNLIMITED_DEFAULT).toBe(24);
+    expect(parseTxTargetMaxAgeHoursWhenUnlimited(null)).toBe(24);
+    expect(parseTxTargetMaxAgeHoursWhenUnlimited('')).toBe(24);
+    expect(parseTxTargetMaxAgeHoursWhenUnlimited('garbage')).toBe(24);
+    expect(parseTxTargetMaxAgeHoursWhenUnlimited('0')).toBe(24);   // the bound can't be "unlimited"
+    expect(parseTxTargetMaxAgeHoursWhenUnlimited('721')).toBe(24);
+    expect(parseTxTargetMaxAgeHoursWhenUnlimited('1')).toBe(1);
+    expect(parseTxTargetMaxAgeHoursWhenUnlimited('720')).toBe(720);
+    expect(parseTxTargetMaxAgeHoursWhenUnlimited('48.9')).toBe(48);
+  });
+
+  it('resolveTxTargetMaxAgeHours: node window when > 0, else the fallback', () => {
+    expect(resolveTxTargetMaxAgeHours(72, 24)).toBe(72);
+    expect(resolveTxTargetMaxAgeHours(0, 24)).toBe(24);
+    expect(resolveTxTargetMaxAgeHours(0, 168)).toBe(168);
+    expect(resolveTxTargetMaxAgeHours(-5, 24)).toBe(24);
+    expect(resolveTxTargetMaxAgeHours(Number.NaN, 24)).toBe(24);
+  });
+
+  it('SETTINGS_TAB_PER_SOURCE_KEYS = the Node Display keys plus the TX-target window', () => {
+    expect(SETTINGS_TAB_PER_SOURCE_KEYS).toEqual([...NODE_DISPLAY_SETTING_KEYS, 'txTargetMaxAgeHoursWhenUnlimited']);
+    // The frozen ten stay ten (migration 131 seed parity); the three
+    // likely-aircraft keys (#5364/#5365) ride on top of them (3 in P1, 3 in P2),
+    // then the four sign-flip keys (#5363).
+    expect(NODE_DISPLAY_SEEDED_KEYS).toHaveLength(10);
+    expect(NODE_DISPLAY_SETTING_KEYS).toHaveLength(20);
   });
 });

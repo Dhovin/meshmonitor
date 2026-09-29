@@ -67,7 +67,19 @@ const meshcoreManager = {
   setContactOutPath: vi.fn().mockResolvedValue({ applied: true, ackConfirmed: true }),
   setNodeFavorite: vi.fn().mockResolvedValue(undefined),
   loginToNode: vi.fn().mockResolvedValue(true),
+  // #5400: the admin login routes go through the shared retry helper.
+  // Delegate to the loginToNode mock so existing per-test
+  // mockResolvedValue(false) overrides keep driving the outcome; a false
+  // stands for the remote refusing.
+  loginToNodeWithRetry: vi.fn(async (publicKey: string, password: string) => {
+    const result = await meshcoreManager.loginToNode(publicKey, password);
+    return { result: result || null, outcome: result ? 'ok' : 'rejected', attempts: 1 };
+  }),
   requestNodeStatus: vi.fn().mockResolvedValue({ batteryMv: 4200, uptimeSecs: 3600 }),
+  requestNodeStatusDetailed: vi.fn(async (publicKey: string) => ({
+    status: await meshcoreManager.requestNodeStatus(publicKey),
+    notOnDevice: false,
+  })),
   sendCliCommand: vi.fn().mockResolvedValue({ reply: 'ok', elapsedMs: 42 }),
   sendLocalCliCommand: vi.fn().mockResolvedValue({ reply: 'v1.7.0', elapsedMs: 12 }),
   setName: vi.fn().mockResolvedValue(true),

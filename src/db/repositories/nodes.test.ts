@@ -47,6 +47,7 @@ const POSTGRES_CREATE = `
     "channelUtilization" REAL,
     "airUtilTx" REAL,
     "lastHeard" BIGINT,
+    "firstHeard" BIGINT,
     "snr" REAL,
     "rssi" INTEGER,
     "lastTracerouteRequest" BIGINT,
@@ -93,6 +94,16 @@ const POSTGRES_CREATE = `
     "remoteAdminMetadata" TEXT,
     "lastTimeSync" BIGINT,
     "isStoreForwardServer" BOOLEAN DEFAULT FALSE,
+    "importedAt" BIGINT,
+    "likelyAircraft" BOOLEAN,
+    "aircraftBasis" TEXT,
+    "groundElevation" DOUBLE PRECISION,
+    "heightAboveGround" DOUBLE PRECISION,
+    "aircraftClassifiedAt" BIGINT,
+    "aircraftAgedOutAt" BIGINT,
+    "aircraftFixedAt" BIGINT,
+    "aircraftFixedLatitude" DOUBLE PRECISION,
+    "aircraftFixedLongitude" DOUBLE PRECISION,
     "createdAt" BIGINT NOT NULL,
     "updatedAt" BIGINT NOT NULL,
     "sourceId" TEXT NOT NULL DEFAULT 'default',
@@ -125,6 +136,7 @@ const MYSQL_CREATE = `
     channelUtilization DOUBLE,
     airUtilTx DOUBLE,
     lastHeard BIGINT,
+    firstHeard BIGINT,
     snr DOUBLE,
     rssi INTEGER,
     lastTracerouteRequest BIGINT,
@@ -171,6 +183,16 @@ const MYSQL_CREATE = `
     remoteAdminMetadata TEXT,
     lastTimeSync BIGINT,
     isStoreForwardServer BOOLEAN DEFAULT FALSE,
+    importedAt BIGINT,
+    likelyAircraft BOOLEAN,
+    aircraftBasis VARCHAR(8),
+    groundElevation DOUBLE,
+    heightAboveGround DOUBLE,
+    aircraftClassifiedAt BIGINT,
+    aircraftAgedOutAt BIGINT,
+    aircraftFixedAt BIGINT,
+    aircraftFixedLatitude DOUBLE,
+    aircraftFixedLongitude DOUBLE,
     createdAt BIGINT NOT NULL,
     updatedAt BIGINT NOT NULL,
     sourceId VARCHAR(36) NOT NULL DEFAULT 'default',
@@ -622,6 +644,25 @@ function runNodesTests(getBackend: () => TestBackend) {
 
     const all = await repo.getAllNodes(ALL_SOURCES);
     expect(all.length).toBe(3);
+  });
+
+  it('getHeardNodes - every heard node regardless of age, source-scoped, skips never-heard rows (#5376)', async () => {
+    const backend = getBackend();
+    if (!backend.available) {
+      console.log(`⚠ Skipped: ${backend.skipReason}`);
+      return;
+    }
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    await repo.upsertNode(makeNode(510, { lastHeard: nowSec - 60 }), 'src-heard-a');
+    await repo.upsertNode(makeNode(511, { lastHeard: nowSec - 400 * 24 * 3600 }), 'src-heard-a');
+    await repo.upsertNode(makeNode(512), 'src-heard-a'); // never heard: placeholder row
+    await repo.upsertNode(makeNode(513, { lastHeard: nowSec }), 'src-heard-b');
+
+    const heard = await repo.getHeardNodes('src-heard-a');
+    // Most recently heard first; the 400-day-old node is kept; 512 and the
+    // other source's node are not.
+    expect(heard.map((n) => Number(n.nodeNum))).toEqual([510, 511]);
   });
 
   it('getNodeCount - returns correct count', async () => {

@@ -1,0 +1,161 @@
+/**
+ * @vitest-environment jsdom
+ *
+ * MapAircraftDisplayControl (#5364/#5365 Phase 1 WP4): the shared Map Features
+ * "Likely aircraft" control used by BOTH NodesTab and DashboardMap. Rendered
+ * against the real en.json strings so the user-facing wording is pinned.
+ */
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { render, screen, fireEvent, act } from '@testing-library/react';
+import MapAircraftDisplayControl from './MapAircraftDisplayControl';
+
+vi.mock('react-i18next', async () => {
+  const { readFileSync } = await import('fs');
+  const en = JSON.parse(readFileSync(`${process.cwd()}/public/locales/en.json`, 'utf-8'));
+  const lookup = (key: string): string | undefined => {
+    if (typeof en[key] === 'string') return en[key];
+    const v = key.split('.').reduce<unknown>((o, k) => (o as Record<string, unknown> | undefined)?.[k], en);
+    return typeof v === 'string' ? v : undefined;
+  };
+  const t = (key: string, opts?: Record<string, unknown>) =>
+    (lookup(key) ?? String(opts?.defaultValue ?? key)).replace(/\{\{(\w+)\}\}/g, (_m, n) => String(opts?.[n] ?? ''));
+  return { useTranslation: () => ({ t, i18n: { language: 'en', changeLanguage: vi.fn() } }) };
+});
+
+describe('MapAircraftDisplayControl', () => {
+  it('renders three radios, checks the current one, and has a data-testid', () => {
+    render(<MapAircraftDisplayControl mode="mark" onChange={vi.fn()} />);
+    expect(screen.getByTestId('map-aircraft-mode')).toBeInTheDocument();
+    const radios = screen.getAllByRole('radio') as HTMLInputElement[];
+    expect(radios).toHaveLength(3);
+    const checked = radios.find((r) => r.checked);
+    expect(checked?.value).toBe('mark');
+    expect(screen.getByText('Show')).toBeInTheDocument();
+    expect(screen.getByText('Mark')).toBeInTheDocument();
+    expect(screen.getByText('Hide')).toBeInTheDocument();
+  });
+
+  it('calls onChange with the clicked mode', () => {
+    const onChange = vi.fn();
+    render(<MapAircraftDisplayControl mode="mark" onChange={onChange} />);
+    fireEvent.click(screen.getByDisplayValue('hide'));
+    expect(onChange).toHaveBeenCalledWith('hide');
+    fireEvent.click(screen.getByDisplayValue('show'));
+    expect(onChange).toHaveBeenCalledWith('show');
+  });
+
+  it('shows the count line when aircraftCount is provided', () => {
+    render(<MapAircraftDisplayControl mode="mark" onChange={vi.fn()} aircraftCount={3} />);
+    expect(screen.getByText(/3 on the map\./)).toBeInTheDocument();
+  });
+
+  it('omits the count line when aircraftCount is not provided', () => {
+    render(<MapAircraftDisplayControl mode="mark" onChange={vi.fn()} />);
+    expect(screen.queryByText(/on the map\./)).not.toBeInTheDocument();
+  });
+
+  it('reflects the current mode when it changes to hide/show', () => {
+    const { rerender } = render(<MapAircraftDisplayControl mode="show" onChange={vi.fn()} />);
+    expect((screen.getByDisplayValue('show') as HTMLInputElement).checked).toBe(true);
+    rerender(<MapAircraftDisplayControl mode="hide" onChange={vi.fn()} />);
+    expect((screen.getByDisplayValue('hide') as HTMLInputElement).checked).toBe(true);
+  });
+
+  describe('Show aged-out (#5364/#5365 Phase 2)', () => {
+    it('is not rendered without onShowAgedOutChange', () => {
+      render(<MapAircraftDisplayControl mode="mark" onChange={vi.fn()} />);
+      expect(screen.queryByTestId('map-aircraft-show-aged-out')).not.toBeInTheDocument();
+      expect(screen.queryByText(/aged out\./)).not.toBeInTheDocument();
+    });
+
+    it('renders the checkbox with the current state and reports toggles', () => {
+      const onToggle = vi.fn();
+      render(
+        <MapAircraftDisplayControl mode="mark" onChange={vi.fn()} showAgedOut={false} onShowAgedOutChange={onToggle} agedOutCount={4} />,
+      );
+      const box = screen.getByRole('checkbox', { name: 'Show aged-out' }) as HTMLInputElement;
+      expect(box.checked).toBe(false);
+      fireEvent.click(box);
+      expect(onToggle).toHaveBeenCalledWith(true);
+      expect(screen.getByText(/4 aged out\./)).toBeInTheDocument();
+    });
+
+    it('shows the checkbox checked when on', () => {
+      render(<MapAircraftDisplayControl mode="hide" onChange={vi.fn()} showAgedOut onShowAgedOutChange={vi.fn()} />);
+      expect((screen.getByRole('checkbox', { name: 'Show aged-out' }) as HTMLInputElement).checked).toBe(true);
+    });
+  });
+
+  describe('Flight trails (#5364/#5365 Phase 3)', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('is not rendered without onShowTrailsChange', () => {
+      render(<MapAircraftDisplayControl mode="mark" onChange={vi.fn()} />);
+      expect(screen.queryByTestId('map-aircraft-show-trails')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('map-aircraft-trail-hours')).not.toBeInTheDocument();
+    });
+
+    it('renders the checkbox and hides the slider while off', () => {
+      const onToggle = vi.fn();
+      render(
+        <MapAircraftDisplayControl mode="mark" onChange={vi.fn()} showTrails={false} onShowTrailsChange={onToggle} />,
+      );
+      const box = screen.getByRole('checkbox', { name: 'Flight trails' }) as HTMLInputElement;
+      expect(box.checked).toBe(false);
+      expect(screen.queryByTestId('map-aircraft-trail-hours')).not.toBeInTheDocument();
+      fireEvent.click(box);
+      expect(onToggle).toHaveBeenCalledWith(true);
+    });
+
+    it('shows the lookback slider with the current value while on', () => {
+      render(
+        <MapAircraftDisplayControl
+          mode="mark"
+          onChange={vi.fn()}
+          showTrails
+          onShowTrailsChange={vi.fn()}
+          trailHours={6}
+          onTrailHoursChange={vi.fn()}
+        />,
+      );
+      expect(screen.getByTestId('map-aircraft-trail-hours')).toBeInTheDocument();
+      const slider = screen.getByRole('slider', { name: 'Trail lookback' }) as HTMLInputElement;
+      expect(slider.getAttribute('aria-valuetext')).toBe('6h');
+      expect(screen.getByText(/Last 6h/)).toBeInTheDocument();
+    });
+
+    it('saves the lookback once the slider settles, not on every step', () => {
+      vi.useFakeTimers();
+      const onHours = vi.fn();
+      render(
+        <MapAircraftDisplayControl
+          mode="mark"
+          onChange={vi.fn()}
+          showTrails
+          onShowTrailsChange={vi.fn()}
+          trailHours={6}
+          onTrailHoursChange={onHours}
+        />,
+      );
+      const slider = screen.getByRole('slider', { name: 'Trail lookback' });
+      fireEvent.change(slider, { target: { value: '10' } });
+      fireEvent.change(slider, { target: { value: '15' } });
+      expect(onHours).not.toHaveBeenCalled();
+      expect(screen.getByText(/Last 7d/)).toBeInTheDocument();
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      expect(onHours).toHaveBeenCalledTimes(1);
+      expect(onHours).toHaveBeenCalledWith(168);
+    });
+  });
+
+  it('contains no emoji in its rendered text', () => {
+    const { container } = render(
+      <MapAircraftDisplayControl mode="mark" onChange={vi.fn()} aircraftCount={2} />,
+    );
+    expect(container.textContent).not.toMatch(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u);
+  });
+});

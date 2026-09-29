@@ -74,6 +74,7 @@ import {
   Package,
   Pause,
   Pin,
+  Plane,
   Play,
   Plus,
   Power,
@@ -92,6 +93,8 @@ import {
   Shield,
   ShieldAlert,
   ShieldCheck,
+  SkipBack,
+  SkipForward,
   Smartphone,
   Smile,
   Sparkles,
@@ -133,6 +136,7 @@ export interface UiIconDefinition {
 export const UI_ICON_DEFINITIONS = {
   accessibility: { lucide: Accessibility, emoji: '♿️', usage: 'accessibility and inclusive design' },
   activity: { lucide: Activity, emoji: '📈', usage: 'packet and activity monitoring' },
+  aircraft: { lucide: Plane, emoji: '✈️', usage: 'likely-aircraft nodes' },
   airQuality: { lucide: AirVent, emoji: '💨', usage: 'air-quality telemetry' },
   alarm: { lucide: AlarmClock, emoji: '⏰', usage: 'scheduled and timed actions' },
   announcement: { lucide: Megaphone, emoji: '📢', usage: 'announcements and notification sources' },
@@ -204,6 +208,8 @@ export const UI_ICON_DEFINITIONS = {
   radio: { lucide: Radio, emoji: '📻', usage: 'MeshCore and radio state' },
   // Three-state status dots (#4217 follow-up). Emoji counterparts are the
   // glyphs these replaced, so emoji-mode users see exactly what they saw before.
+  stepBack: { lucide: SkipBack, emoji: '⏮️', usage: 'step back one item in playback' },
+  stepForward: { lucide: SkipForward, emoji: '⏭️', usage: 'step forward one item in playback' },
   statusOn: { lucide: CircleDot, emoji: '●', usage: 'active / connected / live status' },
   statusPartial: { lucide: CircleDashed, emoji: '◐', usage: 'partial or pending status' },
   statusOff: { lucide: Circle, emoji: '○', usage: 'inactive / disconnected status' },

@@ -17,6 +17,7 @@ import { dataEventEmitter } from './services/dataEventEmitter.js';
 import { sendMessagePushNotification } from './services/messagePushNotifier.js';
 import mqttPacketLogService from './services/mqttPacketLogService.js';
 import { autoDeleteByDistanceService } from './services/autoDeleteByDistanceService.js';
+import { aircraftAgeOutService } from './services/aircraftAgeOutService.js';
 import databaseService from '../services/database.js';
 import { isBlankMacAddr } from '../utils/nodeFieldBlanks.js';
 
@@ -95,7 +96,7 @@ import {
 import { calculateDistance } from '../utils/distance.js';
 import { getEffectiveDbNodePosition } from './utils/nodeEnhancer.js';
 import { canonicalTelemetryType, canonicalTelemetryUnit } from './utils/telemetryKeys.js';
-import { resolveLastHeardSec } from './utils/replayGuard.js';
+import { resolveLastHeardSec, resolvePositionObservedAtMs } from './utils/replayGuard.js';
 import { plausibleRxTime } from './utils/messageTime.js';
 import { shouldDiscardPosition } from '../utils/nullIsland.js';
 import { getDiscardInvalidPositions } from '../utils/positionIngestConfig.js';
@@ -109,6 +110,9 @@ import {
   type PositionShape,
   MqttPacketFilter,
 } from './mqttPacketFilter.js';
+import { maybeRecordMqttCoverageReception } from './utils/coverageMqtt.js';
+import { recordMqttPositionHistory } from './utils/mqttPositionHistory.js';
+import { getCachedSignFlipContext, correctLatLon } from './services/signFlipCorrection.js';
 
 /**
  * First-drop-per-node tracker for ignore/geo-ignore noise suppression (see
@@ -132,6 +136,42 @@ export function firstDropForNode(sourceId: string, nodeNum: number): boolean {
 /** Exposed for tests to reset between cases. */
 export function __resetFirstDropCacheForTest(): void {
   droppedOnce.clear();
+}
+
+/** Read a MeshPacket hop header field, accepting the protobufjs camelCase name
+ *  or a bridge's raw snake_case name. Missing / non-numeric → undefined, so an
+ *  absent hop_start stays "unknown" downstream rather than becoming 0 (#5366). */
+function mqttHopField(packet: unknown, camel: string, snake: string): number | undefined {
+  const p = packet as Record<string, unknown>;
+  const v = p[camel] ?? p[snake];
+  return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+}
+
+/**
+ * The POSITION payload with its coordinates moved to the sign-flip corrected
+ * point when correction is on for `sourceId` and applies (#5363); otherwise the
+ * payload itself. Used only as geo-gate input.
+ */
+async function signFlipCorrectedPosition(
+  sourceId: string,
+  position: PositionShape & { precisionBits?: number | null; precision_bits?: number | null },
+): Promise<PositionShape> {
+  const ctx = await getCachedSignFlipContext(sourceId);
+  if (!ctx) return position;
+  const latI = position.latitudeI ?? position.latitude_i;
+  const lngI = position.longitudeI ?? position.longitude_i;
+  if (typeof latI !== 'number' || typeof lngI !== 'number') return position;
+  const precisionBits = position.precisionBits ?? position.precision_bits ?? undefined;
+  const c = correctLatLon(latI / 1e7, lngI / 1e7, ctx, precisionBits);
+  if (c.latitude == null || c.longitude == null) return position;
+  if (c.latitude === latI / 1e7 && c.longitude === lngI / 1e7) return position;
+  return {
+    ...position,
+    latitudeI: Math.round(c.latitude * 1e7),
+    longitudeI: Math.round(c.longitude * 1e7),
+    latitude_i: undefined,
+    longitude_i: undefined,
+  };
 }
 
 export interface MqttIngestionInput {
@@ -190,9 +230,11 @@ async function insertAndAnnounceMessage(
   text: string,
   isDirectMessage: boolean,
 ): Promise<boolean> {
+  // #5101: every message on this path arrived over MQTT.
+  const row = msg.transportMechanism == null ? { ...msg, transportMechanism: TransportMechanism.MQTT } : msg;
   let inserted: boolean;
   try {
-    inserted = await databaseService.messages.insertMessage(msg, sourceId);
+    inserted = await databaseService.messages.insertMessage(row, sourceId);
   } catch (err) {
     logger.error('Failed to insert MQTT message:', err);
     return false;
@@ -200,12 +242,12 @@ async function insertAndAnnounceMessage(
   if (!inserted) return false;
 
   try {
-    dataEventEmitter.emitNewMessage(msg, sourceId);
+    dataEventEmitter.emitNewMessage(row, sourceId);
   } catch (err) {
     logger.error('Failed to emit MQTT message event:', err);
   }
   void sendMessagePushNotification({
-    message: msg,
+    message: row,
     messageText: text,
     isDirectMessage,
     sourceId,
@@ -389,7 +431,12 @@ async function ingestServiceEnvelopeInner(input: MqttIngestionInput): Promise<Mq
 
     case PortNum.POSITION_APP: {
       const position = payload as PositionShape & Record<string, any>;
-      const geo = filter ? filter.classifyPosition(position) : 'no-geo';
+      // #5363: with sign-flip correction on for this source, the geo gate
+      // judges the corrected point, so a node that only dropped its minus
+      // sign is not geo-ignored as outside the box. Detection skipped (or
+      // correction off) = the reported fix, exactly as before. Only the
+      // classification input changes; the stored fix stays as reported.
+      const geo = filter ? filter.classifyPosition(await signFlipCorrectedPosition(sourceId, position)) : 'no-geo';
 
       if (geo === 'out') {
         // Outside the boundary. Capture display names before purge so the
@@ -404,7 +451,11 @@ async function ingestServiceEnvelopeInner(input: MqttIngestionInput): Promise<Mq
           existing?.longName ?? `Node ${fromNodeId}`,
           existing?.shortName ?? fromNodeId.slice(-4),
         );
-        if (inserted) {
+        // A tracked asset (#5354) is still geo-ignored, but never purged: its
+        // retained history outlives the bbox. Checked only on the transition.
+        if (inserted && (await databaseService.getAssetNodeAsync(fromNum))) {
+          logger.info(`Geo-ignored tracked asset ${fromNodeId}@${sourceId}; skipping purge`);
+        } else if (inserted) {
           // Fire-and-forget full purge (messages incl. broadcasts, telemetry,
           // traceroutes, neighbors, packet logs, node row). Ingestion must not
           // block the packet loop on a multi-table cascade. The ignore-cache
@@ -424,15 +475,6 @@ async function ingestServiceEnvelopeInner(input: MqttIngestionInput): Promise<Mq
         await databaseService.ignoredNodes.liftGeoIgnoreAsync(fromNum, sourceId);
       }
 
-      // After any lift attempt, a still-ignored sender must NOT ingest — this
-      // catches manual ignores with an in-bounds position, a geo lift that lost
-      // the race to a manual upgrade, and coordless ('unknown') positions from
-      // an ignored node. A never-ignored node (or one just lifted) passes.
-      if (databaseService.ignoredNodes.isIgnoredCached(fromNum, sourceId)) {
-        return { ingested: false, reason: 'ignored', portnum };
-      }
-
-      // Fail-open ingest ('in' reappearance, 'unknown', or 'no-geo').
       const latI = position.latitudeI ?? position.latitude_i;
       const lngI = position.longitudeI ?? position.longitude_i;
       const alt = position.altitude;
@@ -454,16 +496,75 @@ async function ingestServiceEnvelopeInner(input: MqttIngestionInput): Promise<Mq
         logger.debug(`MQTT: dropping bogus position (${lat}, ${lng}) precisionBits=${precisionBits} from ${fromNodeId}`);
       }
 
+      // Aircraft age-out D3 lift: an aged-out aircraft is DB-ignored, so the
+      // gate below would drop its fix before the post-upsert hook could lift
+      // the ignore, and it could never come back on an MQTT source. Lift first,
+      // on a live, trustworthy fix only. Manual and geo ignores are untouched.
+      if (!positionIsBogus && lat != null && lng != null &&
+          databaseService.ignoredNodes.isIgnoredCached(fromNum, sourceId)) {
+        await aircraftAgeOutService.liftIfLivePosition(sourceId, fromNum, packet.rxTime, nowMs);
+      }
+
+      // After any lift attempt, a still-ignored sender must NOT ingest — this
+      // catches manual ignores with an in-bounds position, a geo lift that lost
+      // the race to a manual upgrade, and coordless ('unknown') positions from
+      // an ignored node. A never-ignored node (or one just lifted) passes.
+      if (databaseService.ignoredNodes.isIgnoredCached(fromNum, sourceId)) {
+        return { ingested: false, reason: 'ignored', portnum };
+      }
+
+      // Fail-open ingest ('in' reappearance, 'unknown', or 'no-geo').
+
       // Inline auto-delete-by-distance (#3900): when this MQTT source has the
       // feature enabled, evaluate the fix as it arrives so a node beyond the
       // configured radius never touches the nodeDB / map — rather than waiting
       // for the next periodic sweep. Only on a trustworthy (non-bogus) fix; a
       // bogus position is not a reliable basis for a distance decision.
       if (!positionIsBogus && lat != null && lng != null) {
-        const outcome = await autoDeleteByDistanceService.applyInlineDistanceCheck(sourceId, fromNum, lat, lng);
+        const outcome = await autoDeleteByDistanceService.applyInlineDistanceCheck(sourceId, fromNum, lat, lng, precisionBits);
         if (outcome !== 'kept') {
           return { ingested: false, reason: 'distance', portnum };
         }
+      }
+
+      // Coverage Report (#5277 P2, §2.6): record one gateway reception per
+      // (packet, path, gateway) for the survey map. Placed here — after the
+      // geo/ignore/distance gates and only for a non-bogus fix — so Coverage
+      // never shows a node the node table refused (Decision D2). Non-blocking
+      // and fully self-contained: never throws into ingest, never emits on
+      // dataEventEmitter, and no-ops when the per-source opt-in is off
+      // (default). See src/server/utils/coverageMqtt.ts.
+      if (!positionIsBogus && lat != null && lng != null) {
+        void maybeRecordMqttCoverageReception({
+          sourceId,
+          envelope,
+          fromNum,
+          localGatewayNodeNum: input.localGatewayNodeNum,
+          lat,
+          lng,
+          altitude: typeof alt === 'number' ? alt : null,
+          precisionBits: precisionBits ?? null,
+          channel: effectiveChannel,
+          nowMs,
+        });
+        // Position history (#5364/#5365 Phase 3): store every trustworthy MQTT
+        // fix as position telemetry, as the TCP path always has, so Position
+        // History and flight trails work for MQTT-heard nodes. Deduped across
+        // gateways on the packet id; non-throwing, not awaited.
+        const positionTime = position.time;
+        void recordMqttPositionHistory({
+          sourceId,
+          fromNum,
+          nodeId: fromNodeId,
+          packetId: typeof packet.id === 'number' ? packet.id >>> 0 : 0,
+          latitude: lat,
+          longitude: lng,
+          altitude: typeof alt === 'number' ? alt : undefined,
+          precisionBits: precisionBits ?? undefined,
+          channel: effectiveChannel,
+          positionTimeSec: typeof positionTime === 'number' && positionTime > 0 ? positionTime : undefined,
+          nowMs,
+        });
       }
 
       const node: Partial<DbNode> = {
@@ -480,6 +581,20 @@ async function ingestServiceEnvelopeInner(input: MqttIngestionInput): Promise<Mq
         channel: effectiveChannel,
         latitude: positionIsBogus ? undefined : lat,
         longitude: positionIsBogus ? undefined : lng,
+        // #5292: persist HOW precise this fix is and WHEN it was observed.
+        // Without them an MQTT-fed row could not be compared against another
+        // source's row of the same node, so the unified view fell back to
+        // "newest lastHeard wins" and flipped between a 13-bit and a 14-bit
+        // rendering of one physical spot as unrelated traffic bumped either
+        // row. Both are dropped with the coordinates on a bogus fix — a
+        // precision or a timestamp describing a position we refused to store
+        // would outrank a real fix from another source.
+        positionPrecisionBits: positionIsBogus ? undefined : precisionBits,
+        // Observation time, not arrival (#5401): a retained or replayed frame
+        // keeps its original rx_time rather than posing as the freshest fix.
+        positionTimestamp: positionIsBogus
+          ? undefined
+          : resolvePositionObservedAtMs(typeof packet.rxTime === 'number' ? packet.rxTime : undefined, nowMs),
         // Drop altitude too on a bogus fix — an altitude with no trustworthy
         // horizontal position is not worth persisting.
         altitude: positionIsBogus ? undefined : (typeof alt === 'number' ? alt : undefined),
@@ -490,7 +605,18 @@ async function ingestServiceEnvelopeInner(input: MqttIngestionInput): Promise<Mq
         createdAt: nowMs,
         updatedAt: nowMs,
       };
-      void databaseService.upsertNodeAsync(node).catch(err => logger.error('MQTT upsertNode failed:', err));
+      void databaseService.upsertNodeAsync(node).then(() => {
+        // Likely-aircraft classification (#5364/#5365): non-throwing,
+        // coalescing queue — see aircraftClassificationService.ts. Only for a
+        // trustworthy fix with an altitude to classify.
+        const hasAlt = !positionIsBogus && typeof alt === 'number';
+        // Phase 2 D3: a LIVE, trustworthy fix lifts an aged-out aircraft's
+        // DB-only ignore (retained/replayed frames never count), then queues
+        // the classification only when there is an altitude, as before.
+        if (!positionIsBogus) {
+          aircraftAgeOutService.handlePositionReception(sourceId, fromNum, packet.rxTime, Date.now(), { classify: hasAlt });
+        }
+      }).catch(err => logger.error('MQTT upsertNode failed:', err));
       return { ingested: true, portnum };
     }
 
@@ -551,6 +677,12 @@ async function ingestServiceEnvelopeInner(input: MqttIngestionInput): Promise<Mq
         rxTime: plausibleRxTime(typeof packet.rxTime === 'number' ? packet.rxTime * 1000 : undefined) ?? undefined,
         rxSnr: typeof packet.rxSnr === 'number' ? packet.rxSnr : undefined,
         rxRssi: typeof packet.rxRssi === 'number' ? packet.rxRssi : undefined,
+        // Hop header fields (#5366). The TCP path stores these on every
+        // message row; MQTT ingest dropped them, so every MQTT reception in
+        // Unified Messages read as "hop count unknown". Same camel/snake read
+        // as meshtasticManager so both paths agree.
+        hopStart: mqttHopField(packet, 'hopStart', 'hop_start'),
+        hopLimit: mqttHopField(packet, 'hopLimit', 'hop_limit'),
         viaMqtt: true,
         emoji,
         replyId,
@@ -858,6 +990,9 @@ async function ingestTraceroute(
     snrTowards: JSON.stringify(snrTowards),
     snrBack: JSON.stringify(snrBack),
     routePositions: JSON.stringify(routePositions),
+    // #5101: every row this path writes arrived over MQTT. Without this the
+    // column stays NULL, which reads as RF (classifyNodeTransport's fallback).
+    transportMechanism: TransportMechanism.MQTT,
     // Originating packet id enables correlating this trace with the same packet
     // heard on another source (e.g. a direct TCP listener) — issue #3623.
     packetId: typeof packet.id === 'number' ? packet.id >>> 0 : null,
@@ -910,6 +1045,9 @@ async function persistRouteSegments(sourceId: string, fullRoute: number[], times
       toNodeId: nodeNumToId(b),
       distanceKm: distKm,
       isRecordHolder: false,
+      // #5101: every MQTT-ingested segment is MQTT — no per-hop sentinel
+      // needed, unlike the TCP writer, since this whole path is MQTT.
+      transportMechanism: TransportMechanism.MQTT,
       timestamp,
       createdAt: Date.now(),
       ...({
@@ -920,6 +1058,10 @@ async function persistRouteSegments(sourceId: string, fullRoute: number[], times
       } as any),
     };
     await databaseService.insertRouteSegmentAsync(seg, sourceId);
+    // #5101 (finding 2): MQTT sources previously never set a record holder —
+    // only the TCP writer did. Mirror it here so MQTT-only sources get
+    // per-transport records too.
+    await databaseService.updateRecordHolderSegmentAsync(seg, sourceId);
   }
 }
 
@@ -1128,6 +1270,9 @@ async function ingestStoreForward(
       rxTime: plausibleRxTime(typeof packet.rxTime === 'number' ? packet.rxTime * 1000 : undefined) ?? undefined,
       rxSnr: typeof packet.rxSnr === 'number' ? packet.rxSnr : undefined,
       rxRssi: typeof packet.rxRssi === 'number' ? packet.rxRssi : undefined,
+      // hopStart/hopLimit deliberately omitted (#5366): this packet's hop
+      // header describes the S&F replay transmission, not the original
+      // message's path, so storing it would report a misleading hop count.
       viaMqtt: true,
       createdAt: nowMs,
       sourcePath: 'mqtt_bridge',

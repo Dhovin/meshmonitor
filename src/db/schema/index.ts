@@ -49,6 +49,18 @@ export * from './messageEvents.js';
 // Meshtastic Heard-By table (#4816 Phase 4 WP1)
 export * from './meshtasticHeardRepeaters.js';
 
+// Coverage Report RF receptions (#5277 Phase 1 WP1)
+export * from './coverageReceptions.js';
+
+// Coverage Report saved surveys (global — no sourceId) (#5277 Phase 4b WP1)
+export * from './coverageSurveys.js';
+
+// ADS-B flight matching for likely aircraft (#5374)
+export * from './aircraftFlightMatches.js';
+
+// MeshCore client-side Ignore / Block, per source (#5408)
+export * from './meshcoreFilters.js';
+
 // Mesh Issues findings (global — no sourceId) (epic #4964 Phase 1 WP1)
 export * from './meshIssues.js';
 
@@ -66,6 +78,9 @@ export * from './savedRegions.js';
 // Operator-hosted privacy documents (global — no sourceId) (#5156)
 export * from './privacyDocuments.js';
 export * from './solarNodeOverrides.js';
+
+// Tracked assets (global — no sourceId) (#5354)
+export * from './assetNodes.js';
 
 // Waypoints table
 export * from './waypoints.js';

@@ -77,7 +77,7 @@ This prevents mobile apps from accidentally or maliciously modifying your physic
 3. In the **Virtual Node** section, toggle **Enable Virtual Node**.
 4. Enter the TCP port mobile apps should connect to (the historical default was `4404`). It must not collide with the source's upstream TCP port or another source's VN port.
 5. Optionally enable **Allow admin commands** — leave off unless you trust every connected client (see [Security Filtering](#security-filtering)).
-6. On a **MeshCore** source, optionally enable **Allow PKI export** — see [PKI private-key export](#pki-private-key-export-meshcore) before you do.
+6. On a **MeshCore** source, optionally enable **Allow PKI export** or **Allow PKI import** — see [PKI private-key export](#pki-private-key-export-meshcore) and [PKI private-key import](#pki-private-key-import-meshcore) before you do.
 7. Click **Save**. The endpoint hot-swaps without restarting the upstream TCP connection.
 
 Configuration lives in the `sources.config` JSON column as:
@@ -130,6 +130,25 @@ Read this before turning it on:
 
 The **Info** tab shows a **PKI Export** row so you can see the current state at a glance.
 
+### PKI private-key import (MeshCore)
+
+*Since 4.16 (#5350).* The MeshCore app can restore a backed-up identity by sending
+`ImportPrivateKey(24)`. **Allow PKI import** (`virtualNode.allowPkiImport`, MeshCore sources
+only, default **off**) relays that key to the physical node, which then *becomes* whoever
+holds it.
+
+- **It is irreversible.** The node's old identity is gone unless you exported it first.
+  Contacts on the mesh see a different node afterwards.
+- **The Virtual Node port has no client authentication.** Anyone who can reach the port could
+  replace your node's identity with a key of their choosing.
+- **It is a separate switch** from **Allow PKI export** and **Allow admin commands**; enabling
+  one never enables the others. Turn it on only for the restore, then turn it off again.
+- With the gate off the Virtual Node answers `Disabled`, byte-identical to firmware compiled
+  without `ENABLE_PRIVATE_KEY_IMPORT`. With it on, the node's own firmware must also support
+  import, or the app gets an error. Each import writes an audit row.
+
+The **Info** tab shows a **PKI Import** row next to **PKI Export**.
+
 ### Docker Compose Example
 
 ```yaml
@@ -154,22 +173,89 @@ On first boot MeshMonitor auto-creates a default `meshtastic_tcp` source from `M
 
 ### Kubernetes/Helm Example
 
+The chart's `service.port`/`service.targetPort` cover the web UI only. Add each
+Virtual Node port you enable to `service.extraPorts` (available since #5416) so
+it's opened on both the container and the Service — otherwise the port exists
+only inside the pod's network namespace and mobile apps outside the cluster
+can't reach it:
+
 ```yaml
 env:
   meshtasticNodeIp: "192.168.1.100"
 
 service:
   type: LoadBalancer
-  ports:
-    - name: http
-      port: 80
-      targetPort: 3001
+  extraPorts:
     - name: virtual-node
       port: 4404
       targetPort: 4404
 ```
 
-After the pod starts, open the Dashboard and enable Virtual Node on the auto-created source.
+After the pod starts, open the Dashboard and enable Virtual Node on the auto-created source, using the same port number you listed above.
+
+#### Pinning the LoadBalancer IP
+
+Mobile apps connect to a fixed address, so you usually want the Virtual Node on
+a stable IP. Most bare-metal load balancers pick the IP from a Service
+annotation, which the chart passes through with `service.annotations`:
+
+| Load balancer | Annotation |
+|---------------|------------|
+| MetalLB 0.13+ | `metallb.io/loadBalancerIPs` (older: `metallb.universe.tf/loadBalancerIPs`) |
+| kube-vip | `kube-vip.io/loadbalancerIPs` |
+| Cilium LB-IPAM | `lbipam.cilium.io/ips` |
+
+```yaml
+service:
+  type: LoadBalancer
+  annotations:
+    metallb.io/loadBalancerIPs: 192.168.1.240
+  extraPorts:
+    - name: virtual-node
+      port: 4404
+      targetPort: 4404
+```
+
+The chart also exposes `service.loadBalancerIP`, `loadBalancerClass`,
+`loadBalancerSourceRanges` and `externalTrafficPolicy`, plus a `nodePort` on
+each port for `type: NodePort`. `loadBalancerIP` is deprecated in Kubernetes in
+favour of the annotations above, but some load balancers still honour it.
+
+::: warning k3s ServiceLB
+k3s's built-in ServiceLB (klipper-lb) cannot pin an IP: it answers on the
+node IPs. To choose the address, install MetalLB, kube-vip or Cilium LB-IPAM
+(and start k3s with `--disable servicelb`), or use `type: NodePort` and connect
+to a node's IP.
+:::
+
+#### Web UI behind an Ingress, Virtual Node on a LoadBalancer
+
+An Ingress (or Gateway API HTTPRoute) can't carry Virtual Node traffic: it
+proxies HTTP, while the Virtual Node speaks the raw Meshtastic TCP protocol. To
+keep the web UI on ClusterIP behind your Ingress and put only the Virtual Node
+port(s) on a LoadBalancer, enable the chart's separate `virtualNodeService`. It
+selects the same pod, has its own type, annotations and load-balancer fields,
+and adds a matching container port for each entry (a port already listed in
+`service.extraPorts` is not added twice):
+
+```yaml
+service:
+  type: ClusterIP
+
+ingress:
+  enabled: true
+  # ...hosts/tls as usual
+
+virtualNodeService:
+  enabled: true
+  type: LoadBalancer
+  annotations:
+    metallb.io/loadBalancerIPs: 192.168.1.241
+  ports:
+    - name: virtual-node
+      port: 4404
+      targetPort: 4404
+```
 
 ## Mobile App Setup
 
@@ -513,6 +599,21 @@ In the MeshCore mobile app, add a new device using the **TCP / network** connect
 By default the MeshCore Virtual Node is **read-and-message only**: read operations and sending text messages are allowed, but configuration-mutating commands (set radio params, set advert name, import private key, reboot, set channel, set TX power, etc.) are **blocked** and rejected back to the app. Exporting the device's private key is **always blocked**, regardless of settings.
 
 Enabling **Allow admin commands** forwards those configuration commands through to the real node. Only enable it on a trusted LAN where you control every device that can reach the port — any connected app would then be able to reconfigure your node.
+
+*Since 4.16 (#5350).* The same toggle also covers contact-list edits and reboot, because the node's contact list is shared with everyone who uses this source in MeshMonitor:
+
+| App action | Allow admin commands off | Allow admin commands on |
+|------------|--------------------------|-------------------------|
+| Delete contact | Refused | Removes it from the node and from MeshMonitor |
+| Rename contact / toggle favourite | Refused | Applied (favourites follow MeshMonitor's own favourite) |
+| Reset path | Refused | Clears the cached route |
+| Import contact (URL / QR) | Refused | Adds the contact |
+| Reboot node | Refused | Reboots the node; MeshMonitor reconnects |
+| Share contact, export contact, read stats | Allowed | Allowed |
+| Import private key | Refused unless **Allow PKI import** is on (separate switch, see above) | Same |
+| Raw-data send | Always refused | Always refused |
+
+Setting a manual route or per-contact telemetry permissions from the app is not relayed; use the MeshMonitor web UI for those. Share contact sends one zero-hop advert, so receive-only mode refuses it.
 
 ### Safety: receive-only mode
 

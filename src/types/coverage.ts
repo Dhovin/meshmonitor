@@ -1,0 +1,156 @@
+/**
+ * API contract for the Coverage Report epic (#5277). Shared by the server
+ * routes (WP3, `src/server/routes/coverageRoutes.ts`) and the frontend (WP4,
+ * `src/services/analysisApi.ts` / `src/hooks/useCoverageData.ts`) so both
+ * sides can be built against the same shape in parallel.
+ *
+ * These are the wire DTOs returned from `/api/analysis/coverage/*` — richer
+ * than the raw `DbCoverageReception` repository row (adds resolved names,
+ * `sourceName`, and privacy-gate nulling of receiver/sender coordinates).
+ */
+
+/** `exact` matches `hopsAway === N`; `max` matches `hopsAway <= N`. */
+export type CoverageHopsMode = 'exact' | 'max';
+
+/** `'meshtastic'` today (P1/P2); `'meshcore'` from P3. */
+export type CoverageProtocol = 'meshtastic' | 'meshcore';
+
+/** `'local'` (this source's own radio, P1/P3); `'mqtt_gateway'` from P2. */
+export type CoverageReceiverKind = 'local' | 'mqtt_gateway';
+
+/** One RF reception: a single (packet, path, receiver) row. */
+export interface CoverageReceptionDto {
+  id: number;
+  sourceId: string;
+  protocol: CoverageProtocol;
+  receiverKind: CoverageReceiverKind;
+  receiverId: string;
+  receiverNodeNum: number | null;
+  /** Receiver position snapshot at receive time. Nulled when the receiver fails the visibility gate. */
+  receiverLatitude: number | null;
+  receiverLongitude: number | null;
+  senderId: string;
+  senderNodeNum: number | null;
+  packetKey: string;
+  packetId: number | null;
+  pathKey: string;
+  latitude: number;
+  longitude: number;
+  altitude: number | null;
+  precisionBits: number | null;
+  snr: number | null;
+  rssi: number | null;
+  hopStart: number | null;
+  hopLimit: number | null;
+  hopsAway: number | null;
+  relayNode: number | null;
+  transportMechanism: number | null;
+  channel: number | null;
+  /** Device receive clock, unix seconds. */
+  rxTime: number | null;
+  /** Server receive time, unix ms. */
+  receivedAt: number;
+}
+
+/** A distinct receiver seen in the retention window, enriched with a name and current position. */
+export interface CoverageReceiverDto {
+  sourceId: string;
+  sourceName: string;
+  protocol: CoverageProtocol;
+  receiverKind: CoverageReceiverKind;
+  receiverId: string;
+  receiverNodeNum: number | null;
+  longName: string | null;
+  shortName: string | null;
+  /** Current node position when known (override-aware), else the latest reception snapshot. Nulled by the visibility gate. */
+  latitude: number | null;
+  longitude: number | null;
+  lastReceivedAt: number;
+  /** Reception rows for this receiver in the retention window (#5277 P2 §2.3/§2.4). */
+  receptionCount: number;
+}
+
+/**
+ * Live per-source MQTT/observer gateway-recording status (#5277 P2 + P3
+ * §2.5), returned alongside `/receivers`. Limited to the sources the caller
+ * can read; found via the typed `isMqttConnectionStatusManager` /
+ * `isMeshCoreMqttManager` predicates over the source manager registry, never
+ * a `source.type` string gate, and read with `getSettingForSources`
+ * (per-source, never the bare `coverage_mqtt_enabled` key — #5080).
+ */
+export interface CoverageMqttSourceStatusDto {
+  sourceId: string;
+  sourceName: string;
+  recordingEnabled: boolean;
+  /** `'meshcore'` for a MeshCore Observer (`meshcore_mqtt`) source; `'meshtastic'` otherwise (P3 §2.5). */
+  protocol: CoverageProtocol;
+}
+
+/** A distinct sender seen in the window, enriched with a name. */
+export interface CoverageSenderDto {
+  senderId: string;
+  senderNodeNum: number | null;
+  longName: string | null;
+  shortName: string | null;
+  /** Distinct fix count. An upper bound when merged across multiple sources. */
+  fixCount: number;
+  lastReceivedAt: number;
+}
+
+/** Cursor-paginated response shape shared by every paginated coverage endpoint. */
+export interface CoveragePage<T> {
+  items: T[];
+  pageSize: number;
+  hasMore: boolean;
+  nextCursor: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Saved surveys (#5277 P4b). Global table; see COVERAGE_P4_SPEC.md §2b.
+// ---------------------------------------------------------------------------
+
+export interface CoverageSurveyDto {
+  id: string;
+  name: string;
+  /** `!xxxxxxxx` or a lowercased 64-hex MeshCore public key. */
+  senderId: string;
+  /** Unix ms. */
+  startAt: number;
+  /** Unix ms; null while live. */
+  endAt: number | null;
+  /** Encoded receiver-filter wire string; null = every receiver. View preference only. */
+  receivers: string | null;
+  /** Configured broadcast interval for gap detection, seconds. */
+  intervalSec: number | null;
+  notes: string | null;
+  createdAt: number;
+  updatedAt: number;
+  /** effectiveSurveyEndAt(startAt, endAt, now) at response time. */
+  effectiveEndAt: number;
+  isLive: boolean;
+  /** Creator or admin. */
+  canEdit: boolean;
+  createdByMe: boolean;
+}
+
+export interface CreateCoverageSurveyBody {
+  name: string;
+  senderId: string;
+  /** Required unless `live`. Unix ms. */
+  startAt?: number;
+  /** Required unless `live`. Unix ms. */
+  endAt?: number;
+  /** Start now and run until stopped (or the live cap). */
+  live?: boolean;
+  receivers?: string | null;
+  intervalSec?: number | null;
+  notes?: string | null;
+}
+
+export interface UpdateCoverageSurveyBody {
+  name?: string;
+  notes?: string | null;
+  intervalSec?: number | null;
+  receivers?: string | null;
+}
+

@@ -24,11 +24,13 @@ export interface BaseMapProps {
   tilesetId?: TilesetId;
   /** Needed only to resolve `custom-*` ids. Default []. */
   customTilesets?: CustomTileset[];
-  /** MapLibre style JSON passthrough for vector tilesets (ignored for raster). */
+  /** MapLibre style JSON passthrough for vector tilesets (ignored for raster,
+   *  and for style-based presets that carry their own `styleUrl`, #5448). */
   styleJson?: Record<string, unknown>;
   /** Deployment-wide Carto basemap API key (#4934). When set, it is appended as
    *  `?key=` to Carto CDN tile URLs (no-op for every other host). Omit/null ⇒
-   *  keyless (Carto tiles show the "API key required" watermark). */
+   *  keyless (Carto tiles show the "API key required" watermark). Vector
+   *  CARTO styles (#5448) get it through MapLibre's `transformRequest`. */
   cartoApiKey?: string | null;
 
   // ---- Optional tileset selector overlay ---------------------------------
@@ -42,6 +44,15 @@ export interface BaseMapProps {
   doubleClickZoom?: boolean;
   zoomControl?: boolean;
   attributionControl?: boolean;
+  /** Render vector layers (CircleMarker/Polyline/Rectangle/…) on a Canvas
+   *  renderer instead of SVG. A Leaflet Map constructor option — like
+   *  `center`/`zoom` it is applied once at mount and is NOT reactive; a
+   *  later prop change does not swap the renderer. Omitted ⇒ Leaflet's own
+   *  default (SVG, `false`). Canvas keeps click/popup/tooltip interactivity
+   *  but renders large marker/overlay counts (thousands) without the
+   *  pan/zoom lag SVG DOM nodes hit at that scale (#5277 Coverage Report
+   *  P4a decision A6). */
+  preferCanvas?: boolean;
   /** Merged into MapContainer style; default { height: '100%', width: '100%' }. */
   mapStyle?: CSSProperties;
   /** className on the MapContainer element. */
@@ -128,6 +139,7 @@ export function BaseMap({
   doubleClickZoom,
   zoomControl,
   attributionControl,
+  preferCanvas,
   mapStyle,
   className,
   resizeTrigger,
@@ -152,11 +164,13 @@ export function BaseMap({
     doubleClickZoom?: boolean;
     zoomControl?: boolean;
     attributionControl?: boolean;
+    preferCanvas?: boolean;
   } = {};
   if (scrollWheelZoom !== undefined) interactionOptions.scrollWheelZoom = scrollWheelZoom;
   if (doubleClickZoom !== undefined) interactionOptions.doubleClickZoom = doubleClickZoom;
   if (zoomControl !== undefined) interactionOptions.zoomControl = zoomControl;
   if (attributionControl !== undefined) interactionOptions.attributionControl = attributionControl;
+  if (preferCanvas !== undefined) interactionOptions.preferCanvas = preferCanvas;
 
   return (
     <>
@@ -176,6 +190,8 @@ export function BaseMap({
               attribution={tileset.attribution}
               maxZoom={tileset.maxZoom}
               styleJson={styleJson}
+              styleUrl={tileset.styleUrl}
+              cartoApiKey={cartoApiKey}
             />
           )
           : (

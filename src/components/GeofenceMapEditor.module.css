@@ -1,0 +1,67 @@
+/*
+ * Circle-geofence fields (Center Lat / Center Lng / Radius).
+ *
+ * This was a fixed `1fr 1fr 1fr` grid. A `1fr` track cannot shrink below its
+ * content, and a number input's intrinsic width is ~190px on mobile, so at a
+ * 390px viewport the grid measured 469px inside a 276px box and pushed the page
+ * sideways. auto-fit + minmax drops to two columns (or one) when the box is
+ * narrow, and three on desktop, with no media query.
+ */
+
+.circleFields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr));
+  gap: 8px;
+  padding: 12px;
+  background: var(--color-surface);
+  border-radius: 8px;
+}
+
+.circleFields input {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+/*
+ * Circle fields. Moved from inline styles so the invalid state can override
+ * the border. The error line reuses the Auto Responder trigger-validation look
+ * (error colour, alert icon, 0.75rem text).
+ */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.fieldLabel {
+  font-size: 12px;
+  color: var(--color-text-subtle);
+}
+
+.circleFields .fieldInput {
+  padding: 6px 8px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-surface-active);
+  border-radius: 4px;
+  color: var(--color-text);
+  font-size: 14px;
+}
+
+.circleFields .fieldInputInvalid {
+  border: 2px solid var(--color-error);
+}
+
+.fieldError {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.75rem;
+  color: var(--color-error);
+}
+
+/* Without this the icon shrinks to a dot when the message wraps at 390px. */
+.fieldErrorIcon {
+  flex-shrink: 0;
+}

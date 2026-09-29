@@ -1,0 +1,56 @@
+.section {
+  margin-top: 1.5rem;
+}
+
+.heading {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0 0 0.5rem;
+}
+
+.checkboxRow {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+}
+
+/* Host sheets size every input for text entry: MeshCore's
+   `.meshcore-form-view input { width: 100%; max-width: 320px; padding… }`
+   stretched the box to 320px and pushed the label right. Two classes + an
+   attribute outrank those one-class rules, so the box keeps its natural size
+   beside its text in both the Meshtastic and MeshCore settings. */
+.section .checkboxRow input[type="checkbox"] {
+  width: auto;
+  max-width: none;
+  margin: 0;
+  padding: 0;
+  flex: 0 0 auto;
+  cursor: pointer;
+}
+
+.referenceLabel {
+  display: block;
+  margin-bottom: 0.35rem;
+}
+
+.referenceRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.coordInput {
+  flex: 1 1 8rem;
+  min-width: 0;
+}
+
+.warning {
+  color: var(--color-warning);
+}
+
+.error {
+  color: var(--color-error);
+}

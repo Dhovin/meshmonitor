@@ -55,7 +55,11 @@ import { shouldDiscardPosition } from '../../utils/nullIsland';
 import { getDiscardInvalidPositions } from '../../utils/positionDisplayConfig';
 import { effectiveMapMaxAgeHours } from '../../utils/mapAge';
 import { isMeshCoreInfrastructureAdvType } from '../MeshCore/meshcoreRole';
-import { ageFilterStops, nearestAgeStopIndex, formatAgeStop } from '../../utils/mapAgeSteps';
+import MapAgeFilterControl from '../map/MapAgeFilterControl';
+import MapAircraftDisplayControl from '../map/MapAircraftDisplayControl';
+import { isAgedOutAircraft, AGED_OUT_AIRCRAFT_OPACITY } from '../map/agedOutAircraft';
+import AircraftTrailsLayer from '../map/layers/AircraftTrailsLayer';
+import { useAircraftTrailLayer } from '../map/useAircraftTrailLayer';
 import { resolveMapEndpoint } from '../../utils/nodeHelpers';
 import api from '../../services/api';
 import { useCsrfFetch } from '../../hooks/useCsrfFetch';
@@ -317,6 +321,14 @@ export default function DashboardMap({
     setMapMaxAgeHours,
     spreadNodes,
     setSpreadNodes,
+    aircraftDisplayMode,
+    setAircraftDisplayMode,
+    showAgedOutAircraft,
+    setShowAgedOutAircraft,
+    showAircraftTrails,
+    setShowAircraftTrails,
+    aircraftTrailHours,
+    setAircraftTrailHours,
   } = useMapContext();
   const showRfNodes = isMqttOnlySource ? true : rawShowRfNodes;
   const showUdpNodes = isMqttOnlySource ? true : rawShowUdpNodes;
@@ -369,7 +381,7 @@ export default function DashboardMap({
   // this keeps every downstream 3D GeoJSON input referentially stable (#4794).
   // The age reference advances whenever node polling or a filter setting changes,
   // which is when the visible set can meaningfully change.
-  const { nodesWithPosition, nowMs, cutoffTime } = useMemo(() => {
+  const { nodesWithPosition, nowMs, cutoffTime, aircraftCountOnMap, agedOutCountOnMap } = useMemo(() => {
     const referenceNowMs = Date.now();
     const ageCutoffTime = referenceNowMs / 1000 - effectiveMaxAge * 60 * 60;
     const infraCutoffTime = referenceNowMs / 1000 - effectiveInfraMaxAge * 60 * 60;
@@ -378,19 +390,38 @@ export default function DashboardMap({
     // companion window. Favorites bypass both, as before.
     const passesAgeGate = (n: typeof nodes[number]): boolean => {
       if (n.isFavorite) return true;
+      // #5364/#5365 Phase 2: an aged-out aircraft is by definition older than
+      // its age-out window, which is often the map window too. It is only
+      // kept when "Show aged-out" is on (below), so let it past the age gate.
+      if (isAgedOutAircraft(n)) return true;
       if (n.lastHeard == null) return false;
       if (n.isMeshCore && isMeshCoreInfrastructureAdvType(n.advType)) {
         return infraNever || n.lastHeard >= infraCutoffTime;
       }
       return n.lastHeard >= ageCutoffTime;
     };
-    const nodesWithTruePos = nodes
-      .filter((n) => !n.isIgnored)
+    // #5364/#5365 Phase 2: ignored nodes are dropped, except aged-out aircraft,
+    // which stay in `eligible` so the "N aged out" hint counts exactly what the
+    // map would draw; they are dropped below unless "Show aged-out" is on.
+    const eligible = nodes
+      .filter((n) => !n.isIgnored || isAgedOutAircraft(n))
       .filter((n) => !n.hideFromMap) // #3549: per-node "Hide from Map" suppresses the marker only
       .filter(passesAgeGate)
       .filter((n) => nodePassesTransportFilter(n, { showRfNodes, showUdpNodes, showMqttNodes }, ageCutoffTime))
       .map((n) => ({ node: n, truePos: getNodeLatLng(n) }))
       .filter((e): e is { node: any; truePos: { lat: number; lng: number } } => e.truePos !== null);
+    // Likely-aircraft count for the Map Features hint line (#5364/#5365 Phase 1
+    // WP4): counted BEFORE the Hide filter so the number stays put when the
+    // user toggles Hide, but after every other map filter so it only counts
+    // nodes that would actually be drawn (the age window in particular).
+    const agedOutCount = eligible.filter((e) => isAgedOutAircraft(e.node)).length;
+    const aircraftCount = eligible.filter((e) => e.node.likelyAircraft === true && !isAgedOutAircraft(e.node)).length;
+    // Likely-aircraft Hide: suppress the marker, except a favourite is never
+    // hidden by this toggle. Aged-out aircraft follow "Show aged-out" only.
+    const nodesWithTruePos = eligible.filter((e) => {
+      if (isAgedOutAircraft(e.node)) return showAgedOutAircraft === true;
+      return !(aircraftDisplayMode === 'hide' && e.node.likelyAircraft === true && !e.node.isFavorite);
+    });
 
     // #4016/#4155: offset obscured low-precision markers within their accuracy cell
     // via the shared occupancy-gated helper — lone nodes stay centered, 2+ same-cell
@@ -409,10 +440,20 @@ export default function DashboardMap({
       { enabled: spreadNodes },
     ).map(({ item: node, latLng }) => ({ node, pos: { lat: latLng[0], lng: latLng[1] } }));
 
-    return { nodesWithPosition: positionedNodes, nowMs: referenceNowMs, cutoffTime: ageCutoffTime };
+    return { nodesWithPosition: positionedNodes, nowMs: referenceNowMs, cutoffTime: ageCutoffTime, aircraftCountOnMap: aircraftCount, agedOutCountOnMap: agedOutCount };
   // `spreadNodes` (#5177) changes every resolved position without changing any
   // node, so it has to be a dependency or toggling it leaves the markers put.
-  }, [nodes, effectiveMaxAge, effectiveInfraMaxAge, infraNever, showRfNodes, showUdpNodes, showMqttNodes, spreadNodes]);
+  }, [nodes, effectiveMaxAge, effectiveInfraMaxAge, infraNever, showRfNodes, showUdpNodes, showMqttNodes, spreadNodes, aircraftDisplayMode, showAgedOutAircraft]);
+
+  // Flight trails (#5364/#5365 Phase 3): one per aircraft this map draws a
+  // marker for — `nodesWithPosition` is already past Hide / age / transport /
+  // "Show aged-out", so trails follow every one of those filters.
+  const drawnNodesForTrails = useMemo(() => nodesWithPosition.map((e) => e.node), [nodesWithPosition]);
+  const aircraftTrailLayer = useAircraftTrailLayer({
+    drawnNodes: drawnNodesForTrails,
+    mode: isUnified ? { kind: 'unified' } : sourceId ? { kind: 'source', sourceId } : null,
+    available: !effective3D,
+  });
 
   // Array form of node positions for MapBoundsUpdater (fit bounds).
   const nodePositions: [number, number][] = nodesWithPosition.map((e) => [e.pos.lat, e.pos.lng]);
@@ -432,9 +473,13 @@ export default function DashboardMap({
       // near-invisible on the globe.
       const isInfra = node.isMeshCore && isMeshCoreInfrastructureAdvType(node.advType);
       const lastHeardMs = node.lastHeard != null ? node.lastHeard * 1000 : null;
-      const opacity = node.isFavorite || (isInfra && infraNever)
-        ? 1
-        : markerAgeOpacity(now, isInfra ? infraCutoffMs : cutoffMs, lastHeardMs);
+      // #5364/#5365 Phase 2: an aged-out aircraft shown by "Show aged-out"
+      // gets the same fixed dim as the 2D marker, not the age fade.
+      const opacity = isAgedOutAircraft(node)
+        ? AGED_OUT_AIRCRAFT_OPACITY
+        : node.isFavorite || (isInfra && infraNever)
+          ? 1
+          : markerAgeOpacity(now, isInfra ? infraCutoffMs : cutoffMs, lastHeardMs);
       return {
         key: unifiedNodeKey(node) ?? String(node.nodeNum ?? node.nodeId ?? node.user?.id),
         lat: pos.lat,
@@ -699,10 +744,16 @@ export default function DashboardMap({
           node.lastHeard != null ? node.lastHeard * 1000 : null,
         );
 
+    // Likely-aircraft badge (#5364/#5365 Phase 1 WP4): 'show' never marks.
+    // An aged-out aircraft (Phase 2, only here when "Show aged-out" is on) is
+    // always badged and dimmed so it reads as "not current".
+    const agedOut = isAgedOutAircraft(node);
+    const markAircraft = agedOut || (aircraftDisplayMode !== 'show' && node.likelyAircraft === true);
+
     return {
       key: markerKey,
       position: [pos.lat, pos.lng],
-      iconSig: `${hops}|${shortName ?? ''}|${isRouter ? 1 : 0}|${roleCategory}|${node.isUnmessagable ? 1 : 0}|${mapPinStyle}|${mapPinColorMode}`,
+      iconSig: `${hops}|${shortName ?? ''}|${isRouter ? 1 : 0}|${roleCategory}|${node.isUnmessagable ? 1 : 0}|${markAircraft ? 1 : 0}|${mapPinStyle}|${mapPinColorMode}`,
       buildIcon: () =>
         createNodeIcon({
           variant: 'meshtastic',
@@ -711,13 +762,14 @@ export default function DashboardMap({
           isRouter,
           roleCategory,
           isUnmessagable: !!node.isUnmessagable,
+          isLikelyAircraft: markAircraft,
           shortName,
           showLabel: true,
           pinStyle: mapPinStyle,
           colorMode: mapPinColorMode,
           nodeNum: Number.isFinite(Number(node.nodeNum)) ? Number(node.nodeNum) : undefined,
         }),
-      opacity: ageOpacity,
+      opacity: agedOut ? AGED_OUT_AIRCRAFT_OPACITY : ageOpacity,
       children: (
         <Popup>
           <DashboardNodePopup node={node} pos={pos} onSourceSelect={onNodeSourceSelect} />
@@ -873,6 +925,14 @@ export default function DashboardMap({
 
         {showAtakContacts && <DashboardAtakContacts sourceId={sourceId} />}
 
+        {/* Flight trails (#5364/#5365 Phase 3), below the node markers. */}
+        {showAircraftTrails && (
+          <AircraftTrailsLayer
+            trails={aircraftTrailLayer.trails}
+            formatTooltip={aircraftTrailLayer.formatTooltip}
+          />
+        )}
+
         <NodeMarkersLayer markers={nodeMarkers} />
 
         {/* Position accuracy regions — shared layer, canonical gray. */}
@@ -984,47 +1044,28 @@ export default function DashboardMap({
               <span>3D Terrain</span>
             </label>
           )}
-          {/* Map Features age slider (#3322): hides node markers, traceroutes,
-              and route segments older than the chosen age. Ranges 1h–maxNodeAge. */}
-          {(() => {
-            // Non-linear discrete stops (1h..30d) via mapAgeSteps (#4770),
-            // bounded by the per-source maxNodeAgeHours setting.
-            // maxNodeAgeHours of 0 = "never / show all" (#4947): keep it 0 so
-            // ageFilterStops/formatAgeStop take their unlimited ("All") branch.
-            const maxHours = maxNodeAgeHours <= 0 ? 0 : Math.max(1, Math.round(maxNodeAgeHours));
-            const stops = ageFilterStops(maxHours);
-            const topIndex = stops.length - 1;
-            const currentIndex = !Number.isFinite(effectiveMaxAge)
-              ? topIndex
-              : nearestAgeStopIndex(stops, Math.max(1, Math.round(effectiveMaxAge)));
-            const label = (idx: number) => formatAgeStop(stops[idx], maxHours);
-            return (
-              <div className="map-control-item" style={{ flexDirection: 'column', alignItems: 'stretch', gap: '0.25rem' }}>
-                <span>Maximum age</span>
-                <div className="position-history-slider">
-                  <input
-                    type="range"
-                    min={0}
-                    max={topIndex}
-                    step={1}
-                    value={currentIndex}
-                    aria-label="Maximum age"
-                    aria-valuemin={0}
-                    aria-valuemax={topIndex}
-                    aria-valuenow={currentIndex}
-                    aria-valuetext={label(currentIndex)}
-                    disabled={topIndex < 1}
-                    onChange={(e) => {
-                      const idx = parseInt(e.target.value, 10);
-                      // Top stop == the setting cap → store null so the map follows the setting.
-                      setMapMaxAgeHours(idx >= topIndex ? null : stops[idx]);
-                    }}
-                  />
-                  <span className="slider-value">{label(currentIndex)}</span>
-                </div>
-              </div>
-            );
-          })()}
+          {/* Map Features age filter (#3322, #5344): hides node markers,
+              traceroutes, and route segments older than the chosen age.
+              Shared with NodesTab; can only narrow the Settings window. */}
+          <MapAgeFilterControl
+            maxNodeAgeHours={maxNodeAgeHours}
+            effectiveMaxAgeHours={effectiveMaxAge}
+            onChange={setMapMaxAgeHours}
+          />
+          {/* Likely aircraft (#5364/#5365 Phase 1 WP4): shared with NodesTab so
+              Show/Mark/Hide can't drift between panels. */}
+          <MapAircraftDisplayControl
+            mode={aircraftDisplayMode}
+            onChange={setAircraftDisplayMode}
+            aircraftCount={aircraftCountOnMap}
+            showAgedOut={showAgedOutAircraft}
+            onShowAgedOutChange={setShowAgedOutAircraft}
+            agedOutCount={agedOutCountOnMap}
+            showTrails={showAircraftTrails}
+            onShowTrailsChange={setShowAircraftTrails}
+            trailHours={aircraftTrailHours}
+            onTrailHoursChange={setAircraftTrailHours}
+          />
           <label className="map-control-item">
             <input
               type="checkbox"

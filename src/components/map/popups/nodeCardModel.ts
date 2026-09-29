@@ -67,11 +67,34 @@ export interface NodeCardModel {
   /** Epoch SECONDS, normalized across variants (MeshCore's `lastSeen` is raw
    *  epoch-ms and is divided down when building this field). */
   lastHeard?: number | null;
+  /** #5390: when the source first heard the node, epoch SECONDS (MeshCore's
+   *  epoch-ms `firstHeard` is divided down like `lastHeard`). Null = unknown. */
+  firstHeard?: number | null;
   sources?: NodeSourceRef[];
+  /** The row's own source, on per-source payloads (a Dashboard source view).
+   *  Unified rows carry `sources` instead. Used by the #5374 flight-match line. */
+  sourceId?: string;
   meshcore?: NodeCardMeshCoreDetails;
   /** Whether the node is favorited — used by the "importance" node-list color
    *  style (#4880) to keep favorites vivid regardless of hop distance. */
   isFavorite?: boolean;
+  /** Likely-aircraft classification (#5364/#5365 Phase 1). Meshtastic only —
+   *  always false for a MeshCore contact. Optional (like `isFavorite`) so
+   *  callers that build a `NodeCardModel` literal directly (e.g.
+   *  `TracerouteStrip`) don't need to set every aircraft field. */
+  likelyAircraft?: boolean;
+  /** `'agl' | 'msl' | 'unknown'`, null when unclassified. */
+  aircraftBasis?: string | null;
+  /** `altitude − groundElevation`, signed; only set when `aircraftBasis === 'agl'`. */
+  heightAboveGround?: number | null;
+  /** #5364/#5365 Phase 2: ignored by the aircraft age-out sweep
+   *  (`isIgnored && aircraftAgedOutAt != null`). */
+  aircraftAgedOut?: boolean;
+  /** #5364/#5365 Phase 2: carries the sticky "reclassified as fixed" mark. */
+  aircraftFixed?: boolean;
+  /** #5363: the shown position is the mirror of this reported pair. Null
+   *  (or absent) when the position was not auto-corrected. */
+  signFlipReported?: { latitude: number; longitude: number } | null;
 }
 
 export type NodeCardVariant = 'meshtastic' | 'meshcore';
@@ -139,6 +162,7 @@ function toMeshtasticModel(raw: unknown, opts?: ToNodeCardModelOptions): NodeCar
     : (typeof positionRaw?.altitude === 'number' ? positionRaw.altitude : null);
 
   const lastHeard = typeof node.lastHeard === 'number' ? node.lastHeard : null;
+  const firstHeard = typeof node.firstHeard === 'number' ? node.firstHeard : null;
 
   // Position accuracy + source live flat on the DeviceInfo (surfaced by the
   // server's mapDbNodeToDeviceInfo / dbNodeMapper). Display-only (#4176).
@@ -147,6 +171,23 @@ function toMeshtasticModel(raw: unknown, opts?: ToNodeCardModelOptions): NodeCar
   const positionTimestamp = typeof node.positionTimestamp === 'number' ? node.positionTimestamp : null;
 
   const sources = Array.isArray(node.sources) ? (node.sources as NodeSourceRef[]) : undefined;
+  const sourceId = typeof node.sourceId === 'string' && node.sourceId ? node.sourceId : undefined;
+
+  // Likely-aircraft classification (#5364/#5365 Phase 1) — flat top-level
+  // fields (no nested equivalent), matching `dbNodeMapper`'s DTO shape.
+  const likelyAircraft = node.likelyAircraft === true;
+  const aircraftBasis = typeof node.aircraftBasis === 'string' ? node.aircraftBasis : null;
+  const heightAboveGround = typeof node.heightAboveGround === 'number' ? node.heightAboveGround : null;
+  // Phase 2 marks (#5364/#5365): same predicate as the map's aged-out filter.
+  const aircraftAgedOut = node.isIgnored === true && typeof node.aircraftAgedOutAt === 'number';
+  const aircraftFixed = typeof node.aircraftFixedAt === 'number';
+  // #5363: set by the server's sign-flip correction, flat on both node shapes.
+  const signFlipReported =
+    node.positionSignFlipCorrected === true
+    && typeof node.reportedLatitude === 'number'
+    && typeof node.reportedLongitude === 'number'
+      ? { latitude: node.reportedLatitude, longitude: node.reportedLongitude }
+      : null;
 
   return {
     longName,
@@ -164,8 +205,16 @@ function toMeshtasticModel(raw: unknown, opts?: ToNodeCardModelOptions): NodeCar
     positionTimestamp,
     position: opts?.pos,
     lastHeard,
+    firstHeard,
     sources,
+    sourceId,
     isFavorite: node.isFavorite === true,
+    likelyAircraft,
+    aircraftBasis,
+    heightAboveGround,
+    aircraftAgedOut,
+    aircraftFixed,
+    signFlipReported,
   };
 }
 
@@ -179,12 +228,25 @@ function toMeshCoreModel(raw: unknown): NodeCardModel {
   const pathLen = typeof c.pathLen === 'number' ? c.pathLen : null;
   const outPath = typeof c.outPath === 'string' ? c.outPath : undefined;
   const lastSeen = typeof c.lastSeen === 'number' ? c.lastSeen : undefined;
+  const firstHeardMs = typeof c.firstHeard === 'number' ? c.firstHeard : undefined;
+  // #5363: set by the server's sign-flip correction on MeshCore rows too.
+  const signFlipReported =
+    c.positionSignFlipCorrected === true
+    && typeof c.reportedLatitude === 'number'
+    && typeof c.reportedLongitude === 'number'
+      ? { latitude: c.reportedLatitude, longitude: c.reportedLongitude }
+      : null;
 
   return {
     longName: advName || name || 'MeshCore',
     nodeId: publicKey || undefined,
     lastHeard: lastSeen !== undefined ? Math.floor(lastSeen / 1000) : null,
+    firstHeard: firstHeardMs !== undefined ? Math.floor(firstHeardMs / 1000) : null,
     meshcore: { publicKey, rssi, snr, pathLen, outPath, lastSeen },
+    // Aircraft classification is Meshtastic-only (D2, #5364/#5365) — a
+    // MeshCore contact is never flagged.
+    likelyAircraft: false,
+    signFlipReported,
   };
 }
 

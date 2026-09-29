@@ -12,7 +12,7 @@ import databaseService, { DbMessage } from '../../services/database.js';
 import { ALL_SOURCES } from '../../db/repositories/index.js';
 import { MeshMessage } from '../../types/message.js';
 import { sourceManagerRegistry } from '../sourceManagerRegistry.js';
-import { resolveSourceManager } from '../utils/resolveSourceManager.js';
+import { resolveSourceManager, resolveOwnMeshtasticManager } from '../utils/resolveSourceManager.js';
 import { isMqttConnectionStatusManager } from '../sourceManagerTypes.js';
 import { logger } from '../../utils/logger.js';
 import { optionalAuth, hasPermission } from '../auth/authMiddleware.js';
@@ -24,6 +24,7 @@ import {
 } from '../utils/virtualChannelPermissions.js';
 import { transformChannel } from '../utils/channelView.js';
 import { enhanceNodeForClient, filterNodesByChannelPermission, getEffectiveDbNodePosition } from '../utils/nodeEnhancer.js';
+import { getCachedSignFlipContext, applySignFlipCorrection, applySignFlipToTraceroute, applySignFlipToTraceroutes } from '../services/signFlipCorrection.js';
 import { PortNum } from '../constants/meshtastic.js';
 import { transformDbMessageToMeshMessage } from '../utils/transformDbMessage.js';
 import { resolveSourceConnectionConfig } from '../utils/resolveSourceConnectionConfig.js';
@@ -55,11 +56,21 @@ router.get('/poll', optionalAuth(), async (req, res) => {
     // Optional sourceId scoping — when provided, use the matching manager and filter DB queries
     const pollSourceId = (req.query.sourceId as string | undefined) || undefined;
     const activeManager = resolveSourceManager(pollSourceId);
+    // The local device's identity/config must come from THIS source's own
+    // Meshtastic manager. resolveSourceManager() hands an mqtt_broker /
+    // mqtt_bridge / meshcore id (or a source with no live manager) the
+    // PRIMARY TCP manager, so the Info tab of an MQTT broker showed another
+    // source's node ID, name, firmware and LoRa config (#5367). null here
+    // means "this source has no local node": those sections stay empty.
+    const deviceManager = resolveOwnMeshtasticManager(pollSourceId);
 
     // Pre-compute shared values used across multiple sections
     const user = (req as any).user;
     const userId = req.user?.id ?? null;
-    const localNodeInfo = activeManager.getLocalNodeInfo();
+    // Unread DM counting keys off THIS source's own node. A source with no
+    // local node (MQTT broker/bridge) skips DM-to-local counting instead of
+    // counting the primary TCP node's DMs (#5375).
+    const localNodeInfo = deviceManager?.getLocalNodeInfo() ?? null;
     // Nodes are stored per-source (composite PK (nodeNum, sourceId) since migration
     // 029). Scope strictly to this source so two sources with overlapping meshes
     // each show only what they have actually heard. When no sourceId is given
@@ -133,7 +144,12 @@ router.get('/poll', optionalAuth(), async (req, res) => {
     // 2. Nodes (always available with optionalAuth, filtered by channel permissions)
     try {
       const estimatedPositions = await databaseService.getAllNodesEstimatedPositionsAsync();
-      result.nodes = await Promise.all(filteredMemoryNodes.map(node => enhanceNodeForClient(node, user, estimatedPositions, canViewPrivate)));
+      const assets = await databaseService.getAssetNodesMapAsync();
+      const enhanced = await Promise.all(filteredMemoryNodes.map(node => enhanceNodeForClient(node, user, estimatedPositions, canViewPrivate, assets)));
+      // #5363: display-only sign-flip correction against this source's reference.
+      // Cached (60 s, cleared by a settings save): this runs on every poll tick.
+      const signFlipCtx = await getCachedSignFlipContext(pollSourceId);
+      result.nodes = enhanced.map(node => applySignFlipCorrection(node, signFlipCtx));
     } catch (error) {
       logger.error('Error fetching nodes in poll:', error);
       result.nodes = [];
@@ -375,10 +391,11 @@ router.get('/poll', optionalAuth(), async (req, res) => {
 
     // 7. Config (always available with optionalAuth)
     try {
-      // Use the active manager's local node info — source-scoped, not the global settings key
-      const managerNodeInfo = activeManager.getLocalNodeInfo();
+      // Use this source's own manager's local node info — source-scoped, not
+      // the global settings key, and never another source's node (#5367).
+      const managerNodeInfo = deviceManager ? deviceManager.getLocalNodeInfo() : null;
 
-      const deviceMetadata = managerNodeInfo ? {
+      const deviceMetadata = managerNodeInfo && deviceManager ? {
         firmwareVersion: managerNodeInfo.firmwareVersion,
         rebootCount: managerNodeInfo.rebootCount,
         hasWifi: managerNodeInfo.hasWifi,
@@ -386,7 +403,7 @@ router.get('/poll', optionalAuth(), async (req, res) => {
         hasBluetooth: managerNodeInfo.hasBluetooth,
         // True when the node is reached via a bridge/proxy (no native IP) and
         // therefore cannot do OTA firmware updates. See isLocalNodeBridged().
-        isBridged: activeManager.isLocalNodeBridged(),
+        isBridged: deviceManager.isLocalNodeBridged(),
       } : undefined;
 
       const pollLocalNodeInfo = managerNodeInfo ? {
@@ -422,8 +439,8 @@ router.get('/poll', optionalAuth(), async (req, res) => {
     // 8. Device config (requires configuration:read permission)
     try {
       const hasConfigRead = req.user?.isAdmin || (req.user ? await hasPermission(req.user, 'configuration', 'read') : false);
-      if (hasConfigRead) {
-        const config = await activeManager.getDeviceConfig();
+      if (hasConfigRead && deviceManager) {
+        const config = await deviceManager.getDeviceConfig();
         if (config) {
           // Hide node address from anonymous users
           if (!req.session.userId && config.basic) {
@@ -453,6 +470,7 @@ router.get('/poll', optionalAuth(), async (req, res) => {
       let limit = Math.ceil(traceroutesPerHour * maxNodeAgeHours * 1.1);
       limit = Math.max(limit, 100);
 
+      const signFlipCtxForTraceroutes = await getCachedSignFlipContext(pollSourceId); // #5363
       const allTraceroutes = await databaseService.traceroutes.getAllTraceroutes(limit, pollSourceId ?? ALL_SOURCES); // intentional cross-source when sourceId omitted
       const recentTraceroutes = allTraceroutes.filter(tr => tr.timestamp >= cutoffTime);
 
@@ -474,13 +492,18 @@ router.get('/poll', optionalAuth(), async (req, res) => {
         return { ...tr, hopCount };
       });
 
-      result.traceroutes = traceroutesWithHops;
+      // #5363: stored routePositions snapshots drawn at the corrected point.
+      // A scoped poll has one source, so reuse the cached context; an unscoped
+      // one spans sources and resolves each row's own.
+      result.traceroutes = pollSourceId
+        ? traceroutesWithHops.map(tr => applySignFlipToTraceroute(tr, signFlipCtxForTraceroutes))
+        : await applySignFlipToTraceroutes(traceroutesWithHops);
     } catch (error) {
       logger.error('Error fetching traceroutes in poll:', error);
     }
 
     // 10. Device node numbers (nodes in the connected radio's local database)
-    result.deviceNodeNums = activeManager.getDeviceNodeNums();
+    result.deviceNodeNums = deviceManager ? deviceManager.getDeviceNodeNums() : [];
 
     res.json(result);
   } catch (error) {

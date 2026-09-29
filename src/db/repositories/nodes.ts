@@ -10,6 +10,9 @@ import { DatabaseType, DbNode } from '../types.js';
 import { logger } from '../../utils/logger.js';
 import { isValidNodeNum } from '../../server/constants/meshtastic.js';
 import { isBlankMacAddr } from '../../utils/nodeFieldBlanks.js';
+import type { TransportCounts } from '../../utils/transportSeries.js';
+import type { AircraftBasis } from '../../utils/aircraftClassification.js';
+import { resolveFirstHeard } from '../../utils/firstHeard.js';
 
 /**
  * Hook for keeping an external in-memory node cache coherent with PG/MySQL writes.
@@ -58,6 +61,65 @@ export interface NodeIdentityRow {
    * consumer normalises before comparing them.
    */
   createdAt: number;
+}
+
+/**
+ * Values written by the aircraft classification service (#5364/#5365 Phase 1
+ * WP1) — see {@link NodesRepository.setAircraftClassification}.
+ */
+export interface AircraftClassificationWrite {
+  likelyAircraft: boolean | null;
+  aircraftBasis: AircraftBasis | null;
+  groundElevation: number | null;
+  heightAboveGround: number | null;
+  aircraftClassifiedAt: number | null;
+}
+
+/**
+ * One node's row as read by {@link NodesRepository.getAircraftReclassifyRows}
+ * — the effective-position inputs (D17) plus the current classification, so
+ * `reclassifySource` can recompute without a network call.
+ */
+export interface AircraftReclassifyRow {
+  nodeNum: number;
+  altitude: number | null;
+  groundElevation: number | null;
+  likelyAircraft: boolean | null;
+  aircraftBasis: string | null;
+  heightAboveGround: number | null;
+  positionOverrideEnabled: boolean | null;
+  latitudeOverride: number | null;
+  longitudeOverride: number | null;
+  altitudeOverride: number | null;
+  latitude: number | null;
+  longitude: number | null;
+  /** Phase 2 "confirmed fixed" anchor (D4); both null when not marked. */
+  aircraftFixedLatitude: number | null;
+  aircraftFixedLongitude: number | null;
+}
+
+/**
+ * One flagged node as read by {@link NodesRepository.listAircraftAgeOutCandidates}
+ * (#5364/#5365 Phase 2) — what the age-out sweep needs to decide, protect,
+ * ignore, and anchor a fixed mark.
+ */
+export interface AircraftAgeOutCandidate {
+  nodeNum: number;
+  nodeId: string;
+  longName: string | null;
+  shortName: string | null;
+  /** Unix **seconds**. */
+  lastHeard: number | null;
+  isFavorite: boolean;
+  isIgnored: boolean;
+  aircraftAgedOutAt: number | null;
+  positionOverrideEnabled: boolean | null;
+  latitudeOverride: number | null;
+  longitudeOverride: number | null;
+  altitudeOverride: number | null;
+  latitude: number | null;
+  longitude: number | null;
+  altitude: number | null;
 }
 
 /**
@@ -296,6 +358,34 @@ export class NodesRepository extends BaseRepository {
   }
 
   /**
+   * For a batch of nodeNums, the source ids that hold a row for each (#5354).
+   *
+   * Unscoped by design, like `getSourcesForNode`: global tables keyed by
+   * nodeNum (asset flags) use it to decide which rows a caller may see. The
+   * route is responsible for intersecting the result with permitted sources.
+   */
+  async getSourceIdsForNodeNums(nodeNums: number[]): Promise<Map<number, string[]>> {
+    const validNums = [...new Set(nodeNums)].filter((n) => isValidNodeNum(n));
+    const out = new Map<number, string[]>();
+    if (validNums.length === 0) return out;
+    const { nodes } = this.tables;
+    for (let i = 0; i < validNums.length; i += 500) {
+      const chunk = validNums.slice(i, i + 500);
+      const rows = await this.db
+        .select({ nodeNum: nodes.nodeNum, sourceId: nodes.sourceId })
+        .from(nodes)
+        .where(inArray(nodes.nodeNum, chunk));
+      for (const row of rows) {
+        const num = Number(row.nodeNum);
+        const list = out.get(num);
+        if (list) list.push(row.sourceId);
+        else out.set(num, [row.sourceId]);
+      }
+    }
+    return out;
+  }
+
+  /**
    * Get a node by nodeId, optionally scoped to a source.
    *
    * After migration 029, (nodeId, sourceId) is the composite unique key. When
@@ -357,6 +447,23 @@ export class NodesRepository extends BaseRepository {
   }
 
   /**
+   * Every node ever heard (non-null `lastHeard`), most-recently-heard first.
+   * The unbounded twin of getActiveNodes, for maxNodeAgeHours = 0 ("unlimited",
+   * #4947/#5376). Unlike getAllNodes it still skips never-heard placeholder
+   * rows (FK/topology breadcrumbs).
+   */
+  async getHeardNodes(sourceId: SourceScope): Promise<DbNode[]> {
+    const { nodes } = this.tables;
+    const result = await this.db
+      .select()
+      .from(nodes)
+      .where(and(isNotNull(nodes.lastHeard), this.withSourceScope(nodes, sourceId)))
+      .orderBy(desc(nodes.lastHeard));
+
+    return this.normalizeBigInts(result) as DbNode[];
+  }
+
+  /**
    * Get active nodes (heard within sinceDays), most-recently-heard first.
    *
    * When `limit` is a positive number, at most that many nodes are returned —
@@ -391,6 +498,49 @@ export class NodesRepository extends BaseRepository {
     const result = await this.db.select({ count: count() }).from(nodes)
       .where(this.withSourceScope(nodes, sourceId));
     return Number(result[0].count);
+  }
+
+  /**
+   * Distinct nodes whose per-transport "last heard" stamp (#4240, mig 126) falls
+   * in `(fromSec, toSec]`. Additive: a node heard over two transports in the
+   * same window counts in both (#5101 P3 D3). Excludes `excludeNodeNum` (the
+   * local node) when given. NULL stamps never count.
+   *
+   * One Drizzle `select` with three `SUM(CASE WHEN … THEN 1 ELSE 0 END)`
+   * expressions, one per transport column, rather than three separate
+   * queries. Coerce each result with `Number(… ?? 0)`: PostgreSQL returns
+   * NUMERIC/BIGINT aggregates as strings and MySQL as decimals; the stamp
+   * columns themselves are BIGINT on PG/MySQL. `sourceId` is required (see
+   * `withSourceScope`).
+   */
+  async countNodesHeardByTransport(
+    sourceId: SourceScope,
+    fromSec: number,
+    toSec: number,
+    excludeNodeNum?: number,
+  ): Promise<TransportCounts> {
+    const { nodes } = this.tables;
+
+    const conditions = [this.withSourceScope(nodes, sourceId)];
+    if (excludeNodeNum !== undefined) {
+      conditions.push(ne(nodes.nodeNum, excludeNodeNum));
+    }
+
+    const result = await this.db
+      .select({
+        rf: sql<string | number>`SUM(CASE WHEN ${nodes.transportLastRf} > ${fromSec} AND ${nodes.transportLastRf} <= ${toSec} THEN 1 ELSE 0 END)`,
+        udp: sql<string | number>`SUM(CASE WHEN ${nodes.transportLastUdp} > ${fromSec} AND ${nodes.transportLastUdp} <= ${toSec} THEN 1 ELSE 0 END)`,
+        mqtt: sql<string | number>`SUM(CASE WHEN ${nodes.transportLastMqtt} > ${fromSec} AND ${nodes.transportLastMqtt} <= ${toSec} THEN 1 ELSE 0 END)`,
+      })
+      .from(nodes)
+      .where(and(...conditions.filter((c): c is Exclude<typeof c, undefined> => c !== undefined)));
+
+    const row = result[0] ?? {};
+    return {
+      rf: Number(row.rf ?? 0),
+      udp: Number(row.udp ?? 0),
+      mqtt: Number(row.mqtt ?? 0),
+    };
   }
 
   /**
@@ -522,6 +672,11 @@ export class NodesRepository extends BaseRepository {
           channelUtilization: nodeData.channelUtilization ?? existingNode.channelUtilization,
           airUtilTx: nodeData.airUtilTx ?? existingNode.airUtilTx,
           lastHeard: this.coerceBigintField(nodeData.lastHeard ?? existingNode.lastHeard),
+          // #5390: stamp once, never overwrite (Unix seconds, like lastHeard).
+          firstHeard: this.coerceBigintField(
+            resolveFirstHeard(existingNode.firstHeard, existingNode.lastHeard, nodeData.lastHeard, 's')
+              ?? existingNode.firstHeard,
+          ),
           snr: nodeData.snr ?? existingNode.snr,
           rssi: nodeData.rssi ?? existingNode.rssi,
           firmwareVersion: nodeData.firmwareVersion ?? existingNode.firmwareVersion,
@@ -586,6 +741,16 @@ export class NodesRepository extends BaseRepository {
         hopsAway: nodeData.hopsAway ?? null,
         viaMqtt: nodeData.viaMqtt ?? null,
         transportMechanism: nodeData.transportMechanism ?? null,
+        // #5101 P3 EXTRA: a brand-new node's very first packet stamps
+        // `transportLast{Rf,Mqtt,Udp}` in `nodeData` (meshtasticManager.ts
+        // ~6407) via this exact INSERT path — there is no separate
+        // "NodeInfo only" first-write. Omitting these here silently dropped
+        // that first stamp until the node's second packet hit the UPDATE
+        // branch below, undercounting `countNodesHeardByTransport` for
+        // newly-discovered nodes in the bin they first appeared.
+        transportLastRf: this.coerceBigintField(nodeData.transportLastRf),
+        transportLastMqtt: this.coerceBigintField(nodeData.transportLastMqtt),
+        transportLastUdp: this.coerceBigintField(nodeData.transportLastUdp),
         isStoreForwardServer: nodeData.isStoreForwardServer ?? null,
         // #5231: see the conflict-path note below — zero MACs store as null.
         macaddr: isBlankMacAddr(nodeData.macaddr) ? null : nodeData.macaddr,
@@ -630,6 +795,12 @@ export class NodesRepository extends BaseRepository {
         // status persists as null.
         nodeStatus: nodeData.nodeStatus ? nodeData.nodeStatus : null,
         nodeStatusUpdatedAt: this.coerceBigintField(nodeData.nodeStatusUpdatedAt),
+        // #5317: only ever set on INSERT, by the contact-URL import. A row that
+        // was heard first and imported later is not "never heard".
+        importedAt: this.coerceBigintField(nodeData.importedAt) ?? null,
+        // #5390: first reception, Unix seconds. Omitted from `upsertSet`
+        // below on purpose — the conflict path must never overwrite it.
+        firstHeard: this.coerceBigintField(resolveFirstHeard(null, null, nodeData.lastHeard, 's')) ?? null,
         createdAt: now,
         updatedAt: now,
       } as any;
@@ -654,6 +825,12 @@ export class NodesRepository extends BaseRepository {
         hopsAway: nodeData.hopsAway ?? null,
         viaMqtt: nodeData.viaMqtt ?? null,
         transportMechanism: nodeData.transportMechanism ?? null,
+        // #5101 P3 EXTRA: see the matching comment on `newNode` above — this
+        // is the value Drizzle applies on the ON CONFLICT DO UPDATE race path
+        // (two concurrent first-seen upserts), so it needs the same fields.
+        transportLastRf: this.coerceBigintField(nodeData.transportLastRf),
+        transportLastMqtt: this.coerceBigintField(nodeData.transportLastMqtt),
+        transportLastUdp: this.coerceBigintField(nodeData.transportLastUdp),
         isStoreForwardServer: nodeData.isStoreForwardServer ?? null,
         // #5231: an all-zero MAC joins '' as "not reported" — firmware
         // deprecated `User.macaddr` in 2.1.x and many nodes send six zero bytes.
@@ -1759,6 +1936,7 @@ export class NodesRepository extends BaseRepository {
       channelUtilization: node.channelUtilization ?? null,
       airUtilTx: node.airUtilTx ?? null,
       lastHeard: node.lastHeard ?? null,
+      firstHeard: node.firstHeard ?? null,
       snr: node.snr ?? null,
       rssi: node.rssi ?? null,
       createdAt: node.createdAt,
@@ -1823,6 +2001,9 @@ export class NodesRepository extends BaseRepository {
       setIfProvided('channelUtilization', nodeData.channelUtilization);
       setIfProvided('airUtilTx', nodeData.airUtilTx);
       setIfProvided('lastHeard', nodeData.lastHeard);
+      // #5390: stamp once, never overwrite (Unix seconds).
+      const syncFirstHeard = resolveFirstHeard(existing.firstHeard, existing.lastHeard, nodeData.lastHeard, 's');
+      if (syncFirstHeard !== undefined) updateSet.firstHeard = syncFirstHeard;
       setIfProvided('snr', nodeData.snr);
       setIfProvided('rssi', nodeData.rssi);
       if (nodeData.firmwareVersion) updateSet.firmwareVersion = nodeData.firmwareVersion;
@@ -1904,6 +2085,8 @@ export class NodesRepository extends BaseRepository {
         positionLocationSource: nodeData.positionLocationSource !== undefined ? nodeData.positionLocationSource : null,
         positionTimestamp: nodeData.positionTimestamp !== undefined ? nodeData.positionTimestamp : null,
         isIgnored: wasIgnored,
+        importedAt: nodeData.importedAt || null,
+        firstHeard: resolveFirstHeard(null, null, nodeData.lastHeard, 's') ?? null,
         createdAt: now,
         updatedAt: now,
         sourceId: insertSourceId,
@@ -1978,5 +2161,277 @@ export class NodesRepository extends BaseRepository {
       logger.error('Failed to query low battery monitored nodes:', error);
       return [];
     }
+  }
+
+  // ============ Likely-aircraft classification (#5364/#5365 Phase 1 WP1) ============
+
+  /**
+   * Persist a classification result for one (nodeNum, sourceId) row. Does
+   * **not** bump `updatedAt` — that column is the merge tie-breaker and the
+   * list sort order, and a classifier write is not node activity.
+   */
+  async setAircraftClassification(
+    nodeNum: number,
+    sourceId: string,
+    c: AircraftClassificationWrite,
+  ): Promise<void> {
+    const { nodes } = this.tables;
+    await this.db
+      .update(nodes)
+      .set({
+        likelyAircraft: c.likelyAircraft,
+        aircraftBasis: c.aircraftBasis,
+        groundElevation: c.groundElevation,
+        heightAboveGround: c.heightAboveGround,
+        aircraftClassifiedAt: this.coerceBigintField(c.aircraftClassifiedAt),
+      })
+      .where(and(eq(nodes.nodeNum, nodeNum), eq(nodes.sourceId, sourceId)));
+
+    await this.syncCacheNode(nodeNum, sourceId);
+  }
+
+  /**
+   * Rows worth a silent settings-change recompute (D6): anything with an
+   * altitude to (re)classify, or an existing classification that a lowered
+   * threshold might need to clear. Carries the effective-position override
+   * fields (D17) so the caller can recompute without re-deriving them.
+   */
+  async getAircraftReclassifyRows(sourceId: string): Promise<AircraftReclassifyRow[]> {
+    const { nodes } = this.tables;
+    const rows = await this.db
+      .select({
+        nodeNum: nodes.nodeNum,
+        altitude: nodes.altitude,
+        groundElevation: nodes.groundElevation,
+        likelyAircraft: nodes.likelyAircraft,
+        aircraftBasis: nodes.aircraftBasis,
+        heightAboveGround: nodes.heightAboveGround,
+        positionOverrideEnabled: nodes.positionOverrideEnabled,
+        latitudeOverride: nodes.latitudeOverride,
+        longitudeOverride: nodes.longitudeOverride,
+        altitudeOverride: nodes.altitudeOverride,
+        latitude: nodes.latitude,
+        longitude: nodes.longitude,
+        aircraftFixedLatitude: nodes.aircraftFixedLatitude,
+        aircraftFixedLongitude: nodes.aircraftFixedLongitude,
+      })
+      .from(nodes)
+      .where(and(
+        eq(nodes.sourceId, sourceId),
+        or(isNotNull(nodes.altitude), isNotNull(nodes.likelyAircraft)),
+      ));
+
+    return rows.map((r: typeof rows[number]) => ({ ...r, nodeNum: Number(r.nodeNum) }));
+  }
+
+  /**
+   * Node numbers with an altitude but never classified — the D11 startup
+   * backfill's work list.
+   */
+  async getUnclassifiedNodeNumsWithAltitude(sourceId: string): Promise<number[]> {
+    const { nodes } = this.tables;
+    const rows = await this.db
+      .select({ nodeNum: nodes.nodeNum })
+      .from(nodes)
+      .where(and(
+        eq(nodes.sourceId, sourceId),
+        isNotNull(nodes.altitude),
+        isNull(nodes.aircraftClassifiedAt),
+      ));
+    return (rows as Array<{ nodeNum: number }>).map((r) => Number(r.nodeNum));
+  }
+
+  /**
+   * Clear the classification for every row in a source (D7: detection turned
+   * off for this source). `groundElevation` is kept — cheap DEM data, not a
+   * user-facing flag, so re-enabling detection later doesn't need a re-fetch
+   * for nodes that haven't moved. `aircraftClassifiedAt` IS cleared, so the
+   * startup backfill picks these rows up again if a later re-enable's
+   * recompute doesn't finish. Returns the number of rows actually changed
+   * and syncs the PG/MySQL node cache for each.
+   */
+  async clearAircraftClassification(sourceId: string): Promise<number> {
+    const { nodes } = this.tables;
+    const classified = and(
+      eq(nodes.sourceId, sourceId),
+      or(
+        isNotNull(nodes.likelyAircraft),
+        isNotNull(nodes.aircraftBasis),
+        isNotNull(nodes.heightAboveGround),
+        isNotNull(nodes.aircraftClassifiedAt),
+        // Phase 2: disabling detection also drops the "confirmed fixed" mark.
+        // Aged-out ignores (`aircraftAgedOutAt`) are deliberately kept.
+        isNotNull(nodes.aircraftFixedAt),
+      ),
+    );
+    // Node numbers are needed only for the cache sync below; the UPDATE uses
+    // the same predicate rather than a (possibly huge) `IN (...)` list.
+    const toClear = await this.db
+      .select({ nodeNum: nodes.nodeNum })
+      .from(nodes)
+      .where(classified);
+
+    if (toClear.length === 0) return 0;
+
+    const nodeNums = (toClear as Array<{ nodeNum: number }>).map((r) => r.nodeNum);
+    await this.db
+      .update(nodes)
+      .set({
+        likelyAircraft: null,
+        aircraftBasis: null,
+        heightAboveGround: null,
+        aircraftClassifiedAt: null,
+        aircraftFixedAt: null,
+        aircraftFixedLatitude: null,
+        aircraftFixedLongitude: null,
+      })
+      .where(classified);
+
+    for (const nodeNum of nodeNums) {
+      await this.syncCacheNode(Number(nodeNum), sourceId);
+    }
+
+    return nodeNums.length;
+  }
+
+  // ============ Aircraft age-out + fixed mark (#5364/#5365 Phase 2) ============
+
+  /**
+   * Record that the age-out sweep ignored this node: sets `isIgnored` and
+   * `aircraftAgedOutAt`. The matching `ignored_nodes` row is written
+   * separately by `IgnoredNodesRepository.addAircraftIgnoreAsync`. Does not
+   * bump `updatedAt` (not node activity).
+   */
+  async markAircraftAgedOut(nodeNum: number, sourceId: string, atMs: number): Promise<void> {
+    const { nodes } = this.tables;
+    await this.db
+      .update(nodes)
+      .set({ isIgnored: true, aircraftAgedOutAt: this.coerceBigintField(atMs) })
+      .where(and(eq(nodes.nodeNum, nodeNum), eq(nodes.sourceId, sourceId)));
+    await this.syncCacheNode(nodeNum, sourceId);
+  }
+
+  /** Undo {@link markAircraftAgedOut}: `isIgnored = false`, `aircraftAgedOutAt = null`. */
+  async clearAircraftAgedOut(nodeNum: number, sourceId: string): Promise<void> {
+    const { nodes } = this.tables;
+    await this.db
+      .update(nodes)
+      .set({ isIgnored: false, aircraftAgedOutAt: null })
+      .where(and(eq(nodes.nodeNum, nodeNum), eq(nodes.sourceId, sourceId)));
+    await this.syncCacheNode(nodeNum, sourceId);
+  }
+
+  /**
+   * Null only `aircraftAgedOutAt` (leaves `isIgnored` to the caller). Used by
+   * the manual un-ignore path so a hand-lifted aircraft stops reading as
+   * "aged out".
+   */
+  async clearAircraftAgedOutMark(nodeNum: number, sourceId: string): Promise<void> {
+    const { nodes } = this.tables;
+    await this.db
+      .update(nodes)
+      .set({ aircraftAgedOutAt: null })
+      .where(and(eq(nodes.nodeNum, nodeNum), eq(nodes.sourceId, sourceId), isNotNull(nodes.aircraftAgedOutAt)));
+    await this.syncCacheNode(nodeNum, sourceId);
+  }
+
+  /**
+   * Set (or, with `null`, clear) the "confirmed fixed" mark (D4). Setting it
+   * also clears `likelyAircraft`, since the fixed rule says the node is not an
+   * aircraft. Clearing it leaves `likelyAircraft` alone for the classifier.
+   */
+  async setAircraftFixed(
+    nodeNum: number,
+    sourceId: string,
+    fixed: { atMs: number; lat: number; lon: number } | null,
+  ): Promise<void> {
+    const { nodes } = this.tables;
+    const set = fixed
+      ? {
+          aircraftFixedAt: this.coerceBigintField(fixed.atMs),
+          aircraftFixedLatitude: fixed.lat,
+          aircraftFixedLongitude: fixed.lon,
+          likelyAircraft: false,
+        }
+      : { aircraftFixedAt: null, aircraftFixedLatitude: null, aircraftFixedLongitude: null };
+    await this.db
+      .update(nodes)
+      .set(set)
+      .where(and(eq(nodes.nodeNum, nodeNum), eq(nodes.sourceId, sourceId)));
+    await this.syncCacheNode(nodeNum, sourceId);
+  }
+
+  /**
+   * Every row in this source flagged `likelyAircraft = true`, ignored or not
+   * (the sweep filters in memory). Carries the effective-position inputs for
+   * the fixed-mark anchor.
+   */
+  async listAircraftAgeOutCandidates(sourceId: string): Promise<AircraftAgeOutCandidate[]> {
+    const { nodes } = this.tables;
+    const rows = await this.db
+      .select({
+        nodeNum: nodes.nodeNum,
+        nodeId: nodes.nodeId,
+        longName: nodes.longName,
+        shortName: nodes.shortName,
+        lastHeard: nodes.lastHeard,
+        isFavorite: nodes.isFavorite,
+        isIgnored: nodes.isIgnored,
+        aircraftAgedOutAt: nodes.aircraftAgedOutAt,
+        positionOverrideEnabled: nodes.positionOverrideEnabled,
+        latitudeOverride: nodes.latitudeOverride,
+        longitudeOverride: nodes.longitudeOverride,
+        altitudeOverride: nodes.altitudeOverride,
+        latitude: nodes.latitude,
+        longitude: nodes.longitude,
+        altitude: nodes.altitude,
+      })
+      .from(nodes)
+      .where(and(eq(nodes.sourceId, sourceId), eq(nodes.likelyAircraft, true)));
+
+    return rows.map((r: typeof rows[number]) => ({
+      ...r,
+      nodeNum: Number(r.nodeNum),
+      lastHeard: r.lastHeard == null ? null : Number(r.lastHeard),
+      isFavorite: Boolean(r.isFavorite),
+      isIgnored: Boolean(r.isIgnored),
+      aircraftAgedOutAt: r.aircraftAgedOutAt == null ? null : Number(r.aircraftAgedOutAt),
+      positionOverrideEnabled: r.positionOverrideEnabled == null ? null : Boolean(r.positionOverrideEnabled),
+    }));
+  }
+
+  /**
+   * `(sourceId, nodeNum)` for every node on the given sources that the map
+   * could draw as a likely aircraft: `likelyAircraft = true`, or aged out by
+   * the sweep (`aircraftAgedOutAt` set). Feeds the flight-trails endpoint
+   * (#5364/#5365 Phase 3); visibility and privacy gates run in the route.
+   */
+  async listAircraftTrailNodeNums(sourceIds: string[]): Promise<Array<{ sourceId: string; nodeNum: number }>> {
+    if (sourceIds.length === 0) return [];
+    const { nodes } = this.tables;
+    const rows = await this.db
+      .select({ sourceId: nodes.sourceId, nodeNum: nodes.nodeNum })
+      .from(nodes)
+      .where(
+        and(
+          inArray(nodes.sourceId, sourceIds),
+          or(eq(nodes.likelyAircraft, true), isNotNull(nodes.aircraftAgedOutAt)),
+        ),
+      );
+    return (rows as Array<{ sourceId: string | null; nodeNum: number | bigint }>)
+      .filter((r) => r.sourceId != null)
+      .map((r) => ({ sourceId: r.sourceId as string, nodeNum: Number(r.nodeNum) }));
+  }
+
+  /** `aircraftAgedOutAt` for one row, or null (row missing or not aged out). */
+  async getAircraftAgedOutAt(nodeNum: number, sourceId: string): Promise<number | null> {
+    const { nodes } = this.tables;
+    const rows = await this.db
+      .select({ aircraftAgedOutAt: nodes.aircraftAgedOutAt })
+      .from(nodes)
+      .where(and(eq(nodes.nodeNum, nodeNum), eq(nodes.sourceId, sourceId)))
+      .limit(1);
+    const v = (rows as Array<{ aircraftAgedOutAt: number | null }>)[0]?.aircraftAgedOutAt;
+    return v == null ? null : Number(v);
   }
 }

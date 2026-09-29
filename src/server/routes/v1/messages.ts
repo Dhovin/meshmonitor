@@ -9,6 +9,7 @@ import express, { Request, Response } from 'express';
 import databaseService from '../../../services/database.js';
 import { ALL_SOURCES } from '../../../db/repositories/index.js';
 import { resolveSourceManager } from '../../utils/resolveSourceManager.js';
+import { refuseNonMeshtasticSource } from '../../utils/requireMeshtasticDeviceSource.js';
 import { sourceManagerRegistry } from '../../sourceManagerRegistry.js';
 import { isMeshCoreManager } from '../../sourceManagerTypes.js';
 import type { MeshCoreManager } from '../../meshcoreManager.js';
@@ -467,6 +468,10 @@ router.post('/', messageLimiter, async (req: Request, res: Response) => {
       }
     }
 
+    // An MQTT broker/bridge source has no radio of its own; resolveSourceManager()
+    // would send through the PRIMARY TCP radio instead (#5375).
+    if (await refuseNonMeshtasticSource(res, msgSourceId, 'message sends')) return;
+
     const meshChannel = channel !== undefined ? parseInt(channel) : 0;
     const trimmedText = text.trim();
 
@@ -539,7 +544,7 @@ router.post('/', messageLimiter, async (req: Request, res: Response) => {
       );
 
       // Get local node info to construct messageId
-      const localNodeNum = await databaseService.settings.getSetting('localNodeNum');
+      const localNodeNum = await databaseService.settings.getLocalNodeNumForSource(activeManager.sourceId);
       const messageId = localNodeNum ? `${localNodeNum}_${requestId}` : requestId.toString();
 
       logger.debug(`📤 v1 API: Sent message via API token (user: ${req.user?.username}, requestId: ${requestId})`);

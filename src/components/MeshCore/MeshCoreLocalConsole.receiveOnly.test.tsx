@@ -12,12 +12,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { MeshCoreLocalConsole } from './MeshCoreLocalConsole';
 
-vi.mock('react-i18next', () => ({
-  useTranslation: () => ({
-    t: (key: string, fallback?: string | Record<string, unknown>) =>
-      typeof fallback === 'string' ? fallback : key,
-  }),
-}));
+vi.mock('react-i18next', async () => {
+  const { createReactI18nextMock } = await import('../../test/mockI18n');
+  return createReactI18nextMock();
+});
 
 function makeActions() {
   return { sendLocalCliCommand: vi.fn().mockResolvedValue({ ok: true, reply: 'ok' }) };
@@ -49,7 +47,7 @@ describe('MeshCoreLocalConsole receive-only mode — Companion device', () => {
     }
   });
 
-  it('disables only the "Send advert" quick action, with a tooltip', () => {
+  it('disables only the "Zero-hop advert" quick action, with a tooltip', () => {
     render(
       <MeshCoreLocalConsole
         sourceId="src-1"
@@ -59,7 +57,7 @@ describe('MeshCoreLocalConsole receive-only mode — Companion device', () => {
         receiveOnly
       />,
     );
-    const advertBtn = screen.getByText('Send advert').closest('button');
+    const advertBtn = screen.getByText('Zero-hop advert').closest('button');
     expect(advertBtn).toBeDisabled();
     expect(advertBtn).toHaveAttribute('title', 'Receive-only mode is on for this MeshCore source. Turn it off in MeshCore Settings to use this.');
   });
@@ -92,7 +90,7 @@ describe('MeshCoreLocalConsole receive-only mode — Companion device', () => {
       />,
     );
     const input = screen.getByPlaceholderText(
-      /Type a command \(ver, stats, clock, advert, help\).*Local serial commands still work/,
+      /Type a command \(ver, stats, clock, advert.zerohop, advert, help\).*Local serial commands still work/,
     );
     expect(input).toBeInTheDocument();
   });
@@ -106,9 +104,9 @@ describe('MeshCoreLocalConsole receive-only mode — Companion device', () => {
         actions={actions}
       />,
     );
-    const advertBtn = screen.getByText('Send advert').closest('button');
+    const advertBtn = screen.getByText('Zero-hop advert').closest('button');
     expect(advertBtn).not.toBeDisabled();
-    expect(advertBtn).toHaveAttribute('title', 'advert');
+    expect(advertBtn).toHaveAttribute('title', 'advert.zerohop');
   });
 });
 
@@ -131,7 +129,7 @@ describe('MeshCoreLocalConsole receive-only mode — Repeater device (ACL form)'
 
     // The "Send advert" quick action, part of the Repeater catalog, is still
     // the one gated control.
-    const advertBtn = screen.getByText('Send advert').closest('button');
+    const advertBtn = screen.getByText('Zero-hop advert').closest('button');
     expect(advertBtn).toBeDisabled();
   });
 });

@@ -49,8 +49,19 @@ describe('configSections', () => {
     const global = settingsNavItems(t, { ...baseOptions, mode: 'global' }).map((i) => i.id);
     const source = settingsNavItems(t, { ...baseOptions, mode: 'source' }).map((i) => i.id);
     expect(global).toContain('settings-language');
+    expect(global).toContain('settings-coverage');
     expect(source).toContain('settings-danger');
     expect(global.filter((id) => source.includes(id))).toEqual([]);
+  });
+
+  it('files Sorting under Global Settings, since its keys are global (#5368)', () => {
+    // preferredSortField / preferredSortDirection / preferredDashboardSortOption
+    // are plain global settings; filing the section per-source (#5182) made it
+    // unreachable from /settings.
+    const global = settingsNavItems(t, { ...baseOptions, mode: 'global' }).map((i) => i.id);
+    const source = settingsNavItems(t, { ...baseOptions, mode: 'source' }).map((i) => i.id);
+    expect(global).toContain('settings-sorting');
+    expect(source).not.toContain('settings-sorting');
   });
 
   describe('visibility gates mirror the tab', () => {
@@ -75,6 +86,36 @@ describe('configSections', () => {
       const ids = settingsNavItems(t, { ...baseOptions, canWriteSettings: false }).map((i) => i.id);
       expect(ids).not.toContain('settings-position-estimation');
       expect(ids).not.toContain('settings-mesh-issues');
+      expect(ids).not.toContain('settings-coverage');
+    });
+
+    // #5277 P2 WP3, widened P3 WP4
+    it('shows Coverage recording only in source mode, for MQTT-shaped source types, with settings write', () => {
+      const mqttSource = { ...baseOptions, mode: 'source' as const, sourceType: 'mqtt_broker' };
+      expect(settingsNavItems(t, mqttSource).map((i) => i.id)).toContain('settings-coverage-mqtt');
+
+      const bridgeSource = { ...baseOptions, mode: 'source' as const, sourceType: 'mqtt_bridge' };
+      expect(settingsNavItems(t, bridgeSource).map((i) => i.id)).toContain('settings-coverage-mqtt');
+
+      // MeshCore Observer sources (#5277 P3 WP4) also get the section.
+      const observerSource = { ...baseOptions, mode: 'source' as const, sourceType: 'meshcore_mqtt' };
+      expect(settingsNavItems(t, observerSource).map((i) => i.id)).toContain('settings-coverage-mqtt');
+
+      // Not an MQTT-shaped source type.
+      const tcpSource = { ...baseOptions, mode: 'source' as const, sourceType: 'meshtastic_tcp' };
+      expect(settingsNavItems(t, tcpSource).map((i) => i.id)).not.toContain('settings-coverage-mqtt');
+
+      // A device-backed MeshCore companion source is not MQTT-shaped either.
+      const companionSource = { ...baseOptions, mode: 'source' as const, sourceType: 'meshcore' };
+      expect(settingsNavItems(t, companionSource).map((i) => i.id)).not.toContain('settings-coverage-mqtt');
+
+      // Global mode has no single source, even if a sourceType is passed.
+      expect(settingsNavItems(t, { ...baseOptions, mode: 'global' as const, sourceType: 'mqtt_broker' })
+        .map((i) => i.id)).not.toContain('settings-coverage-mqtt');
+
+      // Gated on settings:write like the other batch-job sections.
+      expect(settingsNavItems(t, { ...mqttSource, canWriteSettings: false }).map((i) => i.id))
+        .not.toContain('settings-coverage-mqtt');
     });
   });
 

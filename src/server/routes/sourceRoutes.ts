@@ -16,6 +16,7 @@ import { MAX_RAISE_TARGET, RAISEABLE_PORTNUMS } from '../mqttHopLimitPolicy.js';
 import { MqttBridgeManager, type MqttBridgeSourceConfig } from '../mqttBridgeManager.js';
 import waypointRoutes from './waypoints.js';
 import observerRoutes from './sourceObserverRoutes.js';
+import aircraftFlightMatchRoutes from './aircraftFlightMatchRoutes.js';
 import { PortNum } from '../constants/meshtastic.js';
 import {
   buildSourceNodes,
@@ -482,14 +483,17 @@ function validateMqttBridgeForwardingMode(config: Record<string, any>): string |
 }
 
 /**
- * Validate the optional `ignoreOkToMqtt` override on an mqtt_bridge
- * config. Absent (undefined) defaults to false (honor the bit).
+ * Validate the optional boolean uplink overrides on an mqtt_bridge config:
+ * `ignoreOkToMqtt` (absent ⇒ honor the bit) and `dropAutomationUplinks`
+ * (#5414, absent ⇒ uplink automation sends as before).
  */
 function validateMqttBridgeIgnoreOkToMqtt(config: Record<string, any>): string | null {
-  const value = config?.ignoreOkToMqtt;
-  if (value === undefined || value === null) return null;
-  if (typeof value !== 'boolean') {
-    return 'mqtt_bridge ignoreOkToMqtt must be a boolean';
+  for (const key of ['ignoreOkToMqtt', 'dropAutomationUplinks'] as const) {
+    const value = config?.[key];
+    if (value === undefined || value === null) continue;
+    if (typeof value !== 'boolean') {
+      return `mqtt_bridge ${key} must be a boolean`;
+    }
   }
   return null;
 }
@@ -781,9 +785,11 @@ function computeSourceRadioSummary(sourceId: string): SourceRadioSummary | null 
         Number(lora.channelNum ?? 0),
         Number(lora.overrideFrequency ?? 0),
         Number(lora.frequencyOffset ?? 0),
-        Number(lora.bandwidth ?? 250),
+        Number(lora.bandwidth ?? 0),
         undefined,
         Number(lora.modemPreset ?? 0),
+        // On a preset the stored bandwidth is stale and firmware ignores it.
+        lora.usePreset === true,
       );
       const txEnabled = lora.txEnabled ?? true;
       const udpRelayEnabled = typeof mgr.isUdpBroadcastRelayEnabled === 'function'
@@ -1578,8 +1584,9 @@ router.delete('/:id', requirePermission('sources', 'write'), async (req: Request
     }
 
     // NOTE: `mesh_beacon_offers` (#4723) is cleaned up inside
-    // purgeAllNodesAsync above, alongside ATAK contacts (#3691) — both are
-    // per-node received state. Do not add a second call here.
+    // purgeAllNodesAsync above, alongside ATAK contacts (#3691) and Coverage
+    // Report RF receptions (#5277) — all three are per-source received state.
+    // Do not add a second call here.
 
     res.json({ success: true });
   } catch (error) {
@@ -2169,6 +2176,7 @@ router.post('/:id/prune-outside-roi', requirePermission('sources', 'write'), asy
 // Waypoints sub-router. Each handler runs `requirePermission('waypoints', …)`
 // scoped to the path's `:id` parameter.
 router.use('/:id/waypoints', waypointRoutes);
+router.use('/:id/nodes/:nodeNum/flight-match', aircraftFlightMatchRoutes);
 router.use('/:id/observer', observerRoutes);
 
 export default router;

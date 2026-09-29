@@ -14,6 +14,9 @@
 import React from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen } from '@testing-library/react';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // --- hoisted mutable mock state -----------------------------------------
 const h = vi.hoisted(() => ({
@@ -23,9 +26,11 @@ const h = vi.hoisted(() => ({
 }));
 
 // --- mocks ---------------------------------------------------------------
-vi.mock('react-i18next', () => ({
-  useTranslation: () => ({ t: (_key: string, fallback?: string) => fallback ?? _key }),
-}));
+vi.mock('react-i18next', async () => {
+  const { createReactI18nextMock } = await import('../test/mockI18n');
+  const t = (_key: string, fallback?: string) => fallback ?? _key;
+  return createReactI18nextMock(t);
+});
 
 vi.mock('@tanstack/react-query', () => ({
   useQueryClient: () => ({
@@ -70,9 +75,21 @@ vi.mock('./configuration/CannedMessageConfigSection', () => ({ default: () => nu
 vi.mock('./configuration/AudioConfigSection', () => ({ default: () => null }));
 vi.mock('./configuration/RemoteHardwareConfigSection', () => ({ default: () => null }));
 vi.mock('./configuration/DetectionSensorConfigSection', () => ({ default: () => null }));
-vi.mock('./configuration/PaxcounterConfigSection', () => ({
-  default: () => <div data-testid="paxcounter-controls" />,
-}));
+// Same shape as the real section: header, then the notice (#5447), then controls.
+vi.mock('./configuration/PaxcounterConfigSection', async () => {
+  const { default: ModuleAvailabilityNotice } = await vi.importActual<
+    typeof import('./configuration/ModuleAvailabilityNotice')
+  >('./configuration/ModuleAvailabilityNotice');
+  return {
+    default: () => (
+      <div className="settings-section">
+        <h3>Paxcounter</h3>
+        <ModuleAvailabilityNotice />
+        <div data-testid="paxcounter-controls" />
+      </div>
+    ),
+  };
+});
 vi.mock('./configuration/StatusMessageConfigSection', () => ({ default: () => null }));
 vi.mock('./configuration/TrafficManagementConfigSection', () => ({ default: () => null }));
 vi.mock('./configuration/MeshBeaconConfigSection', () => ({ default: () => null }));
@@ -108,8 +125,55 @@ describe('ConfigurationTab — excluded module gating (#5065)', () => {
     h.currentConfig = { supportedModules: { paxcounter: false, mqtt: true } };
     render(<ConfigurationTab nodes={[]} channels={[]} />);
 
-    expect(await screen.findByText(NOTICE)).toBeInTheDocument();
+    const notice = await screen.findByText(NOTICE);
+    expect(notice).toBeInTheDocument();
     expect(screen.getByTestId('paxcounter-controls')).toBeInTheDocument();
+
+    // The notice sits inside the Paxcounter wrapper, under its own header,
+    // not above it where it reads as part of the section above (#5447).
+    const pax = document.getElementById('config-paxcounter')!;
+    expect(pax.contains(notice)).toBe(true);
+    const header = screen.getByRole('heading', { name: 'Paxcounter' });
+    expect(
+      header.compareDocumentPosition(notice) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy();
   });
 
+});
+
+/*
+ * Section spacing. Every section is the only child of its `#config-*` wrapper,
+ * so the global `.settings-section:last-child` rule zeroes its bottom margin
+ * and sections joined flush. The gap now lives on the wrappers' container.
+ * jsdom does not apply stylesheets, so this pins the class hook and the rule.
+ */
+describe('ConfigurationTab — gap between config sections', () => {
+  it('spaces the section wrappers from a class on their container', async () => {
+    h.currentConfig = { supportedModules: { paxcounter: false } };
+    render(<ConfigurationTab nodes={[]} channels={[]} />);
+    await screen.findByText(NOTICE);
+
+    const pax = document.getElementById('config-paxcounter')!;
+    const stack = pax.parentElement!;
+    expect(stack.classList.contains('settings-content')).toBe(true);
+    const extra = Array.from(stack.classList).filter((c) => c !== 'settings-content');
+    expect(extra).toHaveLength(1);
+    expect(extra[0]).not.toBe('undefined');
+
+    // Every direct child is a section wrapper, so the sibling rule spaces
+    // sections and nothing else. The gated wrapper is still one of them.
+    const children = Array.from(stack.children);
+    expect(children.length).toBeGreaterThan(20);
+    for (const child of children) {
+      expect(child.id).toMatch(/^config-/);
+    }
+    expect(pax.querySelector('.settings-section')).not.toBeNull();
+  });
+
+  it('adds space only between wrappers, never after the last one', () => {
+    const dir = dirname(fileURLToPath(import.meta.url));
+    const css = readFileSync(join(dir, 'ConfigurationTab.module.css'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+    expect(css).toMatch(/\.sectionStack\s*>\s*\*\s*\+\s*\*\s*\{\s*margin-top:\s*2rem;\s*\}/);
+    expect(css).not.toMatch(/\.sectionStack[^{]*\{[^}]*margin-bottom/);
+  });
 });

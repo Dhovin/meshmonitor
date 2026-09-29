@@ -479,7 +479,7 @@ Scan results appear in the Node Details panel for each node:
 
 **No Nodes Being Scanned**:
 - Verify nodes have public keys (required for admin communication)
-- Check that nodes are "active" (heard within the configured maxNodeAgeHours)
+- Check that nodes are "active" (heard within the configured maxNodeAgeHours). When the node window is 0 (show all nodes), the scanner, Auto-Traceroute and remote LocalStats use the **Transmit target window** setting instead (default 24 hours)
 - Ensure the scanner is enabled and saved
 
 **All Scans Failing**:
@@ -1418,6 +1418,64 @@ Auto Responder uses Meshtastic's messaging system. For more information:
 - [Meshtastic Messaging Documentation](https://meshtastic.org/docs/overview/mesh-algo#messaging)
 - [Meshtastic Text Messages](https://meshtastic.org/docs/configuration/module/canned-message)
 
+## Forwarding {#forwarding}
+
+Forwarding copies matching incoming messages to another destination on the same source. A common use is "send my DMs to my phone while I'm away from home". It sits next to the Auto Responder and needs no [Automation Engine](/features/automation-engine) workflow. It works on Meshtastic and MeshCore sources.
+
+### How It Works
+
+Each source has its own list of rules. When a text message arrives, every enabled rule checks it:
+
+1. **Forward messages from**: direct messages to this node, or one channel.
+2. **Only from sender** (optional): limit the rule to one node.
+3. **Only if text matches** (optional): a case-insensitive regular expression, checked with the same safe regex engine as the Auto-Acknowledge and MeshCore Auto-Responder patterns.
+
+When a rule matches, MeshMonitor sends a copy to the rule's target:
+
+- **Node (DM)**: a direct message to one node, such as your phone's companion node.
+- **Channel**: a broadcast on another channel of the same source. No channel is pre-selected; you must pick one before the rule can be saved.
+
+Each rule has its own checkbox, so you can switch a rule on when you leave and off when you get back without deleting it. A new rule starts switched off: fill it in, then tick its checkbox to turn it on.
+
+The forwarded text looks like this:
+
+```
+[fwd] Alice: are you around?
+```
+
+It always starts with `[fwd]`. After that comes the rule's optional **prefix**, then the original message. The prefix supports two tokens:
+
+| Token | Replaced with |
+|-------|---------------|
+| `{from}` | The sender's name, or its node ID if the name is unknown |
+| `{channel}` | The channel name the message arrived on, or `DM` |
+
+### Built-in Limits
+
+These limits are fixed. You cannot change them:
+
+- **5 forwards per rule per minute.** Past that, MeshMonitor drops further matches for that rule until the minute has passed, and writes one log line per minute (not one per dropped message). Saving your rules does not reset this count.
+- **200 characters.** MeshMonitor cuts longer forwarded messages, including the `[fwd]` marker and prefix, and ends them with `...`.
+- **No loops.** MeshMonitor never forwards its own messages, never forwards a message that already starts with `[fwd]`, and never forwards a message back to the node or channel it came from. You also cannot save a rule that forwards a channel to itself.
+- **One try per forward.** A forwarded DM that fails is not retried.
+- **No forwarding while the source cannot transmit.** On a MeshCore source in receive-only mode, a Meshtastic source with TX disabled, or an MQTT source, the rules stay visible but read-only and nothing is sent. On Meshtastic, the automation airtime cutoff also pauses forwarding while the mesh is busy.
+- **Live messages only.** Messages that a Meshtastic 2.8 node replays from its history on reconnect are not forwarded.
+- **At most 20 rules per source.**
+
+::: warning Channel targets use shared airtime
+Forwarding to a channel broadcasts to everyone on that channel, and every hop repeats it. Each forward costs about one message times the number of hops. At the 5-per-minute cap, a busy rule can add up to 5 channel broadcasts a minute to the mesh. Prefer a DM target when you can.
+:::
+
+### Limitations
+
+- **Same source only.** A rule forwards within the source that received the message. It cannot forward from one source to another (for example, from a MeshCore source to a Meshtastic source). Use the [Automation Engine](/features/automation-engine) for cross-source work.
+- **MeshCore channel messages carry no sender key.** On MeshCore, a rule with **Only from sender** set can match DMs, but never channel messages.
+- **MeshCore channel targets** do not use the automatic re-send that other MeshCore automations can use for missed channel sends.
+
+### Permissions
+
+Viewing rules needs `automation` read permission on the source. Changing them needs `automation` write permission on that source.
+
 ## Timer Triggers (Timed Events) {#timer-triggers}
 
 Schedule scripts to run automatically at specified times using cron expressions. This feature allows you to automate recurring tasks like sending daily status updates, weather reports, or network statistics to your mesh network.
@@ -1999,6 +2057,7 @@ Navigate to **Settings > Automation** and find the **Auto Favorite** section.
 |---------|-------------|---------|
 | Enable Auto Favorite | Toggle the feature on/off | Off |
 | Stale Hours | Hours since last heard before a node is considered stale and unfavorited | 24 |
+| Exclude likely aircraft | Never auto-favorite a node flagged by [likely-aircraft detection](/features/settings#likely-aircraft-detection); remove one that was already auto-favorited before it got flagged | On |
 
 ### Eligibility Rules
 
@@ -2023,6 +2082,15 @@ Targets must also:
 - Not have `favoriteLocked = true` (manually managed)
 
 > **Tip:** On a `Client_Base` local node, nearby `Client` / `Client_Mute` devices are intentionally skipped by auto-favorite. If you want those pinned, favorite them **manually** by clicking the star.
+
+### Excluding Likely Aircraft
+
+The **Exclude likely aircraft** switch, on by default, keeps [likely-aircraft detection](/features/settings#likely-aircraft-detection) and Auto Favorite from fighting each other:
+
+- A node currently flagged as a likely aircraft is never auto-favorited, even if it otherwise meets the eligibility rules above.
+- The exclusion only does anything while **both** the switch and likely-aircraft detection are on for this source. If detection is off, the switch is shown disabled with a link back to **Settings → Node Display** to turn it on.
+- A node that was auto-favorited *before* it got flagged (for example, heard once at altitude before its NodeInfo arrived) is removed once it has been seen flagged at **two consecutive hourly sweeps at least 45 minutes apart**. One flagged sweep alone is not enough — this protects against a single bad GPS altitude reading. The 45-minute gap also keeps a quick restart or reconnect from being mistaken for a second sweep.
+- Manual (locked) favorites and a user's own favorites are never touched by this exclusion, exactly like the rest of Auto Favorite's sweep.
 
 ### Permissions
 

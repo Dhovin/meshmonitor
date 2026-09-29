@@ -10,6 +10,8 @@ import { DatabaseType, DbPacketLog, DbPacketCountByNode, DbPacketCountByPortnum,
 import { logger } from '../../utils/logger.js';
 import { getPortNumName, PortNum } from '../../server/constants/meshtastic.js';
 import { BROADCAST_ADDR } from '../../utils/tracerouteSegments.js';
+import type { NodeTransportClass } from '../../utils/nodeTransport.js';
+import { transportClassCondition } from './transportSql.js';
 
 /**
  * Per-node hop-arrival aggregate row — Mesh Issues B6 "hop horizon" evidence
@@ -36,6 +38,13 @@ export interface PacketHopArrivalRow {
  * re-declaring it, and so its test can assert against it directly. `[ours]`.
  */
 export const HOP_ARRIVAL_MAX_ROWS = 20_000;
+
+/** Non-admin packet visibility for aggregate counts (#5101 follow-up). */
+export interface PacketVisibility {
+  allowedChannels: number[];
+  canReadMessages: boolean;
+}
+
 
 /**
  * One deduped broadcast-telemetry timestamp for a node — Mesh Issues A5's
@@ -65,11 +74,48 @@ export class PacketLogRepository extends BaseRepository {
   // ============ PACKET LOG ============
 
   /**
+   * packet_log transport predicates (#5101): the exact mechanism filter
+   * (Packet Monitor) plus the RF/UDP/MQTT class filter (Info tab), the
+   * latter delegated to the shared `transportClassCondition` (also used by
+   * `route_segments` in `TraceroutesRepository`) so the two tables can never
+   * drift on what counts as RF/UDP/MQTT.
+   */
+  private transportConditions(
+    column: SQL,
+    filter: { transport_mechanism?: number; transportClass?: NodeTransportClass },
+  ): SQL[] {
+    const out: SQL[] = [];
+    if (filter.transport_mechanism !== undefined) out.push(sql`${column} = ${filter.transport_mechanism}`);
+    if (filter.transportClass) out.push(transportClassCondition(column, filter.transportClass));
+    return out;
+  }
+
+  /**
+   * SQL twin of `filterPacketsByPermissions` (server/routes/packetPermissions.ts)
+   * for aggregate counts, which can't filter rows in memory. A row counts when
+   * it is encrypted, OR it is a text DM and the caller can read messages, OR it
+   * is not a text DM and its channel is null or one the caller may read.
+   * `col` is the column prefix ('pl.' or '').
+   */
+  private packetVisibilityCondition(v: PacketVisibility, col: '' | 'pl.'): SQL {
+    const c = (name: string) => sql.raw(`${col}${name}`);
+    const encrypted = this.isSQLite() ? sql`${c('encrypted')} = 1` : sql`${c('encrypted')} = ${true}`;
+    const isDm = sql`(${c('portnum')} = ${PortNum.TEXT_MESSAGE_APP} AND ${c('to_node')} IS NOT NULL AND ${c('to_node')} <> ${BROADCAST_ADDR})`;
+    const channels = v.allowedChannels.length > 0
+      ? sql`(${c('channel')} IS NULL OR ${c('channel')} IN (${sql.join(v.allowedChannels.map((n) => sql`${n}`), sql`, `)}))`
+      : sql`${c('channel')} IS NULL`;
+    const dmBranch = v.canReadMessages ? sql`${isDm}` : sql`1=0`;
+    return sql`(${encrypted} OR ${dmBranch} OR (NOT ${isDm} AND ${channels}))`;
+  }
+
+  /**
    * Filter options for packet log queries
    */
   private buildPacketLogWhere(options: PacketLogFilterOptions): { conditions: any[]; } {
     const conditions: any[] = [];
-    const { portnum, from_node, to_node, channel, encrypted, since, relay_node, transport_mechanism, sourceId, untilTs, untilId, search } = options;
+    const { portnum, from_node, to_node, channel, encrypted, since, relay_node, transport_mechanism, transportClass, sourceId, untilTs, untilId, search } = options;
+
+    if (options.visibility) conditions.push(this.packetVisibilityCondition(options.visibility, 'pl.'));
 
     if (sourceId !== undefined) conditions.push(sql`pl.${sql.identifier('sourceId')} = ${sourceId}`);
     // Keyset cursor — mirrors ORDER BY pl.timestamp DESC, pl.id DESC so paging never
@@ -94,9 +140,7 @@ export class PacketLogRepository extends BaseRepository {
     } else if (relay_node !== undefined) {
       conditions.push(sql`pl.relay_node = ${relay_node}`);
     }
-    if (transport_mechanism !== undefined) {
-      conditions.push(sql`pl.transport_mechanism = ${transport_mechanism}`);
-    }
+    conditions.push(...this.transportConditions(sql`pl.transport_mechanism`, { transport_mechanism, transportClass }));
     // Free-text search across the decoded content (#4958): the human-readable
     // preview and the serialized-JSON metadata (both plain TEXT in every
     // backend). Postgres LIKE is case-sensitive, so branch to ILIKE there;
@@ -632,14 +676,16 @@ export class PacketLogRepository extends BaseRepository {
    * Get packet counts grouped by from_node (for distribution charts).
    * Returns top N nodes by packet count.
    */
-  async getPacketCountsByNode(options?: { since?: number; limit?: number; portnum?: number; sourceId?: string }): Promise<DbPacketCountByNode[]> {
-    const { since, limit = 10, portnum, sourceId } = options || {};
+  async getPacketCountsByNode(options?: { since?: number; limit?: number; portnum?: number; sourceId?: string; transportClass?: NodeTransportClass; visibility?: PacketVisibility }): Promise<DbPacketCountByNode[]> {
+    const { since, limit = 10, portnum, sourceId, transportClass, visibility } = options || {};
 
     try {
       const conditions: any[] = [];
       if (sourceId !== undefined) conditions.push(sql`pl.${sql.identifier('sourceId')} = ${sourceId}`);
       if (since !== undefined) conditions.push(sql`pl.timestamp >= ${since}`);
       if (portnum !== undefined) conditions.push(sql`pl.portnum = ${portnum}`);
+      conditions.push(...this.transportConditions(sql`pl.transport_mechanism`, { transportClass }));
+      if (visibility) conditions.push(this.packetVisibilityCondition(visibility, 'pl.'));
       const whereClause = conditions.length > 0 ? this.combineConditions(conditions) : sql`1=1`;
 
       const longName = this.col('longName');
@@ -687,14 +733,16 @@ export class PacketLogRepository extends BaseRepository {
    * Get packet counts grouped by portnum (for distribution charts).
    * Includes port name from meshtastic constants.
    */
-  async getPacketCountsByPortnum(options?: { since?: number; from_node?: number; sourceId?: string }): Promise<DbPacketCountByPortnum[]> {
-    const { since, from_node, sourceId } = options || {};
+  async getPacketCountsByPortnum(options?: { since?: number; from_node?: number; sourceId?: string; transportClass?: NodeTransportClass; visibility?: PacketVisibility }): Promise<DbPacketCountByPortnum[]> {
+    const { since, from_node, sourceId, transportClass, visibility } = options || {};
 
     try {
       const conditions: any[] = [];
       if (sourceId !== undefined) conditions.push(sql`${sql.identifier('sourceId')} = ${sourceId}`);
       if (since !== undefined) conditions.push(sql`timestamp >= ${since}`);
       if (from_node !== undefined) conditions.push(sql`from_node = ${from_node}`);
+      conditions.push(...this.transportConditions(sql`transport_mechanism`, { transportClass }));
+      if (visibility) conditions.push(this.packetVisibilityCondition(visibility, ''));
       const whereClause = conditions.length > 0 ? this.combineConditions(conditions) : sql`1=1`;
 
       const rows = await this.executeQuery(sql`
@@ -883,7 +931,10 @@ export interface PacketLogFilterOptions {
   since?: number;
   relay_node?: number | 'unknown';
   transport_mechanism?: number;
+  transportClass?: NodeTransportClass;
   sourceId?: string;
+  /** Non-admin channel/DM visibility for aggregate counts (see packetVisibilityCondition). */
+  visibility?: PacketVisibility;
   /** Free-text substring match across payload_preview + metadata (#4958). */
   search?: string;
   /**

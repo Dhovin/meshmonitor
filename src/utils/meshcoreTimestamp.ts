@@ -1,0 +1,119 @@
+/**
+ * Plausibility bounds for a MeshCore device-reported epoch timestamp (ms).
+ *
+ * Every MeshCore node carries its own real-time clock, and unlike Meshtastic
+ * there is no equivalent of a mesh-wide `set_time` admin push keeping them in
+ * sync — a companion or repeater that has never had its clock set (or whose
+ * clock has since drifted) stamps adverts and messages with whatever bogus
+ * value its RTC currently holds. Issue #5339 observed a single mesh's "last
+ * heard" values spread from year 2000 to year 2087 purely from this.
+ *
+ * MeshMonitor already receives every one of these events in real time, so
+ * its own receipt clock (`Date.now()`) is always available as a fallback.
+ * This module is the single gate between "trust the device's stated time"
+ * and "the device's clock cannot be trusted right now" — callers pass a raw
+ * device timestamp through {@link plausibleMeshCoreTimeMs} and get back
+ * either that same value (device clock looks sane) or their own supplied
+ * fallback (it doesn't).
+ *
+ * Mirrors the precedent set for the Meshtastic ingestion paths
+ * (`src/server/utils/messageTime.ts`'s `plausibleRxTime`, #4206), which guards
+ * only a floor (unsynced nodes reporting seconds-since-boot land near Unix
+ * epoch). MeshCore's drift runs in both directions, so this adds a ceiling
+ * too.
+ */
+
+/** 2020-01-01T00:00:00Z, in ms — MeshCore didn't exist before this. */
+const MIN_PLAUSIBLE_MESHCORE_TIME_MS = 1_577_836_800_000;
+
+/**
+ * How far ahead of MeshMonitor's own clock a device-reported time may sit
+ * before it's treated as drift rather than ordinary clock skew. Generous on
+ * purpose — this only needs to reject multi-year drift, not nudge out
+ * legitimately-unsynced-but-close clocks.
+ */
+const MAX_FUTURE_SKEW_MS = 24 * 60 * 60 * 1000; // 1 day
+
+/**
+ * Whether an already-converted epoch-ms value could plausibly be a real
+ * receive time, relative to `nowMs`.
+ */
+export function isPlausibleMeshCoreTimeMs(ms: number, nowMs: number = Date.now()): boolean {
+  return Number.isFinite(ms) && ms >= MIN_PLAUSIBLE_MESHCORE_TIME_MS && ms <= nowMs + MAX_FUTURE_SKEW_MS;
+}
+
+/**
+ * How far BEFORE MeshMonitor received a message its sender's stated time may
+ * sit (#5339). The floor above only rejects clocks from before MeshCore
+ * existed, which lets through the most common bad value: a node with no RTC
+ * boots at the firmware's fixed default (2024) and stamps every message with
+ * it. A day covers the companion's offline queue draining after a short
+ * MeshMonitor outage; anything older is a broken clock, not a delayed message.
+ */
+const MAX_MESSAGE_PAST_SKEW_MS = 24 * 60 * 60 * 1000; // 1 day
+
+/**
+ * Whether a message's sender-stated time (ms) is believable for a message we
+ * received at `receivedAtMs`: plausible per {@link isPlausibleMeshCoreTimeMs}
+ * and no more than {@link MAX_MESSAGE_PAST_SKEW_MS} older than receipt.
+ */
+export function isPlausibleMeshCoreMessageTimeMs(ms: number, receivedAtMs: number): boolean {
+  return isPlausibleMeshCoreTimeMs(ms, receivedAtMs) && ms >= receivedAtMs - MAX_MESSAGE_PAST_SKEW_MS;
+}
+
+/**
+ * Whether an epoch-ms value sits further ahead of `nowMs` than ordinary clock
+ * skew allows, i.e. could only have come from a drifted RTC. The one-sided
+ * half of {@link isPlausibleMeshCoreTimeMs}, for callers where a too-OLD value
+ * heals itself (the next real observation is newer) but a too-NEW one never
+ * would.
+ */
+export function isFutureDriftedMeshCoreTimeMs(ms: number, nowMs: number = Date.now()): boolean {
+  return Number.isFinite(ms) && ms > nowMs + MAX_FUTURE_SKEW_MS;
+}
+
+/**
+ * Resolve a MeshCore device-reported epoch-SECONDS timestamp (e.g. the wire
+ * `sender_timestamp`) to epoch ms, falling back to `nowMs` (MeshMonitor's own
+ * receipt clock; injectable for tests) when the value is missing,
+ * non-positive, or implausible per {@link isPlausibleMeshCoreTimeMs}. `nowMs`
+ * doubles as both the fallback value and the reference point for the
+ * plausibility ceiling, matching the `sender_timestamp ? ... : Date.now()`
+ * shape this replaces at each call site.
+ */
+export function plausibleMeshCoreTimeMs(
+  senderTimestampSec: number | null | undefined,
+  nowMs: number = Date.now(),
+): number {
+  if (typeof senderTimestampSec !== 'number' || senderTimestampSec <= 0) return nowMs;
+  const ms = senderTimestampSec * 1000;
+  return isPlausibleMeshCoreTimeMs(ms, nowMs) ? ms : nowMs;
+}
+
+/**
+ * {@link plausibleMeshCoreTimeMs} with the tighter
+ * {@link isPlausibleMeshCoreMessageTimeMs} window, for live direct and channel
+ * messages (#5339). Room posts do NOT use this: a room server replays its
+ * backlog on login, so a days-old stated time there is real history.
+ */
+export function plausibleMeshCoreMessageTimeMs(
+  senderTimestampSec: number | null | undefined,
+  nowMs: number = Date.now(),
+): number {
+  if (typeof senderTimestampSec !== 'number' || senderTimestampSec <= 0) return nowMs;
+  const ms = senderTimestampSec * 1000;
+  return isPlausibleMeshCoreMessageTimeMs(ms, nowMs) ? ms : nowMs;
+}
+
+/**
+ * Pass an epoch-ms value through only if it is plausible; otherwise
+ * `undefined`. Also covers rows stored before this gate existed (#5339): a
+ * drifted `lastHeard` of year 2087 would otherwise keep a node at the top of
+ * Last Heard sort and dodge the max-age filter until then.
+ */
+export function plausibleMeshCoreTimeMsOrUndefined(
+  ms: number | null | undefined,
+  nowMs: number = Date.now(),
+): number | undefined {
+  return typeof ms === 'number' && isPlausibleMeshCoreTimeMs(ms, nowMs) ? ms : undefined;
+}

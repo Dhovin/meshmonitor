@@ -1,6 +1,10 @@
 /**
- * Node Display settings — the ten per-source keys and their hardcoded
- * defaults (epic #4412 Phase 2 WP1).
+ * Node Display settings — the ten per-source keys seeded by migration 131
+ * and their hardcoded defaults (epic #4412 Phase 2 WP1), plus the three
+ * unseeded likely-aircraft detection keys (#5364/#5365 Phase 1 WP5) that
+ * route through the same per-source Node Display machinery. See
+ * `NODE_DISPLAY_SEEDED_KEYS` vs. `AIRCRAFT_NODE_DISPLAY_KEYS` below for the
+ * split and why it exists.
  *
  * Isomorphic, zero imports. Lives in `src/constants/` (not
  * `src/server/constants/settings.ts`) because that file is server-only and
@@ -13,10 +17,11 @@
  * source with no stored per-source value falls straight through to the
  * hardcoded default here — never to a neighbouring source's value, and
  * never to the legacy un-namespaced global row. This module is the single
- * place those ten literals live; do not hardcode any of them elsewhere.
+ * place those literals live; do not hardcode any of them elsewhere.
  */
 
-export const NODE_DISPLAY_SETTING_KEYS = [
+/** The frozen ten keys seeded by migration 131. Do not add to this list. */
+export const NODE_DISPLAY_SEEDED_KEYS = [
   'maxNodeAgeHours',
   'inactiveNodeThresholdHours',
   'inactiveNodeCheckIntervalMinutes',
@@ -28,6 +33,49 @@ export const NODE_DISPLAY_SETTING_KEYS = [
   'nodeDimmingStartHours',
   'nodeDimmingMinOpacity',
 ] as const;
+export type NodeDisplaySeededKey = typeof NODE_DISPLAY_SEEDED_KEYS[number];
+
+/**
+ * Likely-aircraft detection (#5364/#5365). Per-source, unseeded: unset falls
+ * through to `parseAircraftSettings`'s hardcoded default
+ * (`src/utils/aircraftClassification.ts`) rather than to a migration 131 seed
+ * row. Routed through Settings -> Node Display alongside the frozen ten, but
+ * kept out of `NODE_DISPLAY_SEEDED_KEYS`/`NODE_DISPLAY_DEFAULT_STRINGS` so
+ * migration 131's seed table — a statement about a point in time — never
+ * needs a new entry.
+ */
+export const AIRCRAFT_NODE_DISPLAY_KEYS = [
+  'aircraftDetectionEnabled',
+  'aircraftAglThresholdMeters',
+  'aircraftMslThresholdMeters',
+  // Phase 2 age-out (#5364/#5365). The server-written
+  // `aircraftAgeOutLastRunAt`/`aircraftAgeOutLastResult` are NOT here: they
+  // are read-only status, never posted from the form.
+  'aircraftAgeOutEnabled',
+  'aircraftAgeOutHours',
+  'aircraftAgeOutAction',
+] as const;
+export type AircraftNodeDisplayKey = typeof AIRCRAFT_NODE_DISPLAY_KEYS[number];
+
+/**
+ * Sign-flipped position correction (#5363). Per-source and unseeded, like the
+ * aircraft keys: unset falls through to `parseSignFlipSettings`' defaults
+ * (off, 500 km, own-node reference) in `src/utils/signFlipPosition.ts`.
+ */
+export const SIGN_FLIP_NODE_DISPLAY_KEYS = [
+  'signFlipCorrectionEnabled',
+  'signFlipCorrectionRangeKm',
+  'signFlipReferenceLatitude',
+  'signFlipReferenceLongitude',
+] as const;
+export type SignFlipNodeDisplayKey = typeof SIGN_FLIP_NODE_DISPLAY_KEYS[number];
+
+/** Every key the Node Display section routes to the scoped `?sourceId=` POST, and the GET back-fill skips. */
+export const NODE_DISPLAY_SETTING_KEYS = [
+  ...NODE_DISPLAY_SEEDED_KEYS,
+  ...AIRCRAFT_NODE_DISPLAY_KEYS,
+  ...SIGN_FLIP_NODE_DISPLAY_KEYS,
+] as const;
 export type NodeDisplaySettingKey = typeof NODE_DISPLAY_SETTING_KEYS[number];
 
 /**
@@ -36,9 +84,10 @@ export type NodeDisplaySettingKey = typeof NODE_DISPLAY_SETTING_KEYS[number];
  * 'false'/'true' — see the Phase 1 deviations log). Enforced by
  * nodeDisplayDefaults.test.ts; migration 131 must NOT import this (a
  * migration is a statement about a point in time — see 131's file-level
- * comment).
+ * comment). Keyed on `NodeDisplaySeededKey` only — the aircraft keys are
+ * unseeded (see `AIRCRAFT_NODE_DISPLAY_KEYS` above) and have no entry here.
  */
-export const NODE_DISPLAY_DEFAULT_STRINGS: Readonly<Record<NodeDisplaySettingKey, string>> = {
+export const NODE_DISPLAY_DEFAULT_STRINGS: Readonly<Record<NodeDisplaySeededKey, string>> = {
   maxNodeAgeHours: '24',
   inactiveNodeThresholdHours: '24',
   inactiveNodeCheckIntervalMinutes: '60',
@@ -158,4 +207,51 @@ export function parseNodeDisplayBoolean(
   if (raw === '1' || raw === 'true') return true;
   if (raw === '0' || raw === 'false') return false;
   return NODE_DISPLAY_BOOLEAN_DEFAULTS[key];
+}
+
+/**
+ * TX-target age window used when `maxNodeAgeHours` is 0 ("unlimited", #5376).
+ *
+ * `maxNodeAgeHours = 0` means "show every node" for display. The jobs that
+ * pick nodes to TRANSMIT to (auto-traceroute, the remote-admin scanner, remote
+ * LocalStats polling) must not widen to every node ever heard, so when the
+ * node window is unlimited they fall back to this per-source window instead.
+ * It does not change how often those jobs fire (their timers set that), only
+ * which nodes they may target.
+ *
+ * Like `maxInfraNodeAgeHours`, it lives OUTSIDE the frozen ten-key Node Display
+ * seed: a standalone per-source setting that falls through to the default when
+ * unstored. 0 is NOT valid here: this is the bound, not another "unlimited".
+ */
+export const TX_TARGET_MAX_AGE_HOURS_WHEN_UNLIMITED_DEFAULT = 24;
+export const TX_TARGET_MAX_AGE_HOURS_WHEN_UNLIMITED_RANGE = { min: 1, max: 720, integer: true } as const;
+
+/**
+ * Every key SettingsTab saves through the per-source (`?sourceId=`) POST: the
+ * frozen ten Node Display keys plus later standalone per-source keys. The GET
+ * route also keeps these out of the global back-fill (no runtime global
+ * fallback, #4412 Phase 3 D5).
+ */
+export const SETTINGS_TAB_PER_SOURCE_KEYS = [
+  ...NODE_DISPLAY_SETTING_KEYS,
+  'txTargetMaxAgeHoursWhenUnlimited',
+] as const;
+
+/** Parse a stored value. null/empty/NaN/out-of-range → the default. */
+export function parseTxTargetMaxAgeHoursWhenUnlimited(raw: string | null | undefined): number {
+  const fallback = TX_TARGET_MAX_AGE_HOURS_WHEN_UNLIMITED_DEFAULT;
+  if (raw === null || raw === undefined || raw === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  const R = TX_TARGET_MAX_AGE_HOURS_WHEN_UNLIMITED_RANGE;
+  if (n < R.min || n > R.max) return fallback;
+  return Math.trunc(n);
+}
+
+/**
+ * The age window (hours, always > 0) that TX-selecting jobs use: the node
+ * window itself, or the fallback when the node window is 0 / unlimited.
+ */
+export function resolveTxTargetMaxAgeHours(maxNodeAgeHours: number, fallbackHours: number): number {
+  return Number.isFinite(maxNodeAgeHours) && maxNodeAgeHours > 0 ? maxNodeAgeHours : fallbackHours;
 }

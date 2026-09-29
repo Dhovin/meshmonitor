@@ -41,7 +41,17 @@ const mocks = vi.hoisted(() => ({
     showRfNodes: true,
     showUdpNodes: true,
     showMqttNodes: true,
+    // #5364/#5365 Phase 2 "Show aged-out".
+    showAgedOutAircraft: false,
+    // #5364/#5365 Phase 3 flight trails.
+    aircraftDisplayMode: 'mark' as string,
+    showAircraftTrails: false,
   },
+  // #5364/#5365 Phase 3: what `useAircraftTrails` returns, the args it was
+  // last called with, and the descriptors the trails layer last received.
+  aircraftTrails: [] as Array<{ sourceId: string; nodeNum: number; points: Array<{ lat: number; lon: number; alt: number | null; ts: number }> }>,
+  aircraftTrailArgs: null as null | { enabled: boolean; hours: number; sourceIds?: string[] | null },
+  renderedTrails: [] as Array<{ key: string; label: string; times: number[] }>,
   // Segments handed to the shared TraceroutePathsLayer on the last render.
   tracerouteSegments: [] as Array<{ fromNodeNum: number; toNodeNum: number; isMqtt: boolean }>,
   // #5283: sources backing `useDashboardSources()`, so tests can select a
@@ -171,7 +181,43 @@ vi.mock('../../contexts/MapContext', () => ({
     setShowWaypoints: vi.fn(),
     showPolarGrid: false,
     setShowPolarGrid: vi.fn(),
+    showAgedOutAircraft: mocks.mapContext.showAgedOutAircraft,
+    setShowAgedOutAircraft: vi.fn(),
+    aircraftDisplayMode: mocks.mapContext.aircraftDisplayMode,
+    setAircraftDisplayMode: vi.fn(),
+    showAircraftTrails: mocks.mapContext.showAircraftTrails,
+    setShowAircraftTrails: vi.fn(),
+    aircraftTrailHours: 6,
+    setAircraftTrailHours: vi.fn(),
   }),
+}));
+
+// #5364/#5365 Phase 3: stub the trails query (no QueryClient in this suite)
+// and capture what the trails layer is handed.
+vi.mock('../../hooks/useAircraftTrails', () => ({
+  useAircraftTrails: (args: { enabled: boolean; hours: number; sourceIds?: string[] | null }) => {
+    mocks.aircraftTrailArgs = args;
+    return { data: args.enabled ? mocks.aircraftTrails : undefined };
+  },
+}));
+vi.mock('../map/layers/AircraftTrailsLayer', () => ({
+  default: (p: { trails: Array<{ key: string; label: string; times: number[] }> }) => {
+    mocks.renderedTrails = p.trails;
+    return <div data-testid="aircraft-trails" data-count={p.trails.length} />;
+  },
+}));
+
+// #5364/#5365 Phase 2: expose the props the map hands the shared aircraft
+// control, so the "N aged out" count can be asserted without i18n text.
+vi.mock('../map/MapAircraftDisplayControl', () => ({
+  default: (p: any) => (
+    <div
+      data-testid="aircraft-control"
+      data-aged-out-count={String(p.agedOutCount)}
+      data-show-aged-out={String(p.showAgedOut)}
+      data-has-toggle={String(typeof p.onShowAgedOutChange === 'function')}
+    />
+  ),
 }));
 
 // Polar grid (#3971) pulls the source list + per-source status to resolve each
@@ -410,7 +456,13 @@ describe('DashboardMap', () => {
       showRfNodes: true,
       showUdpNodes: true,
       showMqttNodes: true,
+      showAgedOutAircraft: false,
+      aircraftDisplayMode: 'mark',
+      showAircraftTrails: false,
     };
+    mocks.aircraftTrails = [];
+    mocks.aircraftTrailArgs = null;
+    mocks.renderedTrails = [];
     mocks.tracerouteSegments = [];
     // Reset the shared settings mock to "no Default Map Center configured".
     mocks.settings.mapPinStyle = 'official';
@@ -711,6 +763,134 @@ describe('DashboardMap', () => {
     );
     const markers = screen.getAllByTestId('map-marker');
     expect(markers.length).toBe(1);
+  });
+
+  describe('Show aged-out (#5364/#5365 Phase 2)', () => {
+    // Aged out long ago: older than the map window, which it must bypass.
+    const agedOutAircraft = {
+      user: { id: 'node-ac', shortName: 'AC', longName: 'Aged Aircraft' },
+      position: { latitude: 36.8, longitude: -81.8 },
+      hopsAway: 1,
+      role: 1,
+      lastHeard: stale,
+      isIgnored: true,
+      likelyAircraft: true,
+      aircraftAgedOutAt: Date.now() - 3600_000,
+    };
+    // Ignored for another reason (manual/geo): never shown by this toggle.
+    const otherIgnoredAircraft = { ...ignoredNodeWithPosition, likelyAircraft: true };
+
+    it('hides aged-out aircraft by default but still counts them for the hint', () => {
+      render(<DashboardMap {...defaultProps} nodes={[nodeWithPosition, agedOutAircraft, otherIgnoredAircraft]} />);
+      expect(screen.getAllByTestId('map-marker')).toHaveLength(1);
+      const ctl = screen.getByTestId('aircraft-control');
+      expect(ctl.getAttribute('data-has-toggle')).toBe('true');
+      expect(ctl.getAttribute('data-show-aged-out')).toBe('false');
+      expect(ctl.getAttribute('data-aged-out-count')).toBe('1');
+    });
+
+    it('draws aged-out aircraft dimmed when on; manual/geo ignores stay hidden', () => {
+      mocks.mapContext.showAgedOutAircraft = true;
+      render(<DashboardMap {...defaultProps} nodes={[nodeWithPosition, agedOutAircraft, otherIgnoredAircraft]} />);
+      const markers = screen.getAllByTestId('map-marker');
+      expect(markers).toHaveLength(2);
+      expect(markers.map((m) => m.getAttribute('data-opacity'))).toContain('0.45');
+      expect(screen.getByTestId('aircraft-control').getAttribute('data-aged-out-count')).toBe('1');
+    });
+
+    it('counts only aged-out nodes the map would draw (transport filter applies)', () => {
+      mocks.mapContext.showAgedOutAircraft = true;
+      mocks.mapContext.showRfNodes = false;
+      mocks.mapContext.showUdpNodes = false;
+      mocks.mapContext.showMqttNodes = false;
+      render(<DashboardMap {...defaultProps} nodes={[agedOutAircraft]} />);
+      expect(screen.queryAllByTestId('map-marker')).toHaveLength(0);
+      expect(screen.getByTestId('aircraft-control').getAttribute('data-aged-out-count')).toBe('0');
+    });
+  });
+
+  describe('Flight trails (#5364/#5365 Phase 3)', () => {
+    const plane = {
+      nodeNum: 0x7a000001,
+      sourceId: 'src-a',
+      user: { id: '!7a000001', shortName: 'PL', longName: 'Plane' },
+      position: { latitude: 36.0, longitude: -81.0 },
+      hopsAway: 1,
+      role: 1,
+      lastHeard: recent,
+      likelyAircraft: true,
+    };
+    const favPlane = { ...plane, nodeNum: 0x7a000002, user: { id: '!7a000002', shortName: 'FP', longName: 'Fav Plane' }, isFavorite: true };
+    const agedOut = {
+      ...plane,
+      nodeNum: 0x7a000003,
+      user: { id: '!7a000003', shortName: 'AO', longName: 'Aged Plane' },
+      lastHeard: stale,
+      isIgnored: true,
+      aircraftAgedOutAt: Date.now() - 3600_000,
+    };
+    const trailFor = (nodeNum: number, sourceId = 'src-a', base = 0) => ({
+      sourceId,
+      nodeNum,
+      points: [
+        { lat: 36, lon: -81, alt: null, ts: base + 1_000 },
+        { lat: 36.1, lon: -81.1, alt: null, ts: base + 60_000 },
+      ],
+    });
+    const drawnTrailNodes = () => mocks.renderedTrails.map((t) => t.key).sort();
+
+    beforeEach(() => {
+      mocks.aircraftTrails = [trailFor(plane.nodeNum), trailFor(favPlane.nodeNum), trailFor(agedOut.nodeNum)];
+    });
+
+    it('draws nothing and does not query while the toggle is off', () => {
+      render(<DashboardMap {...defaultProps} sourceId="src-a" nodes={[plane]} />);
+      expect(screen.queryByTestId('aircraft-trails')).not.toBeInTheDocument();
+      expect(mocks.aircraftTrailArgs?.enabled).toBe(false);
+    });
+
+    it('draws a trail for each drawn aircraft on a per-source map', () => {
+      mocks.mapContext.showAircraftTrails = true;
+      render(<DashboardMap {...defaultProps} sourceId="src-a" nodes={[plane, favPlane, nodeWithPosition]} />);
+      expect(mocks.aircraftTrailArgs).toMatchObject({ enabled: true, hours: 6, sourceIds: ['src-a'] });
+      expect(drawnTrailNodes()).toEqual([`aircraft-trail-${plane.nodeNum}`, `aircraft-trail-${favPlane.nodeNum}`].sort());
+    });
+
+    it('Hide mode removes trails with the markers, except a favourite', () => {
+      mocks.mapContext.showAircraftTrails = true;
+      mocks.mapContext.aircraftDisplayMode = 'hide';
+      render(<DashboardMap {...defaultProps} sourceId="src-a" nodes={[plane, favPlane]} />);
+      expect(drawnTrailNodes()).toEqual([`aircraft-trail-${favPlane.nodeNum}`]);
+    });
+
+    it('aged-out aircraft get a trail only while Show aged-out is on', () => {
+      mocks.mapContext.showAircraftTrails = true;
+      const { unmount } = render(<DashboardMap {...defaultProps} sourceId="src-a" nodes={[plane, agedOut]} />);
+      expect(drawnTrailNodes()).toEqual([`aircraft-trail-${plane.nodeNum}`]);
+      unmount();
+
+      mocks.mapContext.showAgedOutAircraft = true;
+      render(<DashboardMap {...defaultProps} sourceId="src-a" nodes={[plane, agedOut]} />);
+      expect(drawnTrailNodes()).toEqual([`aircraft-trail-${plane.nodeNum}`, `aircraft-trail-${agedOut.nodeNum}`].sort());
+    });
+
+    it('drops another source\'s trail on a per-source map', () => {
+      mocks.mapContext.showAircraftTrails = true;
+      mocks.aircraftTrails = [trailFor(plane.nodeNum, 'src-b')];
+      render(<DashboardMap {...defaultProps} sourceId="src-a" nodes={[plane]} />);
+      expect(mocks.renderedTrails).toEqual([]);
+    });
+
+    it('Unified merges one aircraft heard by two sources into one trail', () => {
+      mocks.mapContext.showAircraftTrails = true;
+      mocks.aircraftTrails = [trailFor(plane.nodeNum, 'src-a'), trailFor(plane.nodeNum, 'src-b', 2_000)];
+      render(<DashboardMap {...defaultProps} sourceId="__unified__" nodes={[plane]} />);
+      expect(mocks.aircraftTrailArgs?.sourceIds ?? null).toBeNull();
+      expect(mocks.renderedTrails).toHaveLength(1);
+      // 1_000 kept, 3_000 within 5 s dropped, 60_000 kept, 62_000 dropped.
+      expect(mocks.renderedTrails[0].times).toEqual([1_000, 60_000]);
+      expect(mocks.renderedTrails[0].label).toBe('Plane');
+    });
   });
 
   it('shows empty state when the only positioned node is ignored', () => {
@@ -1175,5 +1355,25 @@ describe('DashboardMap — MQTT-only source bypasses transport filters (#5283)',
 
     expect(screen.getByText('Show MQTT')).toBeInTheDocument();
     expect(screen.queryAllByTestId('map-marker')).toHaveLength(0);
+  });
+});
+
+// #5344: the Map Features age filter is the shared MapAgeFilterControl (also
+// used by NodesTab). The global i18n mock echoes keys, so this pins which
+// label the top ("All") stop picks; en.json wording is covered by
+// MapAgeFilterControl.test.tsx.
+describe('DashboardMap — Map age filter names the Settings window (#5344)', () => {
+  it('reads "All (… from Settings)" at the top stop for a finite Settings window', () => {
+    render(<DashboardMap {...defaultProps} maxNodeAgeHours={24} />);
+    const slider = screen.getByRole('slider', { name: 'map.ageFilter' });
+    expect(slider).toHaveAttribute('aria-valuetext', 'map.ageAllFromSettings');
+    expect(screen.getByTestId('map-age-showing')).toBeInTheDocument();
+    expect(screen.getByText('map.ageFilterHint')).toBeInTheDocument();
+  });
+
+  it('reads "no limit in Settings" when the Settings window is 0 (show all)', () => {
+    render(<DashboardMap {...defaultProps} maxNodeAgeHours={0} />);
+    const slider = screen.getByRole('slider', { name: 'map.ageFilter' });
+    expect(slider).toHaveAttribute('aria-valuetext', 'map.ageAllUnlimited');
   });
 });

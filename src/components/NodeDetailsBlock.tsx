@@ -17,6 +17,11 @@ import { UiIcon, type UiIconName } from './icons';
 import { MeshtasticContactShare } from './MeshtasticContactShare';
 import { NodeSkyView } from './gnss/NodeSkyView';
 import { Firmware28SilenceNotice } from './Firmware28SilenceNotice';
+import { ShowCoverageLink } from './Analysis/ShowCoverageLink';
+import { formatAircraftSummary } from '../utils/aircraftClassification';
+import { SignFlipNotice } from './SignFlipNotice';
+import FlightMatchLine from './FlightMatchLine';
+import AssetTrackingSection from './AssetTrackingSection';
 
 interface NodeDetailsBlockProps {
   node: DeviceInfo | null;
@@ -35,6 +40,11 @@ interface NodeDetailsBlockProps {
    * when absent (or a MeshCore/no-source context) the badge is simply omitted.
    */
   sourceId?: string | null;
+  /**
+   * Asset Tracking section (#5354). Rendered only when given, because it
+   * needs the app's QueryClient; `canEdit` = the caller's `settings:write`.
+   */
+  assetTracking?: { canEdit: boolean };
 }
 
 const MAX_NODE_NOTES_LENGTH = 2000;
@@ -81,7 +91,7 @@ function buildSignalTrendTooltip(
   return parts.join('\n');
 }
 
-const NodeDetailsBlock: React.FC<NodeDetailsBlockProps> = ({ node, timeFormat = '24', dateFormat = 'MM/DD/YYYY', canEditNotes = false, onSaveNotes, sourceId }) => {
+const NodeDetailsBlock: React.FC<NodeDetailsBlockProps> = ({ node, timeFormat = '24', dateFormat = 'MM/DD/YYYY', canEditNotes = false, onSaveNotes, sourceId, assetTracking }) => {
   const { t } = useTranslation();
   const { channels } = useChannels();
   const { currentNodeId } = useDeviceConfig();
@@ -375,7 +385,10 @@ const NodeDetailsBlock: React.FC<NodeDetailsBlockProps> = ({ node, timeFormat = 
   return (
     <div className="node-details-block">
       <div className="node-details-header">
-        <h3 className="node-details-title">{t('node_details.title')}</h3>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+          <h3 className="node-details-title">{t('node_details.title')}</h3>
+          {node.user?.id && <ShowCoverageLink senderId={node.user.id} />}
+        </div>
         <button
           className="node-details-toggle"
           onClick={() => setIsCollapsed(!isCollapsed)}
@@ -565,6 +578,15 @@ const NodeDetailsBlock: React.FC<NodeDetailsBlockProps> = ({ node, timeFormat = 
                 </span>
               )}
             </div>
+            {/* #5363: the coords above are the mirror of what the node sent. */}
+            {node.positionSignFlipCorrected
+              && node.reportedLatitude != null
+              && node.reportedLongitude != null && (
+              <SignFlipNotice
+                reportedLatitude={node.reportedLatitude}
+                reportedLongitude={node.reportedLongitude}
+              />
+            )}
           </div>
         )}
 
@@ -574,6 +596,42 @@ const NodeDetailsBlock: React.FC<NodeDetailsBlockProps> = ({ node, timeFormat = 
             <div className="node-detail-label">{t('node_details.elevation', 'Elevation')}</div>
             <div className="node-detail-value">
               {node.position.altitude}m
+            </div>
+          </div>
+        )}
+
+        {/* Likely aircraft (#5364/#5365 Phase 1 WP4) */}
+        {node.likelyAircraft && (
+          <div className="node-detail-card">
+            <div className="node-detail-label">
+              <UiIcon name="aircraft" size={14} /> {t('nodes.likely_aircraft', 'Likely aircraft')}
+            </div>
+            <div className="node-detail-value">
+              {formatAircraftSummary(
+                { aircraftBasis: node.aircraftBasis, heightAboveGround: node.heightAboveGround, altitude: node.position?.altitude },
+                t,
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ADS-B flight match (#5374), fetched only while this panel is open */}
+        {node.likelyAircraft && (
+          <FlightMatchLine sourceId={sourceId} nodeNum={node.nodeNum} likelyAircraft variant="details" />
+        )}
+
+        {/* Aircraft age-out / fixed marks (#5364/#5365 Phase 2) */}
+        {node.isIgnored && node.aircraftAgedOutAt != null && (
+          <div className="node-detail-card" data-testid="node-details-aircraft-aged-out">
+            <div className="node-detail-label">
+              <UiIcon name="aircraft" size={14} /> {t('node_popup.aircraft_aged_out', 'Aged out (likely aircraft)')}
+            </div>
+          </div>
+        )}
+        {node.aircraftFixedAt != null && (
+          <div className="node-detail-card" data-testid="node-details-aircraft-fixed">
+            <div className="node-detail-label">
+              <UiIcon name="aircraft" size={14} /> {t('node_popup.aircraft_fixed', 'Reclassified as fixed')}
             </div>
           </div>
         )}
@@ -761,6 +819,16 @@ const NodeDetailsBlock: React.FC<NodeDetailsBlockProps> = ({ node, timeFormat = 
             </div>
           )}
 
+          {/* First Heard (#5390) — Unix seconds, like lastHeard */}
+          {typeof node.firstHeard === 'number' && (
+            <div className="node-detail-card" data-testid="node-first-heard">
+              <div className="node-detail-label">{t('node_details.first_heard', 'First Heard')}</div>
+              <div className="node-detail-value">
+                {formatLastHeard(node.firstHeard)}
+              </div>
+            </div>
+          )}
+
           {/* Notes (#3921) — editable when permitted, otherwise read-only */}
           {(canEditNotes && onSaveNotes) ? (
             <div className="node-detail-card node-detail-card-2col node-detail-notes">
@@ -793,6 +861,11 @@ const NodeDetailsBlock: React.FC<NodeDetailsBlockProps> = ({ node, timeFormat = 
             </div>
           ) : null}
         </div>
+
+        {/* Asset tracking (#5354) — sits right below Notes. */}
+        {assetTracking && node.nodeNum != null && (
+          <AssetTrackingSection nodeNum={node.nodeNum} asset={node.asset} canEdit={assetTracking.canEdit} />
+        )}
 
         {/* "Silent on 2.8+" notice (#5033). Self-gated: renders nothing unless
             the node is on firmware >= 2.8, is still being heard, and has gone

@@ -41,10 +41,13 @@ import { useNodes, useTelemetryNodes, setNodeFieldInCache } from './useServerDat
 import { useTraceroutePaths, type ThemeColors } from './useTraceroutePaths';
 import { isNodeComplete, getEffectivePosition } from '../utils/nodeHelpers';
 import { effectiveMapMaxAgeHours } from '../utils/mapAge';
+import { resolveNodeListAgeHours } from '../utils/nodeQuickAgeFilter';
+import { useNodeQuickAgeFilter } from './useNodeQuickAgeFilter';
 import { nodePassesTransportFilter, transportCutoffSec, isMqttOnlySourceType } from '../utils/nodeTransport';
 import { logger } from '../utils/logger';
 import { favoritePendingKey, pendingFavoriteRequests } from '../utils/pendingToggles';
 import { isTxDisabledBody } from '../utils/txDisabled';
+import { isAgedOutAircraft } from '../components/map/agedOutAircraft';
 
 export interface UseSourceViewParams {
   /** The deployment base path — App passes `appBasename` (#3962 5.4 PR8
@@ -156,6 +159,13 @@ export function useSourceView(params: UseSourceViewParams) {
     sortDirection,
     setTracerouteLoading,
   } = useUI();
+  // Nodes tab quick age filter (#5387): a view-only override of the Settings
+  // window, applied ONLY while the Nodes tab is active (processedNodes also
+  // feeds the Messages tab, which keeps the Settings window). null = Settings.
+  const [quickAgeHours] = useNodeQuickAgeFilter();
+  const listAgeHours = activeTab === 'nodes'
+    ? resolveNodeListAgeHours(quickAgeHours, maxNodeAgeHours)
+    : maxNodeAgeHours;
   const {
     showPaths,
     showRoute,
@@ -247,9 +257,14 @@ export function useSourceView(params: UseSourceViewParams) {
       const node = nodes.find(n => n.nodeNum === nodeNum);
       const nodeName = node?.user?.shortName || node?.user?.longName || `Node ${nodeNum}`;
 
+      // #5354: a manual delete is still allowed for a tracked asset, but say
+      // plainly that its retained history goes with it.
+      const assetWarning = node?.asset
+        ? `${t('purgeModal.assetWarning', 'This node is a tracked asset. Deleting it also removes its retained history.')}\n\n`
+        : '';
       if (
         !window.confirm(
-          `Are you sure you want to DELETE ${nodeName} from the local database?\n\nThis will remove:\n- The node from the map and node list\n- All messages with this node\n- All traceroutes for this node\n- All telemetry data for this node\n\nThis action cannot be undone.`
+          `${assetWarning}Are you sure you want to DELETE ${nodeName} from the local database?\n\nThis will remove:\n- The node from the map and node list\n- All messages with this node\n- All traceroutes for this node\n- All telemetry data for this node\n\nThis action cannot be undone.`
         )
       ) {
         return;
@@ -303,9 +318,12 @@ export function useSourceView(params: UseSourceViewParams) {
       const node = nodes.find(n => n.nodeNum === nodeNum);
       const nodeName = node?.user?.shortName || node?.user?.longName || `Node ${nodeNum}`;
 
+      const assetWarning = node?.asset
+        ? `${t('purgeModal.assetWarning', 'This node is a tracked asset. Deleting it also removes its retained history.')}\n\n`
+        : '';
       if (
         !window.confirm(
-          `Are you sure you want to PURGE ${nodeName} from BOTH the connected device AND the local database?\n\nThis will:\n- Send an admin command to remove the node from the device NodeDB\n- Remove the node from the map and node list\n- Delete all messages with this node\n- Delete all traceroutes for this node\n- Delete all telemetry data for this node\n\nThis action cannot be undone and affects both the device and local database.`
+          `${assetWarning}Are you sure you want to PURGE ${nodeName} from BOTH the connected device AND the local database?\n\nThis will:\n- Send an admin command to remove the node from the device NodeDB\n- Remove the node from the map and node list\n- Delete all messages with this node\n- Delete all traceroutes for this node\n- Delete all telemetry data for this node\n\nThis action cannot be undone and affects both the device and local database.`
         )
       ) {
         return;
@@ -355,22 +373,36 @@ export function useSourceView(params: UseSourceViewParams) {
   );
 
   // Get processed (filtered and sorted) nodes
-  const processedNodes = useMemo((): DeviceInfo[] => {
-    const cutoffTime = Date.now() / 1000 - maxNodeAgeHours * 60 * 60;
+  // #5364/#5365 Phase 2: `agedOutAircraftNodes` is the set the NodesTab map
+  // adds when "Show aged-out" is on — ignored-by-age-out aircraft that pass
+  // every OTHER filter here, so the map and its "N aged out" hint agree.
+  const { processedNodes, agedOutAircraftNodes } = useMemo((): {
+    processedNodes: DeviceInfo[];
+    agedOutAircraftNodes: DeviceInfo[];
+  } => {
+    const cutoffTime = Date.now() / 1000 - listAgeHours * 60 * 60;
 
-    // Age filter (favorites are always visible)
-    const ageFiltered = nodes.filter(node => {
-      if (node.isFavorite) return true;
-      if (!node.lastHeard) return false;
-      return node.lastHeard >= cutoffTime;
-    });
+    // A window of 0 = "never / show all" (#4947). Keep this per-source view
+    // aligned with useProcessedNodes. listAgeHours is maxNodeAgeHours unless
+    // the Nodes tab quick filter overrides it (#5387).
+    const ageFiltered =
+      listAgeHours <= 0
+        ? nodes
+        : nodes.filter(node => {
+            if (node.isFavorite) return true;
+            // #5317: keep an imported-but-never-heard node visible — see the same
+            // guard in useProcessedNodes.
+            if (node.importedAt && !node.lastHeard) return true;
+            if (!node.lastHeard) return false;
+            return node.lastHeard >= cutoffTime;
+          });
 
     // Only apply nodesNodeFilter when Nodes tab is active
     // Messages tab will apply its own messagesNodeFilter
     const textFiltered = activeTab === 'nodes' ? filterNodes(ageFiltered, nodesNodeFilter) : ageFiltered;
 
     // Apply advanced filters
-    const advancedFiltered = textFiltered.filter(node => {
+    const passesAdvancedFilters = (node: DeviceInfo, allowAgedOut: boolean): boolean => {
       const nodeId = node.user?.id;
       const isShowMode = nodeFilters.filterMode === 'show';
 
@@ -454,7 +486,9 @@ export function useSourceView(params: UseSourceViewParams) {
       // Ignored nodes filter - hide ignored nodes by default
       // When showIgnored is false (default): hide ignored nodes
       // When showIgnored is true: show ignored nodes
-      if (!nodeFilters.showIgnored && node.isIgnored) {
+      // #5364/#5365 Phase 2: `allowAgedOut` lets an aged-out aircraft through
+      // for the map-only "Show aged-out" list; manual/geo ignores never pass.
+      if (!nodeFilters.showIgnored && node.isIgnored && !(allowAgedOut && isAgedOutAircraft(node))) {
         return false;
       }
 
@@ -482,7 +516,17 @@ export function useSourceView(params: UseSourceViewParams) {
       }
 
       return true;
-    });
+    };
+    const advancedFiltered = textFiltered.filter(node => passesAdvancedFilters(node, false));
+
+    // Aged-out aircraft skip the age window (they are older than it by
+    // definition) but pass the text and advanced filters like any other node.
+    // Nodes already in the list (showIgnored on, still inside the window) are
+    // not repeated.
+    const inList = new Set(advancedFiltered.map(node => node.nodeNum));
+    const agedOutCandidates = nodes.filter(node => isAgedOutAircraft(node) && !inList.has(node.nodeNum));
+    const agedOutText = activeTab === 'nodes' ? filterNodes(agedOutCandidates, nodesNodeFilter) : agedOutCandidates;
+    const agedOut = agedOutText.filter(node => passesAdvancedFilters(node, true));
 
     // Separate favorites from non-favorites
     const favorites = advancedFiltered.filter(node => node.isFavorite);
@@ -493,10 +537,13 @@ export function useSourceView(params: UseSourceViewParams) {
     const sortedNonFavorites = sortNodes(nonFavorites, sortField, sortDirection);
 
     // Concatenate: favorites first, then non-favorites
-    return [...sortedFavorites, ...sortedNonFavorites];
+    return {
+      processedNodes: [...sortedFavorites, ...sortedNonFavorites],
+      agedOutAircraftNodes: agedOut,
+    };
   }, [
     nodes,
-    maxNodeAgeHours,
+    listAgeHours,
     activeTab,
     nodesNodeFilter,
     sortField,
@@ -638,10 +685,10 @@ export function useSourceView(params: UseSourceViewParams) {
   );
 
   // Effective map age cap for traceroute/route-segment visibility (#3322):
-  // the Map Features age slider, clamped to [1, maxNodeAgeHours]. null =
-  // follow the source's setting (per-source since #4412 Phase 3), so default
-  // behavior is unchanged.
-  const effectiveMapMaxAge = effectiveMapMaxAgeHours(mapMaxAgeHours, maxNodeAgeHours);
+  // the Map Features age slider, clamped to [1, listAgeHours]. null = follow
+  // the source's setting (per-source since #4412 Phase 3), or the Nodes tab
+  // quick filter when one is picked (#5387), so default behavior is unchanged.
+  const effectiveMapMaxAge = effectiveMapMaxAgeHours(mapMaxAgeHours, listAgeHours);
 
   // Create stable digests of nodes and traceroutes that only change when relevant data changes
   // This prevents unnecessary recalculation of traceroutePathsElements
@@ -755,6 +802,7 @@ export function useSourceView(params: UseSourceViewParams) {
 
   return {
     processedNodes,
+    agedOutAircraftNodes,
     shouldShowData,
     centerMapOnNode,
     toggleFavorite,

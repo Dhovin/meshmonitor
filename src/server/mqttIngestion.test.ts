@@ -20,6 +20,11 @@ vi.mock('../services/database.js', () => ({
     insertTracerouteAsync: vi.fn(async () => undefined),
     insertRouteSegment: vi.fn(),
     insertRouteSegmentAsync: vi.fn(async () => undefined),
+    // #5101 (finding 2): persistRouteSegments now also calls this per stored
+    // segment, mirroring the TCP writer.
+    updateRecordHolderSegmentAsync: vi.fn(async () => undefined),
+    // #5354 tracked assets — none unless a test says so.
+    getAssetNodeAsync: vi.fn(async () => null),
     deleteNodeAsync: vi.fn(async () => ({
       messagesDeleted: 0,
       broadcastMessagesDeleted: 0,
@@ -63,6 +68,7 @@ vi.mock('../services/database.js', () => ({
     // inline check is a no-op for this suite's wiring/branching assertions.
     settings: {
       getSettingForSource: vi.fn(async () => null),
+      getLocalNodeNumForSource: vi.fn(async () => null),
     },
     setNodeIgnoredAsync: vi.fn(async () => undefined),
   },
@@ -101,12 +107,21 @@ vi.mock('./meshtasticProtobufService.js', () => ({
   },
 }));
 
+// Likely-aircraft classification (#5364/#5365): the POSITION_APP path only
+// needs to prove it *calls* `schedule()` after the upsert resolves — the
+// classification pipeline itself is covered by
+// `aircraftClassificationService.test.ts`.
+vi.mock('./services/aircraftClassificationService.js', () => ({
+  aircraftClassificationService: { schedule: vi.fn() },
+}));
+
 import { ingestServiceEnvelope, _resetMqttIngestCachesForTest } from './mqttIngestion.js';
 import { setDiscardInvalidPositions, __resetDiscardInvalidPositionsForTest } from '../utils/positionIngestConfig.js';
 import { MqttPacketFilter, type ServiceEnvelopeShape } from './mqttPacketFilter.js';
 import databaseService from '../services/database.js';
 import meshtasticProtobufService from './meshtasticProtobufService.js';
-import { CHANNEL_DB_OFFSET } from './constants/meshtastic.js';
+import { aircraftClassificationService } from './services/aircraftClassificationService.js';
+import { CHANNEL_DB_OFFSET, TransportMechanism } from './constants/meshtastic.js';
 
 const NODE_IN = 0x7ff80a48;
 const NODE_OUT = 0x11111111;
@@ -343,6 +358,24 @@ describe('ingestServiceEnvelope — POSITION geo evaluation', () => {
     expect(databaseService.upsertNodeAsync).not.toHaveBeenCalled();
   });
 
+  it('geo-ignores a tracked asset but never purges it (#5354)', async () => {
+    await outOfBboxOnce();
+    (databaseService.ignoredNodes.addGeoIgnoreAsync as any).mockResolvedValueOnce(true);
+    (databaseService.getAssetNodeAsync as any).mockResolvedValueOnce({ nodeNum: NODE_OUT, retentionDays: 90 });
+    const filter = new MqttPacketFilter({ geo: ON_BBOX });
+
+    const result = await ingestServiceEnvelope({
+      sourceId: 'bridge-1',
+      envelope: envFor(NODE_OUT, 3 /* POSITION_APP */),
+      filter,
+    });
+
+    expect(result).toMatchObject({ ingested: false, reason: 'geo-ignored' });
+    expect(databaseService.ignoredNodes.addGeoIgnoreAsync).toHaveBeenCalledTimes(1);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(databaseService.deleteNodeAsync).not.toHaveBeenCalled();
+  });
+
   it('does not re-purge an already geo-ignored node (addGeoIgnoreAsync → false)', async () => {
     await outOfBboxOnce();
     (databaseService.ignoredNodes.addGeoIgnoreAsync as any).mockResolvedValueOnce(false);
@@ -473,6 +506,9 @@ describe('ingestServiceEnvelope — POSITION Null Island guard (#3763)', () => {
     expect(arg.latitude).toBeUndefined();
     expect(arg.longitude).toBeUndefined();
     expect(arg.altitude).toBeUndefined(); // even though the payload carried altitude: 0
+    // Bogus fix → no aircraft classification job (#5364/#5365 spec §4.4).
+    await new Promise((r) => setTimeout(r, 0));
+    expect(aircraftClassificationService.schedule).not.toHaveBeenCalled();
   });
 
   it('strips a precision-obscured (0,0) fix that arrives re-centered as (offset, offset)', async () => {
@@ -514,6 +550,10 @@ describe('ingestServiceEnvelope — POSITION Null Island guard (#3763)', () => {
     const arg = (databaseService.upsertNodeAsync as any).mock.calls[0][0];
     expect(arg.latitude).toBeCloseTo(43.7, 5);
     expect(arg.longitude).toBeCloseTo(-79.3, 5);
+    // A trustworthy fix with an altitude schedules aircraft classification
+    // after the upsert resolves (#5364/#5365 spec §4.4).
+    await new Promise((r) => setTimeout(r, 0));
+    expect(aircraftClassificationService.schedule).toHaveBeenCalledWith('bridge-1', NODE_IN);
   });
 });
 
@@ -582,6 +622,37 @@ describe('ingestServiceEnvelope — TEXT_MESSAGE_APP directed vs broadcast chann
     const inserted = (databaseService.messages.insertMessage as any).mock.calls[0][0];
     expect(inserted.channel).toBe(-1);
     expect(inserted.toNodeNum).toBe(0x11223344);
+  });
+
+  it('stores hopStart/hopLimit on the message row (#5366)', async () => {
+    // Regression: MQTT ingest dropped the hop header, so every MQTT reception
+    // in Unified Messages showed "hop count unknown".
+    const env = textEnvelopeTo(0xffffffff);
+    env.packet!.hopStart = 5;
+    env.packet!.hopLimit = 2;
+    await ingestServiceEnvelope({ sourceId: 'bridge-1', envelope: env });
+    const inserted = (databaseService.messages.insertMessage as any).mock.calls[0][0];
+    expect(inserted.hopStart).toBe(5);
+    expect(inserted.hopLimit).toBe(2);
+  });
+
+  it('accepts snake_case hop_start/hop_limit from a bridge (#5366)', async () => {
+    const env = textEnvelopeTo(0xffffffff);
+    (env.packet as any).hop_start = 3;
+    (env.packet as any).hop_limit = 3;
+    await ingestServiceEnvelope({ sourceId: 'bridge-1', envelope: env });
+    const inserted = (databaseService.messages.insertMessage as any).mock.calls[0][0];
+    expect(inserted.hopStart).toBe(3);
+    expect(inserted.hopLimit).toBe(3);
+  });
+
+  it('leaves hopStart unset (unknown, not 0) when the packet has none (#5366)', async () => {
+    const env = textEnvelopeTo(0xffffffff);
+    env.packet!.hopLimit = 3;
+    await ingestServiceEnvelope({ sourceId: 'bridge-1', envelope: env });
+    const inserted = (databaseService.messages.insertMessage as any).mock.calls[0][0];
+    expect(inserted.hopStart).toBeUndefined();
+    expect(inserted.hopLimit).toBe(3);
   });
 
   it('leaves a broadcast message on its channel (not -1)', async () => {
@@ -673,6 +744,8 @@ describe('ingestServiceEnvelope — TEXT_MESSAGE_APP tapbacks', () => {
     const inserted = (databaseService.messages.insertMessage as any).mock.calls[0][0];
     expect(inserted.emoji).toBeUndefined();
     expect(inserted.replyId).toBeUndefined();
+    // #5101: every message on this MQTT ingest path arrived over MQTT.
+    expect(inserted.transportMechanism).toBe(TransportMechanism.MQTT);
   });
 });
 
@@ -745,6 +818,8 @@ describe('ingestServiceEnvelope — TRACEROUTE_APP', () => {
     expect(record.route).toBe('[]');
     expect(record.snrTowards).toBe('[40]');
     expect(sourceId).toBe('bridge-1');
+    // #5101: every row this ingest path writes arrived over MQTT.
+    expect(record.transportMechanism).toBe(TransportMechanism.MQTT);
 
     const telemetryCall = (databaseService.insertTelemetryAsync as any).mock.calls
       .find((c: any[]) => c[0].telemetryType === 'messageHops');
@@ -763,6 +838,68 @@ describe('ingestServiceEnvelope — TRACEROUTE_APP', () => {
       .find((c: any[]) => c[0].nodeNum === NODE_IN);
     expect(senderUpsert).toBeDefined();
     expect(senderUpsert[1]).toBe('bridge-1');
+  });
+});
+
+describe('ingestServiceEnvelope — TRACEROUTE_APP route segments (#5101)', () => {
+  const REQUESTER = 0x11111111;
+  const HOP = 0xaaaa2222;
+  const RESPONDER = NODE_IN;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (databaseService.nodes.getNode as any).mockImplementation(async (nodeNum: number) => {
+      const coords: Record<number, [number, number]> = {
+        [REQUESTER]: [10, 10],
+        [HOP]: [10.01, 10],
+        [RESPONDER]: [10.02, 10],
+      };
+      const c = coords[nodeNum];
+      if (!c) return null;
+      return { nodeNum, latitude: c[0], longitude: c[1] };
+    });
+  });
+
+  it('stamps MQTT on every forward+return segment and calls updateRecordHolderSegmentAsync per segment (finding 2)', async () => {
+    const { default: protobuf } = await import('./meshtasticProtobufService.js');
+    (protobuf.processPayload as any).mockImplementationOnce(() => ({
+      route: [HOP],
+      routeBack: [HOP],
+      snrTowards: [40, 20],
+      snrBack: [40, 20],
+    }));
+
+    const envelope: ServiceEnvelopeShape = {
+      channelId: 'LongFast',
+      gatewayId: '!00000001',
+      packet: {
+        id: 0x12345678,
+        from: RESPONDER,
+        to: REQUESTER,
+        channel: 0,
+        decoded: { portnum: 70 /* TRACEROUTE_APP */, payload: new Uint8Array([0]) },
+      },
+    };
+
+    const result = await ingestServiceEnvelope({ sourceId: 'bridge-1', envelope });
+    expect(result.ingested).toBe(true);
+
+    // Forward [REQUESTER, HOP, RESPONDER] -> 2 segments; return
+    // [RESPONDER, HOP, REQUESTER] -> 2 segments.
+    expect(databaseService.insertRouteSegmentAsync).toHaveBeenCalledTimes(4);
+    const inserted = (databaseService.insertRouteSegmentAsync as any).mock.calls.map((c: any[]) => c[0]);
+    for (const seg of inserted) {
+      expect(seg.transportMechanism).toBe(TransportMechanism.MQTT);
+    }
+
+    // Every inserted segment also gets a record-holder check, MQTT sources
+    // previously never did this (finding 2) — only the TCP writer did.
+    expect(databaseService.updateRecordHolderSegmentAsync).toHaveBeenCalledTimes(4);
+    const recorded = (databaseService.updateRecordHolderSegmentAsync as any).mock.calls.map((c: any[]) => c[0]);
+    expect(recorded).toEqual(inserted);
+    for (const call of (databaseService.updateRecordHolderSegmentAsync as any).mock.calls) {
+      expect(call[1]).toBe('bridge-1');
+    }
   });
 });
 
@@ -853,6 +990,8 @@ describe('ingestServiceEnvelope — STORE_FORWARD_APP', () => {
     expect(inserted.viaMqtt).toBe(true);
     expect(inserted.viaStoreForward).toBe(true);
     expect(inserted.sourceId).toBe('bridge-1');
+    // #5101: every message on this MQTT ingest path arrived over MQTT.
+    expect(inserted.transportMechanism).toBe(TransportMechanism.MQTT);
   });
 
   it('does NOT insert a duplicate when the original message already landed', async () => {

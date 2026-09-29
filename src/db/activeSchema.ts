@@ -124,6 +124,15 @@ import {
 import {
   meshtasticHeardRepeatersSqlite, meshtasticHeardRepeatersPostgres, meshtasticHeardRepeatersMysql,
 } from './schema/meshtasticHeardRepeaters.js';
+import {
+  coverageReceptionsSqlite, coverageReceptionsPostgres, coverageReceptionsMysql,
+} from './schema/coverageReceptions.js';
+import {
+  coverageSurveysSqlite, coverageSurveysPostgres, coverageSurveysMysql,
+} from './schema/coverageSurveys.js';
+import {
+  aircraftFlightMatchesSqlite, aircraftFlightMatchesPostgres, aircraftFlightMatchesMysql,
+} from './schema/aircraftFlightMatches.js';
 
 // Mesh Issues findings (global — no sourceId) (epic #4964 Phase 1 WP1)
 import {
@@ -158,6 +167,15 @@ import {
 import {
   solarNodeOverridesSqlite, solarNodeOverridesPostgres, solarNodeOverridesMysql,
 } from './schema/solarNodeOverrides.js';
+// Tracked assets (global — no sourceId) (#5354)
+import {
+  assetNodesSqlite, assetNodesPostgres, assetNodesMysql,
+} from './schema/assetNodes.js';
+// MeshCore Ignore / Block, per source (#5408)
+import {
+  meshcoreIgnoredNodesSqlite, meshcoreIgnoredNodesPostgres, meshcoreIgnoredNodesMysql,
+  meshcoreMessageFiltersSqlite, meshcoreMessageFiltersPostgres, meshcoreMessageFiltersMysql,
+} from './schema/meshcoreFilters.js';
 
 // Waypoints table
 import {
@@ -304,6 +322,18 @@ export interface ActiveSchema {
   // Meshtastic Heard-By (#4816 Phase 4 WP1)
   meshtasticHeardRepeaters: any;
 
+  // Coverage Report RF receptions (#5277 Phase 1 WP1)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #5277 matches the existing ActiveSchema per-dialect table pattern; typing burn-down is #3962 Phase 6
+  coverageReceptions: any;
+
+  // Coverage Report saved surveys, global — no sourceId (#5277 Phase 4b WP1)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #5277 matches the existing ActiveSchema per-dialect table pattern; typing burn-down is #3962 Phase 6
+  coverageSurveys: any;
+
+  // ADS-B flight matches for likely aircraft, per source (#5374)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #5374 matches the existing ActiveSchema per-dialect table pattern; typing burn-down is #3962 Phase 6
+  aircraftFlightMatches: any;
+
   // Mesh Issues findings (global — no sourceId) (epic #4964 Phase 1 WP1)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #4964 matches the existing ActiveSchema per-dialect table pattern; typing burn-down is #3962 Phase 6
   meshIssues: any;
@@ -327,6 +357,12 @@ export interface ActiveSchema {
   privacyDocuments: any;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #3195 dialect-union table slot, same shape as every sibling here
   solarNodeOverrides: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #5354 dialect-union table slot, same shape as every sibling here
+  assetNodes: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #5408 dialect-union table slot, same shape as every sibling here
+  meshcoreIgnoredNodes: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- #5408 dialect-union table slot, same shape as every sibling here
+  meshcoreMessageFilters: any;
 
   // Waypoints
   waypoints: any;
@@ -437,6 +473,9 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     meshcoreHeardRepeaters: meshcoreHeardRepeatersSqlite,
     messageEvents: messageEventsSqlite,
     meshtasticHeardRepeaters: meshtasticHeardRepeatersSqlite,
+    coverageReceptions: coverageReceptionsSqlite,
+    coverageSurveys: coverageSurveysSqlite,
+    aircraftFlightMatches: aircraftFlightMatchesSqlite,
     meshIssues: meshIssuesSqlite,
     embedProfiles: embedProfilesSqlite,
     automations: automationsSqlite,
@@ -447,6 +486,9 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     meshcoreSavedRegions: meshcoreSavedRegionsSqlite,
     privacyDocuments: privacyDocumentsSqlite,
     solarNodeOverrides: solarNodeOverridesSqlite,
+    assetNodes: assetNodesSqlite,
+    meshcoreIgnoredNodes: meshcoreIgnoredNodesSqlite,
+    meshcoreMessageFilters: meshcoreMessageFiltersSqlite,
     waypoints: waypointsSqlite,
     sources: sourcesSqlite,
     estimatedPositions: estimatedPositionsSqlite,
@@ -513,6 +555,9 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     meshcoreHeardRepeaters: meshcoreHeardRepeatersPostgres,
     messageEvents: messageEventsPostgres,
     meshtasticHeardRepeaters: meshtasticHeardRepeatersPostgres,
+    coverageReceptions: coverageReceptionsPostgres,
+    coverageSurveys: coverageSurveysPostgres,
+    aircraftFlightMatches: aircraftFlightMatchesPostgres,
     meshIssues: meshIssuesPostgres,
     embedProfiles: embedProfilesPostgres,
     automations: automationsPostgres,
@@ -523,6 +568,9 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     meshcoreSavedRegions: meshcoreSavedRegionsPostgres,
     privacyDocuments: privacyDocumentsPostgres,
     solarNodeOverrides: solarNodeOverridesPostgres,
+    assetNodes: assetNodesPostgres,
+    meshcoreIgnoredNodes: meshcoreIgnoredNodesPostgres,
+    meshcoreMessageFilters: meshcoreMessageFiltersPostgres,
     waypoints: waypointsPostgres,
     sources: sourcesPostgres,
     estimatedPositions: estimatedPositionsPostgres,
@@ -589,6 +637,9 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     meshcoreHeardRepeaters: meshcoreHeardRepeatersMysql,
     messageEvents: messageEventsMysql,
     meshtasticHeardRepeaters: meshtasticHeardRepeatersMysql,
+    coverageReceptions: coverageReceptionsMysql,
+    coverageSurveys: coverageSurveysMysql,
+    aircraftFlightMatches: aircraftFlightMatchesMysql,
     meshIssues: meshIssuesMysql,
     embedProfiles: embedProfilesMysql,
     automations: automationsMysql,
@@ -599,6 +650,9 @@ const SCHEMA_MAP: Record<DatabaseType, ActiveSchema> = {
     meshcoreSavedRegions: meshcoreSavedRegionsMysql,
     privacyDocuments: privacyDocumentsMysql,
     solarNodeOverrides: solarNodeOverridesMysql,
+    assetNodes: assetNodesMysql,
+    meshcoreIgnoredNodes: meshcoreIgnoredNodesMysql,
+    meshcoreMessageFilters: meshcoreMessageFiltersMysql,
     waypoints: waypointsMysql,
     sources: sourcesMysql,
     estimatedPositions: estimatedPositionsMysql,

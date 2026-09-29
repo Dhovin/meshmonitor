@@ -18,11 +18,10 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 
-vi.mock('react-i18next', () => ({
-  useTranslation: () => ({
-    t: (key: string, fallback?: string) => (typeof fallback === 'string' ? fallback : key),
-  }),
-}));
+vi.mock('react-i18next', async () => {
+  const { createReactI18nextMock } = await import('../../test/mockI18n');
+  return createReactI18nextMock();
+});
 
 const txStatus = { isTxDisabled: true };
 vi.mock('../../hooks/useTxStatus', () => ({
@@ -47,6 +46,12 @@ vi.mock('./hooks/useMeshCore', () => ({
   ConnectionStatus: {},
 }));
 
+vi.mock('../../hooks/useMeshCoreFilters', () => ({
+  useMeshCoreIgnoredNodes: () => ({ data: [] }),
+  useHiddenMeshCoreKeys: () => new Set<string>(),
+  useSetMeshCoreIgnoredNode: () => ({ mutateAsync: vi.fn() }),
+  useRemoveMeshCoreIgnoredNode: () => ({ mutateAsync: vi.fn() }),
+}));
 vi.mock('./hooks/useMeshCoreUnread', () => ({
   useMeshCoreUnread: () => ({ channels: false, dms: false }),
 }));

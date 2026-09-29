@@ -186,6 +186,21 @@ import { migration as spreadNodesPrefMigration, runMigration164Postgres, runMigr
 import { migration as waypointNotificationsMigration, runMigration165Postgres, runMigration165Mysql } from '../server/migrations/165_waypoint_notifications.js';
 import { migration as meshBeaconMuteMigration, runMigration166Postgres, runMigration166Mysql } from '../server/migrations/166_mesh_beacon_mute.js';
 import { migration as solarNodeOverridesMigration, runMigration167Postgres, runMigration167Mysql } from '../server/migrations/167_solar_node_overrides.js';
+import { migration as nodesImportedAtMigration, runMigration168Postgres, runMigration168Mysql } from '../server/migrations/168_nodes_imported_at.js';
+import { migration as routeSegmentsTransportMigration, runMigration169Postgres, runMigration169Mysql } from '../server/migrations/169_route_segments_transport_mechanism.js';
+import { migration as messagesTransportMigration, runMigration170Postgres, runMigration170Mysql } from '../server/migrations/170_messages_transport_mechanism.js';
+import { migration as reclassifyRecordHoldersMigration, runMigration171Postgres, runMigration171Mysql } from '../server/migrations/171_reclassify_record_holder_transport.js';
+import { migration as createCoverageReceptionsMigration, runMigration172Postgres, runMigration172Mysql } from '../server/migrations/172_create_coverage_receptions.js';
+import { migration as createCoverageSurveysMigration, runMigration173Postgres, runMigration173Mysql } from '../server/migrations/173_create_coverage_surveys.js';
+import { migration as resetPostgresSequencesMigration, runMigration174Postgres, runMigration174Mysql } from '../server/migrations/174_reset_postgres_sequences.js';
+import { migration as addNodeAircraftClassificationMigration, runMigration175Postgres, runMigration175Mysql } from '../server/migrations/175_add_node_aircraft_classification.js';
+import { migration as userMapPreferencesAircraftDisplayModeMigration, runMigration176Postgres, runMigration176Mysql } from '../server/migrations/176_user_map_preferences_aircraft_display_mode.js';
+import { migration as addNodeAircraftAgeOutMigration, runMigration177Postgres, runMigration177Mysql } from '../server/migrations/177_add_node_aircraft_ageout.js';
+import { migration as userMapPreferencesAircraftTrailsMigration, runMigration178Postgres, runMigration178Mysql } from '../server/migrations/178_user_map_preferences_aircraft_trails.js';
+import { migration as addNodeFirstHeardMigration, runMigration179Postgres, runMigration179Mysql } from '../server/migrations/179_add_node_first_heard.js';
+import { migration as createAircraftFlightMatchesMigration, runMigration180Postgres, runMigration180Mysql } from '../server/migrations/180_create_aircraft_flight_matches.js';
+import { migration as createAssetNodesMigration, runMigration181Postgres, runMigration181Mysql } from '../server/migrations/181_create_asset_nodes.js';
+import { migration as createMeshcoreIgnoreBlockMigration, runMigration182Postgres, runMigration182Mysql } from '../server/migrations/182_create_meshcore_ignore_block.js';
 
 // ============================================================================
 // Registry
@@ -2713,4 +2728,227 @@ registry.register({
   sqlite: (db) => solarNodeOverridesMigration.up(db),
   postgres: (client) => runMigration167Postgres(client),
   mysql: (pool) => runMigration167Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 168: nodes.importedAt (#5317) — when a row came from a contact URL
+// rather than from hearing the node, so the UI can badge it until it is heard.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 168,
+  name: 'nodes_imported_at',
+  settingsKey: 'migration_168_nodes_imported_at',
+  sqlite: (db) => nodesImportedAtMigration.up(db),
+  postgres: (client) => runMigration168Postgres(client),
+  mysql: (pool) => runMigration168Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 169: `route_segments.transportMechanism` (#5101) — the effective
+// per-hop transport, plus the (sourceId, transportMechanism, distanceKm)
+// index the Info tab's per-transport record queries rely on.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 169,
+  name: 'route_segments_transport_mechanism',
+  settingsKey: 'migration_169_route_segments_transport_mechanism',
+  sqlite: (db) => routeSegmentsTransportMigration.up(db),
+  postgres: (client) => runMigration169Postgres(client),
+  mysql: (pool) => runMigration169Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 170: `messages.transportMechanism` (#5101) — the transport a
+// message arrived on, feeding the Info tab's Total Messages RF/UDP/MQTT split.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 170,
+  name: 'messages_transport_mechanism',
+  settingsKey: 'migration_170_messages_transport_mechanism',
+  sqlite: (db) => messagesTransportMigration.up(db),
+  postgres: (client) => runMigration170Postgres(client),
+  mysql: (pool) => runMigration170Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 171: best-effort reclassify of existing route_segments record
+// holders by transport (#5101 §10.1). Bounded to record-holder rows; never
+// blocks boot (whole body is try/catch'd inside the migration itself).
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 171,
+  name: 'reclassify_record_holder_transport',
+  settingsKey: 'migration_171_reclassify_record_holder_transport',
+  sqlite: (db) => reclassifyRecordHoldersMigration.up(db),
+  postgres: (client) => runMigration171Postgres(client),
+  mysql: (pool) => runMigration171Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 172: create `coverage_receptions` (Coverage Report epic #5277,
+// Phase 1 WP1) — one row per (packet, path, receiver) RF reception, recorded
+// from the live Meshtastic RX path. No backfill; starts empty. PER-SOURCE.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 172,
+  name: 'create_coverage_receptions',
+  settingsKey: 'migration_172_create_coverage_receptions',
+  sqlite: (db) => createCoverageReceptionsMigration.up(db),
+  postgres: (client) => runMigration172Postgres(client),
+  mysql: (pool) => runMigration172Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 173: create `coverage_surveys` (Coverage Report epic #5277,
+// Phase 4b WP1) — a saved "this sender, this time range" survey. GLOBAL
+// table (no sourceId), UUID text PK. No backfill; starts empty.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 173,
+  name: 'create_coverage_surveys',
+  settingsKey: 'migration_173_create_coverage_surveys',
+  sqlite: (db) => createCoverageSurveysMigration.up(db),
+  postgres: (client) => runMigration173Postgres(client),
+  mysql: (pool) => runMigration173Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 174: advance PostgreSQL SERIAL/IDENTITY sequences past existing
+// ids. Repairs installs restored before restorePostgres() reset sequences
+// itself (explicit-id INSERTs never advance a PG sequence). Forward-only and
+// idempotent. SQLite / MySQL: no-op.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 174,
+  name: 'reset_postgres_sequences',
+  settingsKey: 'migration_174_reset_postgres_sequences',
+  sqlite: (db) => resetPostgresSequencesMigration.up(db),
+  postgres: (client) => runMigration174Postgres(client),
+  mysql: (pool) => runMigration174Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 175: likely-aircraft classification columns on `nodes`
+// (#5364/#5365 Phase 1 WP1). Five nullable columns, no default, no index —
+// `upsertNode` never writes them (like `mobile`/`notes`); only the aircraft
+// classification repository methods do.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 175,
+  name: 'add_node_aircraft_classification',
+  settingsKey: 'migration_175_add_node_aircraft_classification',
+  sqlite: (db) => addNodeAircraftClassificationMigration.up(db),
+  postgres: (client) => runMigration175Postgres(client),
+  mysql: (pool) => runMigration175Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 176: `user_map_preferences.aircraft_display_mode` (#5364/#5365
+// Phase 1 WP1, decision D12) — per-user Show/Mark/Hide choice for the
+// likely-aircraft map control. NULL reads as 'mark'.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 176,
+  name: 'user_map_preferences_aircraft_display_mode',
+  settingsKey: 'migration_176_user_map_preferences_aircraft_display_mode',
+  sqlite: (db) => userMapPreferencesAircraftDisplayModeMigration.up(db),
+  postgres: (client) => runMigration176Postgres(client),
+  mysql: (pool) => runMigration176Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 177: aircraft age-out + "confirmed fixed" columns on `nodes`
+// (#5364/#5365 Phase 2). Four nullable columns, no default, no index;
+// `upsertNode` never writes them.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 177,
+  name: 'add_node_aircraft_ageout',
+  settingsKey: 'migration_177_add_node_aircraft_ageout',
+  sqlite: (db) => addNodeAircraftAgeOutMigration.up(db),
+  postgres: (client) => runMigration177Postgres(client),
+  mysql: (pool) => runMigration177Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 178: `user_map_preferences.show_aircraft_trails` +
+// `aircraft_trail_hours` (#5364/#5365 Phase 3) — per-user flight-trail toggle
+// and lookback (1..168 h, default 6).
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 178,
+  name: 'user_map_preferences_aircraft_trails',
+  settingsKey: 'migration_178_user_map_preferences_aircraft_trails',
+  sqlite: (db) => userMapPreferencesAircraftTrailsMigration.up(db),
+  postgres: (client) => runMigration178Postgres(client),
+  mysql: (pool) => runMigration178Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 179: `firstHeard` on `nodes` (Unix seconds) and `meshcore_nodes`
+// (epoch ms) (#5390). Per-source, set once by the repositories; backfilled from
+// the earlier of createdAt / lastHeard for rows that have been heard.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 179,
+  name: 'add_node_first_heard',
+  settingsKey: 'migration_179_add_node_first_heard',
+  sqlite: (db) => addNodeFirstHeardMigration.up(db),
+  postgres: (client) => runMigration179Postgres(client),
+  mysql: (pool) => runMigration179Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 180: `aircraft_flight_matches` (#5374). Per-source ADS-B lookup
+// state for a likely-aircraft flagging; the row is the DB-backed 2-lookup cap.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 180,
+  name: 'create_aircraft_flight_matches',
+  settingsKey: 'migration_180_create_aircraft_flight_matches',
+  sqlite: (db) => createAircraftFlightMatchesMigration.up(db),
+  postgres: (client) => runMigration180Postgres(client),
+  mysql: (pool) => runMigration180Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 181: `asset_nodes` (#5354, Asset Tracking Phase 1). GLOBAL (no
+// sourceId): the tracked-asset flag and its telemetry retention belong to the
+// physical node. Copies migration 167 (`solar_node_overrides`).
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 181,
+  name: 'create_asset_nodes',
+  settingsKey: 'migration_181_create_asset_nodes',
+  sqlite: (db) => createAssetNodesMigration.up(db),
+  postgres: (client) => runMigration181Postgres(client),
+  mysql: (pool) => runMigration181Mysql(pool),
+});
+
+// ---------------------------------------------------------------------------
+// Migration 182: `meshcore_ignored_nodes` + `meshcore_message_filters` (#5408,
+// MeshCore client-side Ignore / Block). PER-SOURCE, FK to sources(id) cascade.
+// ---------------------------------------------------------------------------
+
+registry.register({
+  number: 182,
+  name: 'create_meshcore_ignore_block',
+  settingsKey: 'migration_182_create_meshcore_ignore_block',
+  sqlite: (db) => createMeshcoreIgnoreBlockMigration.up(db),
+  postgres: (client) => runMigration182Postgres(client),
+  mysql: (pool) => runMigration182Mysql(pool),
 });

@@ -6,6 +6,168 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [4.16.2] - 2026-09-29
+
+The full release of the 4.16.2 line. It ships everything in 4.16.2-rc1 through rc6 below, plus the two fixes in this section. Highlights since 4.16.1: the Coverage Report, likely-aircraft detection with ADS-B flight matching, asset tracking with timeline playback, per-transport breakdowns, sign-flipped position correction, per-source Message Forwarding, MeshCore Ignore/Block, and CARTO vector basemaps. Upgrading from 4.16.1 runs migrations 168–182 automatically.
+
+### Fixed
+- **The Nodes list header** grew to ~310px: a global `.sidebar-header` rule laid the title and controls side by side, squeezing every control onto its own line. The header is stacked again (title, filter, one toolbar row), and Filter, Group by Role and Add from URL are now icon buttons with tooltips. (#5477)
+- **An aged-out aircraft could never come back on an MQTT source.** The MQTT position path dropped the ignored sender's fix before the age-out lift could run, so the node stayed hidden while still being heard. A live, trustworthy fix now lifts the `aircraft` ignore first; manual and geo ignores are untouched, and replayed or retained frames still never lift. (#5478)
+
+## [4.16.2-rc6] - 2026-09-28
+
+### Added
+- **Message Forwarding**, per source, next to the Auto-Responder on both Meshtastic and MeshCore. Each rule copies a matching incoming message (DM or channel, optionally filtered by sender or regex) to one node or another channel on the same source, with an optional `{from}` / `{channel}` prefix. Each rule is hard-capped at 5 forwards per 60 s, at most 20 rules per source, sends never retry, and NodeDB replays are never forwarded. Channel targets show an airtime warning; receive-only and MQTT sources show the rules read-only. (#5446, #5455)
+- **MeshCore Ignore and Block**, for nodes and text patterns. MeshCore firmware has no block or mute, so MeshMonitor filters in the client. Ignore stores the message but skips notifications, automations, auto-ack, auto-responder, forwarding and Virtual Node relay, and folds runs into an "N ignored messages" row; Block drops the message on receipt. Text rules match exact, wildcard or regex against the sender name, body or both. Controls sit under the contact detail panel and in two new sections of the MeshCore source's Settings, each with hit counts. Migration 182. (#5408, #5469)
+- **`action.setAutomationEnabled`** in the Automation Engine enables, disables or toggles an automation by id (literal or `{{ }}` template), replacing the `runScript` + `curl` + API token workaround. (#5445, #5454)
+- **CARTO vector basemaps** (Voyager, Positron, Dark Matter) in 2D, plus a bundled **CARTO Voyager Dark** style: a dark map that keeps land-use colour. A CARTO key, when set, is added to CARTO requests only. 3D and raster-only views use each preset's matching raster tiles. (#5448, #5453)
+
+### Changed
+- **The dev tileserver is opt-in**, and `tiles/` is a real directory again. A symlink committed by accident left fresh clones with a dangling `tiles` link and crash-looped the dev tileserver; `lint:ci` now rejects tracked symlinks. (#5470)
+- **MQTT docs and help text** say Meshtastic declined meshtastic/firmware#11994 (a per-packet `ok_to_mqtt` override) by design, and name the workarounds. The bridge-side drop from #5418 stays the supported answer. (#5452)
+- **Blog:** a One Year of MeshMonitor retrospective. (#5456)
+- **Translations updated from Hosted Weblate** (Indonesian). (#5464)
+- **Tests:** every react-i18next mock now returns a stable `t`, which ends a class of latent flakes; the EmbedSettings dialog and MeshCore neighbours-config flakes are fixed; the MySQL outlier batch-delete test gets 60 s. (#5461, #5473, #5474)
+- 10 Dependabot updates, including `maplibre-gl` 6.11.2, `aedes` 1.2.0 (MQTT broker security fixes), `@tanstack/react-query`, `lucide-react`, `jsdom`, `puppeteer`, `supertest`, the CodeQL actions, and the production and development groups. (#5435–#5444)
+
+### Fixed
+- **Packet Monitor** logged firmware 2.8's NodeDB replay burst (~50 packets on every connect) as fresh LoRa receptions after a MeshMonitor restart. Packets with a stale `rx_time` and no RSSI are now skipped. (#5426, #5450)
+- **MeshCore Last Heard** took the sender's clock, so nodes with no RTC stayed pinned at a 2024 default. It now uses the companion's own clock (`last_mod`). (#5339, #5451)
+- **MeshCore contacts with binary names.** The serial protocol has no checksum, so dropped bytes spliced frames into bogus contacts. Corrupt contact frames are now dropped and binary node names scrubbed. (#5460)
+- **MeshCore neighbour polling** hit every source, drawing a 404 from each Meshtastic and MQTT source on every refetch. It now polls MeshCore sources only. (#5472)
+- **Module-excluded notices** read as a warning about the section above; they now sit under their own section header. Range Test on 2.8 shows one notice instead of two. (#5447, #5449, #5458)
+- **A phantom "Save changes" bar** appeared on the Automation page with no edits, whenever a stored setting was blank. (#5459)
+- **Status Message input** cut off its placeholder, and its counter spilled onto the next section's header. (#5457)
+- **Mobile:** the Automation, Configuration and global `/settings` pages no longer scroll sideways on a phone, trigger fields stay inside their cards, geofence hints wrap, and the Auto Responder placeholder shows in full on desktop. (#5462, #5463, #5465, #5466, #5471)
+- **Geofence Lat/Lng/Radius** fields moved the circle on every keystroke; they now commit on blur. (#5471)
+- **Maps embedded in settings pages** painted over the sticky section nav, and Automation number inputs are now bounded, with a server-side interval clamp. (#5467)
+- **`/settings`** content scrolled above the section nav; Embed profile modals ignored Escape and had an unlabelled close button; browsers reporting `en-US` hit a 404 before falling back, and `zh-CN` / `zh-TW` now load Chinese instead of English; heap telemetry drew a 401. (#5468)
+- **iOS 27 home-screen app** still fogged the Dashboard topbar; it is now pinned like the per-source header. (#5286, #5328)
+- **Login username field** no longer auto-capitalises on mobile keyboards, and gives autofill a clearer hint. Thanks @ievans! (#5430)
+
+## [4.16.2-rc5] - 2026-09-28
+
+### Added
+- **Asset tracking.** Flag a node as an asset in Node Details → Asset tracking to keep its telemetry for 1–365 days (default 90) on every source, always draw its trail, and exempt it from automated cleanups. The Nodes map draws the asset's whole retained history, thinned to keep its shape, and a playback bar replays the trip with a moving marker at 60×/600×/3600×. Migration 181. (#5354, #5411, #5419, #5422)
+- **ADS-B flight matching for likely aircraft**, off by default. When a node becomes a likely aircraft, MeshMonitor asks a community ADS-B feed (adsb.lol or adsb.fi) which flight is there, at most twice per flagging, and shows the match in the popup and details. Migration 180. (#5374, #5410)
+- **Sign-flipped position correction**, off by default, per source. A node whose latitude or longitude sign was entered wrong is shown at its mirror point when exactly one mirror lands within range (default 500 km) of the source's own node or a set point, with a notice showing the reported coordinates. Stored data never changes. Distance auto-delete, MQTT geo-ignore, automation geofences, traceroute snapshots and MeshCore contacts all use the corrected point. (#5363, #5409, #5412)
+- **Drop automation traffic at the MQTT bridge uplink**, a per-bridge option, off by default. MeshMonitor's own automated sends (auto-ack, responders, announce, timers, geofences, Automation Engine actions, auto-ping and similar) never reach the upstream broker; manual sends still do. A drop counter shows beside the ok_to_mqtt counter. (#5414, #5418)
+- **Map clustering toggle** in Settings → Map, separate from the Map Click Zoom Gate. On by default. (#5404, #5407)
+- **Helm: expose Virtual Node ports** with `service.extraPorts`, pin a LoadBalancer IP with `service.annotations` (MetalLB, kube-vip, Cilium) or `loadBalancerIP`, and optionally put the Virtual Node on its own `virtualNodeService` so the web UI can stay behind an Ingress. (#5416, #5417)
+
+### Changed
+- **MeshCore remote logins wait longer and retry.** Each attempt waits the longer of twice the firmware's estimate or 10 s, and the admin buttons try up to 3 times on silence (never on a refused password). Every login screen shows live progress and a Cancel button. Behind a reverse proxy, a worst-case login can now take about 34 s. (#5400, #5405)
+- **MeshCore neighbour lists show the whole table.** The repeater sends at most 10 neighbours per reply, so the Contact Details button and "Poll Neighbours" now fetch up to 5 pages, each spaced by the 60 s radio gap, with live progress and Cancel. The scheduled autopoll stays at 1 page (strongest first) and merges into the stored list instead of shrinking it. (#5413, #5425)
+- **OTA firmware updates run on the selected source.** Disconnect, reconnect, verify, retry and cancel act on the source the update was started from, not the primary radio, and use its custom TCP port. (#5424, #5428, #5432)
+- **OTA board map** matches the Meshtastic release file names for 2.7.x and 2.8.0: 26 ESP32 boards fixed (including Station G3 and Mini ePaper S3), 13 nRF52 boards no longer offered OTA. Six models shared by several builds are refused with a clear message, and boards with sibling builds (e.g. Heltec V4 / V4 TFT) show a warning before flashing. (#5423, #5429, #5433)
+
+### Fixed
+- **Firmware update** failed at Extract on 2.8.0, which keeps each board's binary in a platform folder. (#5402, #5403)
+- **Positions** were dated by when a packet arrived, so firmware 2.8 NodeDB replays made stale fixes look newest (and kept stale likely-aircraft badges). They now carry the observation time. (#5401, #5406)
+- **Auto-Favorite** stacked one more hourly sweep on every reconnect; packet distribution counts ignored per-channel permissions. (#5427)
+- **Nodes list header** controls overflowed a narrow sidebar instead of wrapping. (#5420, #5421)
+- **MeshCore channel reorder** could open and immediately close when clicked just as the channel list loaded. (#5431)
+
+## [4.16.2-rc4] - 2026-09-27
+
+### Added
+- **Likely-aircraft detection.** A node flying more than a set height above the terrain beneath it (default 500 m; 5000 m above sea level when there is no terrain data) is flagged as a likely aircraft. Mountaintop repeaters stay fixed. Per source, in Settings → Node Display. Migrations 175–178. (#5364, #5365, #5386, #5391, #5396)
+  - The map shows a plane badge and popup line, with a Show / Mark / Hide control in both Map Features panels.
+  - Auto-Favorite skips likely aircraft by default, and a new automation trigger fires when a node becomes one.
+  - Optional age-out ignores (or, opt-in, deletes) aircraft not heard for N hours, and lifts the ignore when a live position arrives. A node that stays put is reclassified as fixed.
+  - Flight trails, off by default, draw each aircraft's recent path with a 1 h–7 day lookback.
+  - MQTT sources now store position history, so Position History and trails work for nodes heard only over MQTT.
+- **First Heard** for Meshtastic and MeshCore nodes, per source: set once from the first believable reception and never overwritten. Shown in node details, map popups and the node export. Migration 179 fills it for existing nodes from the earlier of `createdAt` and Last Heard. (#5390, #5395)
+- **Nodes tab quick age filter** (Setting / 24h / 3d / 7d / 30d / All) in the Nodes header. It changes the view only, never the saved setting, and applies to the Nodes list and its map for Meshtastic and MeshCore. (#5387, #5394)
+- **MeshCore channel order:** a sort dropdown on the Channels page (device order, name, last message, custom), with drag-and-drop for the custom order. Stored per browser. (#5385, #5392)
+- **Reorder MeshCore channel slots on the companion** from Channels settings. Each slot write is read back, a failure restores the original layout, and message history, unread markers, scope, per-channel permissions and MeshCore auto-ack / announce / responder / timer settings follow each channel. Connected Virtual Node apps are disconnected so they re-read the list. Automations that name a raw channel number are listed for review, not rewritten. (#5379, #5397)
+- **Unified Messages hop counts:** each source tag shows how many hops that source heard the message at (`?` when unknown). (#5366, #5393)
+- **Transmit target window** (Settings → Node Display, default 24 h, 1–720): when the node window is 0 ("all"), auto-traceroute, the remote-admin scanner and remote LocalStats pick targets from nodes heard within this window instead of none. (#5376, #5384)
+- **Virtual Node PKI import** opt-in (`allowPkiImport`, off by default) for the MeshCore ImportPrivateKey command, and a Virtual Node card on the MeshCore Node Info view showing its status, admin and PKI settings. (#5350, #5372, #5380, #5381)
+
+### Changed
+- **The three node-age controls say what they do:** the sidebar pill is informational, "Node list & map window (hours)" sets the default, and the map's age filter can only narrow it. The Nodes header shows the active window. (#5344, #5373)
+- **MQTT and MeshCore sources no longer borrow the primary Meshtastic radio.** Sends, mesh requests, channel pushes, device config, remote admin and connect/disconnect from those sources are refused (`SOURCE_NOT_MESHTASTIC`), and status routes report the source's own state. Send controls on MQTT sources are disabled with an explanation. A disconnected TCP source returns `SOURCE_NOT_CONNECTED`. (#5367, #5371, #5375, #5383)
+- **Virtual Node companion commands:** remove, rename, favourite, reset path, import contact and reboot are now handled (admin-gated), along with share/export contact and stats. Private-key import and raw data are refused unless opted in. (#5350, #5372)
+
+### Fixed
+- **Security:** an MQTT broker source's Info and Device Config tabs showed, and could write to, the primary TCP node, including its private key. (#5367, #5371)
+- **Max node age 0** hid every non-favourite node in the per-source Nodes tab and removed all neighbour links from the map. It now means "all nodes". (#5338, #5352, #5378)
+- **MeshCore**
+  - A powered-off node's Last Heard kept advancing: contact syncs, path resets and failed DMs stamped it with "now". (#5341, #5343)
+  - Nodes with a drifted clock (year 2000 or 2087) broke Last Heard sorting and pinned messages to the wrong place in the channel. Implausible times now fall back to receipt time, and stored bad values heal. (#5339, #5342)
+  - New-node notifications never fired for companions in auto-add mode, because the first advert has no name. (#5340, #5370)
+- **Local node number** was read from a key the manager never writes, so `/api/config`, spam detection, telemetry security badges and distance auto-delete missed the local node on every source except the default. (#5377, #5382)
+- **Mesh Issues C2 "Broadcasting too often"** flagged MeshMonitor's own directly connected nodes because of their phone-only telemetry. (#5388, #5389)
+- **MQTT text messages** were stored without hop data. (#5393)
+- **Global Settings** lost its Sorting section. (#5368, #5369)
+- **`watch-release.sh`** could report a stale run as the release result. (#5362)
+
+## [4.16.2-rc3] - 2026-09-25
+
+### Added
+- **Coverage Report** replaces the Range Test module that firmware 2.8 removed, and it's passive: MeshMonitor sends nothing. Every position fix a radio source hears is stored with that radio's SNR, RSSI and hop data, and Reports → Coverage plots the fixes on a map coloured by signal. Drive a GPS node around and read the map.
+  - MQTT gateways (opt-in recording) and MeshCore receptions also count as receivers.
+  - The report adds coverage gaps, a summary, a grid view, export, deep links and saved surveys.
+  - Recordings are kept for 7 days by default (Global Settings → Coverage Report). (#5277, #5334, #5336, #5337, #5348, #5353)
+- **Per-transport breakdown (RF / UDP / MQTT)**, with migrations 169–171. (#5101, #5329, #5330, #5332)
+  - Network Survey hop buckets, the Packet Distribution cards, Total Nodes and Total Messages split by transport.
+  - Total Messages is now a real count, not the last 100 messages.
+  - Record Holder and Longest Active route segments keep one record per transport.
+  - Counters the firmware reports itself (Radio Statistics, Packets TX/RX and the "(Device)" charts) are labelled as covering all transports.
+  - New "Traffic by Transport" charts (nodes heard and packets received, in 5-minute bins) appear on the Info tab and as Dashboard favourites.
+- **Purge telemetry outliers.** Use "Clean outliers…" in a telemetry chart's menu, or a source-wide sweep in Settings. It shows a preview, then removes readings more than k × MAD from the series median and/or outside min/max bounds. Admin-only, and each purge is audit-logged. (#5333, #5335)
+- **`{{ trigger.packetHash }}`** on MeshCore "A message is received" automations: the 16-character on-wire packet hash, for linking a message to CoreScope maps such as `map.meshcore.com.hr/#/packets/<hash>`. Best-effort for DMs. (#5357, #5359)
+- **MeshCore "Add to radio"** adds a node the radio hasn't stored to its contact list, so you can log in to it. If the list is full, favourites are never evicted. (#5349, #5351)
+- **User Scripts Gallery:** Discord Webhook DM / PUBLIC. (#5345, #5346)
+
+### Changed
+- **MeshCore adverts default to zero-hop, and automated flood adverts are limited to one per hour per source.** That covers the auto-announce burst, timer triggers and the automation advert action, and the limit survives restarts. A manual flood advert asks for confirmation and states its airtime cost. Saved configs with no mode set keep flooding, but fall under the hourly limit. (#5347)
+- **Longest Active and Record Holder cards need `traceroute:read`** on the source, and Clear Record needs `traceroute:write`. They used `info` before, which applies across all sources and so could not limit them to one. (#5330)
+
+### Fixed
+- **MeshCore**
+  - The node list no longer shrinks to just the radio's contacts on every contact update. (#5349, #5351)
+  - Logging in to, querying or messaging a node the radio doesn't hold reports `CONTACT_NOT_ON_DEVICE` instead of a generic failure. (#5351)
+  - A short key prefix that matches several contacts no longer resolves to the first one, which misnamed repeaters from path hashes. (#5351)
+  - Channel messages are matched to their raw frame by decryption, so route, SNR and RSSI no longer attach to the wrong message. (#5359)
+- **PostgreSQL restore** advances serial sequences, so inserts after a restore no longer collide or get silently dropped. Migration 174 repairs installs that were already restored. (#5355)
+- **Per-transport counts** (#5329, #5332):
+  - MQTT-ingested traceroutes were classified as RF.
+  - Packets marked only `viaMqtt` were logged as LoRa.
+  - A new node's first transport stamp was dropped.
+  - Firmware 2.8 NodeDB replays were counted as live receptions.
+- **Channels:** deleting a channel now removes its row and messages, and cards shift while you drag to reorder. (#5324, #5326)
+- **Position History:** the heading triangle no longer blocks hover and click on the dot beneath it. (#5356, #5358)
+- **Dashboard Packet Rate card** is limited to the selected source, and starring a derived chart now keeps its underlying data from being pruned. (#5332)
+
+## [4.16.2-rc2] - 2026-09-23
+
+### Added
+- **Add a node from a Meshtastic contact URL.** Paste a `meshtastic.org/v/#...` link into "+ Add from URL" in the node list to add a node this source has never heard, so it can be messaged before any packet arrives. The row carries an "Imported" badge until the node is actually heard. Nothing is sent over the mesh. (#5317, #5318)
+- **Scheduled NodeInfo Enrichment.** Settings → Auto-Enrichment runs the Enrichment "Fix All" on an interval or cron schedule. Off by default. Schedules are floored at one hour; the optional push to the device NodeDB sends at most 25 NodeInfo requests per run, 30 s apart, and the timer survives restarts and settings saves without firing early. (#5287, #5322)
+
+### Fixed
+- **iOS home-screen app:** the node list fills the phone (#5316), and the status-bar blur gap from #5286 now also applies when the user agent carries no `Version/NN` token. (#5319)
+- **LoRa frequency readout for any preset that is not 250 kHz wide.** Firmware ignores `bandwidth`/`spread_factor`/`coding_rate` whenever a modem preset is in use, and never writes the preset's parameters back into them, so those fields sit stale — a bench radio on Long Turbo reported Medium Fast's `250 / 9 / 5`. The frequency was computed from that stale bandwidth, and the channel grid is bandwidth-spaced, so Long Turbo, Short Turbo and Medium Turbo (500 kHz) and Long Slow / Long Moderate (125 kHz) all reported the wrong centre frequency — a US node on Long Turbo channel 14 showed 905.375 MHz while transmitting on 908.750 MHz. The bandwidth now follows `use_preset`, as firmware does; a genuine manual bandwidth is still honoured. Long Fast is 250 kHz, so it was never affected. The panel also reported the stale bandwidth itself, and now reports the effective one. (#5320, #5321)
+- **Modem presets 9-16 show their name** instead of `Unknown (9)` in the LoRa Radio Configuration panel, and back up as `LONG_TURBO` rather than a bare number. The display map, the backup enum map and the bandwidth table were three independent literals that had each drifted at `SHORT_TURBO`; they now read one canonical table in `src/utils/loraFrequency.ts`. (#5320, #5321)
+- **Restoring a backup naming a preset above `SHORT_TURBO`** (including one exported by the Meshtastic CLI) passed the preset through to the radio as a string instead of its enum number. (#5320, #5321)
+- **Medium Turbo link budget** — `rxSensitivityForModemPreset` returned no sensitivity figure for a preset the configuration UI offers. (#5320, #5321)
+
+## [4.16.2-rc1] - 2026-09-21
+
+### Added
+- **MeshCore MULTIPART and CONTROL payloads** are decoded rather than shown as unknown types. (#5285, #5308)
+
+### Fixed
+- **MQTT-only deployments show their own data** instead of an empty dashboard. (#5283)
+- **Large node sets are usable again** — the node list is virtualized and map markers cluster at low zoom, so a mesh fed from MQTT no longer drags scrolling and panning to a crawl. `/api/poll` is also fetched once at mount rather than three times. (#5284)
+- **Map Analysis hop shading** counts hops only from traceroutes the local node took part in, so remote nodes no longer render as 0-hop. (#5289)
+- **Unified position drift** — a node's position is picked by the freshest observation rather than the newest `lastHeard`, which also reconciles manual position-request responses across sources. (#5292, #5293, #5314)
+- **iOS 27 home-screen app:** the header title no longer renders inside the system status-bar blur. (#5286)
+- **iOS 27 mobile portrait:** the collapsed node-list arrow no longer overlaps the open Map controls sheet, and a long custom POSIX timezone stays inside its field with the chevron. (#5291)
+- **MeshCore source page in landscape** now uses the mobile layout instead of keeping its desktop one, which left the nav row mid-page and the content pane empty. (#5311, #5312)
+
 ## [4.16.1] - 2026-09-18
 
 ### Added

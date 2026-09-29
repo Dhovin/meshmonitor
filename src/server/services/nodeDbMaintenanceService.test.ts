@@ -46,6 +46,34 @@ vi.mock('../protobufService.js', () => ({
 import { mapDbNodeToDeviceInfo, NodeDbMaintenanceService } from './nodeDbMaintenanceService.js';
 
 describe('mapDbNodeToDeviceInfo', () => {
+  /**
+   * #5317: this mapper is an explicit allowlist, so a new column reaches the
+   * client only if it is named here. `importedAt` was added to the schema, the
+   * repository and the route, and still arrived undefined in /api/poll until
+   * this line existed — the node list could not badge an imported node.
+   */
+  it('carries importedAt through so the client can badge a never-heard import', () => {
+    const result = mapDbNodeToDeviceInfo({
+      nodeNum: 0x3f60a525,
+      nodeId: '!3f60a525',
+      longName: 'Rigel',
+      shortName: 'Rig',
+      importedAt: 1_700_000_000_000,
+    });
+    expect(result.importedAt).toBe(1_700_000_000_000);
+  });
+
+  it('omits importedAt for a node that was heard rather than imported', () => {
+    const result = mapDbNodeToDeviceInfo({
+      nodeNum: 0x3f60a525,
+      nodeId: '!3f60a525',
+      longName: 'Rigel',
+      shortName: 'Rig',
+      importedAt: null,
+    });
+    expect(result.importedAt).toBeUndefined();
+  });
+
   it('passes nodeNum through verbatim (BIGINT coercion happens upstream in the repository, not here)', () => {
     const node = {
       nodeNum: 123456789,
@@ -94,6 +122,103 @@ describe('mapDbNodeToDeviceInfo', () => {
     expect(result2.isFavorite).toBe(true);
     expect(result2.isIgnored).toBe(false);
     expect(result2.position).toEqual({ latitude: 1.5, longitude: 2.5, altitude: 10 });
+  });
+
+  /**
+   * #5101 WP4 / R1: the four transport-stamp fields the client's
+   * `getNodeTransportClasses` reads. Without this pass-through the
+   * per-source Nodes map fell back to `viaMqtt` alone (no UDP, no #4240
+   * decay) — see finding 1 in TRANSPORT_BREAKDOWN_P1_SPEC.md.
+   */
+  it('passes the four transport-stamp fields through, Number-coerced', () => {
+    const node = {
+      nodeNum: 1,
+      nodeId: '!00000001',
+      longName: '',
+      shortName: '',
+      transportMechanism: 5,
+      transportLastRf: 1_700_000_000,
+      transportLastMqtt: 1_700_000_100,
+      transportLastUdp: 1_700_000_200,
+    };
+    const result: any = mapDbNodeToDeviceInfo(node);
+    expect(result.transportMechanism).toBe(5);
+    expect(result.transportLastRf).toBe(1_700_000_000);
+    expect(result.transportLastMqtt).toBe(1_700_000_100);
+    expect(result.transportLastUdp).toBe(1_700_000_200);
+  });
+
+  it('coerces PG BIGINT strings on the transport stamps to numbers', () => {
+    const node = {
+      nodeNum: 1,
+      nodeId: '!00000001',
+      longName: '',
+      shortName: '',
+      transportLastRf: '1700000000' as unknown as number,
+    };
+    const result: any = mapDbNodeToDeviceInfo(node);
+    expect(result.transportLastRf).toBe(1700000000);
+    expect(typeof result.transportLastRf).toBe('number');
+  });
+
+  it('omits the transport-stamp fields the row does not carry', () => {
+    const node = { nodeNum: 1, nodeId: '!00000001', longName: '', shortName: '' };
+    const result: any = mapDbNodeToDeviceInfo(node);
+    expect(result.transportMechanism).toBeUndefined();
+    expect(result.transportLastRf).toBeUndefined();
+    expect(result.transportLastMqtt).toBeUndefined();
+    expect(result.transportLastUdp).toBeUndefined();
+  });
+
+  /**
+   * #5364/#5365: the likely-aircraft classification fields. SQLite stores
+   * `likelyAircraft` as 0/1 — the mapper must coerce it to a real boolean,
+   * not pass the integer through.
+   */
+  it('maps the likely-aircraft classification fields (SQLite 1 -> true)', () => {
+    const node = {
+      nodeNum: 1,
+      nodeId: '!00000001',
+      longName: '',
+      shortName: '',
+      likelyAircraft: 1,
+      aircraftBasis: 'agl',
+      groundElevation: 200,
+      heightAboveGround: 3000,
+    };
+    const result: any = mapDbNodeToDeviceInfo(node);
+    expect(result.likelyAircraft).toBe(true);
+    expect(result.aircraftBasis).toBe('agl');
+    expect(result.groundElevation).toBe(200);
+    expect(result.heightAboveGround).toBe(3000);
+  });
+
+  it('maps likelyAircraft=0 to false, not omitted', () => {
+    const node = { nodeNum: 1, nodeId: '!00000001', longName: '', shortName: '', likelyAircraft: 0, aircraftBasis: 'msl' };
+    const result: any = mapDbNodeToDeviceInfo(node);
+    expect(result.likelyAircraft).toBe(false);
+    expect(result.aircraftBasis).toBe('msl');
+  });
+
+  it('omits the aircraft fields the row does not carry (never classified)', () => {
+    const node = { nodeNum: 1, nodeId: '!00000001', longName: '', shortName: '' };
+    const result: any = mapDbNodeToDeviceInfo(node);
+    expect(result.likelyAircraft).toBeUndefined();
+    expect(result.aircraftBasis).toBeUndefined();
+    expect(result.groundElevation).toBeUndefined();
+    expect(result.heightAboveGround).toBeUndefined();
+    expect(result.aircraftAgedOutAt).toBeUndefined();
+    expect(result.aircraftFixedAt).toBeUndefined();
+  });
+
+  it('maps the Phase 2 aged-out and fixed marks (#5364/#5365)', () => {
+    const node = {
+      nodeNum: 1, nodeId: '!00000001', longName: '', shortName: '',
+      aircraftAgedOutAt: '1700000000000', aircraftFixedAt: 1_700_000_000_500,
+    };
+    const result: any = mapDbNodeToDeviceInfo(node);
+    expect(result.aircraftAgedOutAt).toBe(1_700_000_000_000);
+    expect(result.aircraftFixedAt).toBe(1_700_000_000_500);
   });
 });
 
@@ -255,6 +380,20 @@ describe('NodeDbMaintenanceService', () => {
       expect(result[0].deviceMetrics?.noiseFloor).toBe(-95);
       // #5033: the uptime sample's timestamp rides along as telemetryTimestamp.
       expect(result[0].telemetryTimestamp).toBe(1700);
+    });
+
+    it('#5390: carries firstHeard through, Number-coerced, and omits it when unknown', async () => {
+      getAllNodes.mockResolvedValue([
+        { nodeNum: 7, nodeId: '!00000007', longName: '', shortName: '', lastHeard: 1_760_000_100, firstHeard: '1760000000' },
+        { nodeNum: 8, nodeId: '!00000008', longName: '', shortName: '', lastHeard: 1_760_000_100, firstHeard: null },
+      ]);
+      getLatestTelemetrySampleForAllNodes.mockResolvedValue(new Map());
+      getLatestTelemetryValueForAllNodes.mockResolvedValue(new Map());
+      const svc = new NodeDbMaintenanceService(makeFakeManager() as any);
+
+      const result: any[] = await svc.getAllNodesAsync('source-A');
+      expect(result[0].firstHeard).toBe(1_760_000_000);
+      expect(result[1].firstHeard).toBeUndefined();
     });
   });
 });

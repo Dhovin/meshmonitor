@@ -11,12 +11,16 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const getAllNodes = vi.fn();
 const getDirectNeighborRssiAsync = vi.fn();
 const getHopCounts = vi.fn();
+const getSetting = vi.fn();
 
 vi.mock('../../services/database.js', () => ({
   default: {
     get nodes() { return { getAllNodes }; },
     get neighbors() { return { getDirectNeighborRssiAsync }; },
     get analysis() { return { getHopCounts }; },
+    get settings() {
+      return { getSetting, getLocalNodeNumForSource: (id: string) => getSetting(`localNodeNum_${id}`) };
+    },
   },
 }));
 
@@ -28,6 +32,7 @@ beforeEach(() => {
   getAllNodes.mockReset().mockResolvedValue([]);
   getDirectNeighborRssiAsync.mockReset().mockResolvedValue(new Map());
   getHopCounts.mockReset().mockResolvedValue({ entries: [] });
+  getSetting.mockReset().mockImplementation(async (key: string) => (key === `localNodeNum_${SRC}` ? '1' : null));
 });
 
 describe('clampWindowHours', () => {
@@ -47,18 +52,51 @@ describe('clampWindowHours', () => {
 describe('bucketHops', () => {
   it('counts nodes per hop distance, ascending', () => {
     expect(bucketHops([{ hops: 2 }, { hops: 0 }, { hops: 2 }, { hops: 1 }])).toEqual([
-      { hops: 0, nodeCount: 1 },
-      { hops: 1, nodeCount: 1 },
-      { hops: 2, nodeCount: 2 },
+      { hops: 0, nodeCount: 1, byTransport: { rf: 1, udp: 0, mqtt: 0 } },
+      { hops: 1, nodeCount: 1, byTransport: { rf: 1, udp: 0, mqtt: 0 } },
+      { hops: 2, nodeCount: 2, byTransport: { rf: 2, udp: 0, mqtt: 0 } },
     ]);
   });
 
   it('keeps hop 0 — direct contacts are a real bucket, not "no data"', () => {
-    expect(bucketHops([{ hops: 0 }])).toEqual([{ hops: 0, nodeCount: 1 }]);
+    expect(bucketHops([{ hops: 0 }])).toEqual([
+      { hops: 0, nodeCount: 1, byTransport: { rf: 1, udp: 0, mqtt: 0 } },
+    ]);
   });
 
   it('drops nonsense hop values instead of charting them', () => {
-    expect(bucketHops([{ hops: -1 }, { hops: NaN }, { hops: 3 }])).toEqual([{ hops: 3, nodeCount: 1 }]);
+    expect(bucketHops([{ hops: -1 }, { hops: NaN }, { hops: 3 }])).toEqual([
+      { hops: 3, nodeCount: 1, byTransport: { rf: 1, udp: 0, mqtt: 0 } },
+    ]);
+  });
+
+  it('splits a bucket by transport class', () => {
+    expect(bucketHops([
+      { hops: 2, transport: 'rf' },
+      { hops: 2, transport: 'udp' },
+      { hops: 2, transport: 'mqtt' },
+      { hops: 2, transport: 'mqtt' },
+    ])).toEqual([
+      { hops: 2, nodeCount: 4, byTransport: { rf: 1, udp: 1, mqtt: 2 } },
+    ]);
+  });
+
+  it('treats a missing transport as rf — the same fallback as the record class', () => {
+    expect(bucketHops([{ hops: 1 }, { hops: 1, transport: 'mqtt' }])).toEqual([
+      { hops: 1, nodeCount: 2, byTransport: { rf: 1, udp: 0, mqtt: 1 } },
+    ]);
+  });
+
+  it('every bucket satisfies nodeCount === rf + udp + mqtt', () => {
+    const buckets = bucketHops([
+      { hops: 0, transport: 'rf' },
+      { hops: 0, transport: 'udp' },
+      { hops: 1, transport: 'mqtt' },
+      { hops: 1 },
+    ]);
+    for (const b of buckets) {
+      expect(b.nodeCount).toBe(b.byTransport.rf + b.byTransport.udp + b.byTransport.mqtt);
+    }
   });
 });
 
@@ -68,7 +106,11 @@ describe('buildNetworkSurvey', () => {
     // reports packets heard by OTHER radios as this radio's neighbours.
     await buildNetworkSurvey(SRC, 12);
     expect(getDirectNeighborRssiAsync).toHaveBeenCalledWith(12, SRC);
-    expect(getHopCounts).toHaveBeenCalledWith({ sourceIds: [SRC] });
+    expect(getHopCounts).toHaveBeenCalledWith({
+      sourceIds: [SRC],
+      localNodeNums: new Map([[SRC, 1]]),
+      includeTransport: true,
+    });
     expect(getAllNodes).toHaveBeenCalledWith(SRC);
   });
 

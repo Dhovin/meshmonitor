@@ -37,7 +37,13 @@ import meshcorePositionHistoryService from '../services/meshcorePositionHistoryS
 import { isBogusPosition } from '../../utils/nullIsland.js';
 import { managerFor, isValidPublicKey, auditMeshcoreEvent, parseHexPathChain, requireMeshcoreTx, failIfTxDisabled, maskContactPositionsForViewOnMap } from './meshcoreRouteShared.js';
 import { ok, fail } from '../utils/apiResponse.js';
+import {
+  getMeshCoreNeighboursFetchRegistry,
+  isValidNeighboursRequestId,
+} from '../services/meshcoreNeighboursFetchProgress.js';
+import { MANUAL_NEIGHBOURS_MAX_PAGES } from '../services/meshcoreNeighboursPaging.js';
 import { buildLocalContactRow, withoutLocalFlag, type MeshCoreContactResponse } from './meshcoreLocalContactRow.js';
+import { applySignFlipToMeshCoreRows } from '../services/signFlipCorrection.js';
 
 const router = Router({ mergeParams: true });
 
@@ -47,11 +53,11 @@ const router = Router({ mergeParams: true });
  */
 router.get('/nodes', optionalAuth(), requirePermission('nodes', 'read', { sourceIdFrom: 'params.id' }), async (req: Request, res: Response) => {
   try {
-    const nodes = await maskContactPositionsForViewOnMap(
+    const nodes = await applySignFlipToMeshCoreRows(await maskContactPositionsForViewOnMap(
       await managerFor(req, res).getAllNodes(),
       req.user ?? null,
       req.params.id,
-    );
+    ), req.params.id); // #5363 display-only sign-flip correction
     res.json({
       success: true,
       data: nodes,
@@ -125,11 +131,11 @@ router.get('/contacts', optionalAuth(), requirePermission('nodes', 'read', { sou
       allContacts.unshift(buildLocalContactRow(localNode));
     }
 
-    const masked = await maskContactPositionsForViewOnMap(
+    const masked = await applySignFlipToMeshCoreRows(await maskContactPositionsForViewOnMap(
       allContacts,
       req.user ?? null,
       req.params.id,
-    );
+    ), req.params.id); // #5363
 
     res.json({
       success: true,
@@ -170,7 +176,10 @@ router.post('/contacts/refresh', meshcoreDeviceLimiter, requireAuth(), requirePe
     // nodes:write (required above) does not imply nodes:viewOnMap — mask the
     // same as GET /contacts so refreshing doesn't become a side-channel
     // around the read-path's position gate (#4559 review follow-up).
-    const masked = await maskContactPositionsForViewOnMap(allContacts, req.user ?? null, req.params.id);
+    const masked = await applySignFlipToMeshCoreRows(
+      await maskContactPositionsForViewOnMap(allContacts, req.user ?? null, req.params.id),
+      req.params.id,
+    ); // #5363
 
     res.json({
       success: true,
@@ -617,6 +626,89 @@ router.delete(
 );
 
 /**
+ * POST /api/sources/:id/meshcore/contacts/:publicKey/add-to-device
+ *
+ * Add a node MeshMonitor knows about to the companion radio's own contact
+ * table, so the radio can log in to / query / message it (#5349). Local
+ * serial write (CMD_ADD_UPDATE_CONTACT) — nothing is transmitted, so no
+ * receive-only gate. Same `nodes:write` scoping as the other contact-table
+ * edits (remove / import).
+ *
+ * Body: { confirmFull?: boolean }
+ *
+ * When the radio's table is full (or its capacity can't be read) the first
+ * call answers 409 CONTACT_TABLE_FULL_CONFIRM with { count, maxContacts };
+ * the UI confirms and repeats with confirmFull:true. Favourites are never
+ * put at risk: see MeshCoreManager.addContactToDevice.
+ */
+router.post(
+  '/contacts/:publicKey/add-to-device',
+  meshcoreDeviceLimiter,
+  requireAuth(),
+  requirePermission('nodes', 'write', { sourceIdFrom: 'params.id' }),
+  async (req: Request, res: Response) => {
+    try {
+      const publicKey = String(req.params.publicKey ?? '').toLowerCase();
+      if (!isValidPublicKey(publicKey)) {
+        return fail(res, 400, 'INVALID_PUBLIC_KEY', 'Invalid public key format (expected 64-character hex string)');
+      }
+      const confirmFull = (req.body as { confirmFull?: unknown } | undefined)?.confirmFull === true;
+      const result = await managerFor(req, res).addContactToDevice(publicKey, { confirmFull });
+      auditMeshcoreEvent(req, 'meshcore_contact_add_to_device', 'configuration', {
+        sourceId: req.params.id,
+        publicKey,
+        confirmFull,
+        status: result.status,
+        ...(result.status === 'added' ? { evicted: result.evicted } : {}),
+      });
+      switch (result.status) {
+        case 'added':
+          return ok(res, result);
+        case 'already_on_device':
+          return ok(res, result);
+        case 'confirm_full':
+          return fail(
+            res,
+            409,
+            'CONTACT_TABLE_FULL_CONFIRM',
+            result.maxContacts === null
+              ? "Couldn't read how many contacts the radio can hold. If its list is full, adding may replace the oldest non-favourite contact (or the radio will refuse)."
+              : `The radio's contact list is full (${result.count}/${result.maxContacts}). Adding may replace the oldest non-favourite contact (or the radio will refuse).`,
+            { count: result.count, maxContacts: result.maxContacts },
+          );
+        case 'favorites_unprotected':
+          return fail(
+            res,
+            409,
+            'FAVORITES_NOT_PROTECTED',
+            'Not added: some favourites are not yet protected on the radio, so a full contact list could evict them. Try again once the radio has synced.',
+            { unprotected: result.unprotected },
+          );
+        case 'table_full':
+          return fail(
+            res,
+            409,
+            'CONTACT_TABLE_FULL',
+            "The radio refused: its contact list is full and it is not set to replace old contacts (or every contact is a favourite). Remove a contact first.",
+            { count: result.count, maxContacts: result.maxContacts },
+          );
+        case 'unknown_type':
+          return fail(res, 422, 'UNKNOWN_NODE_TYPE', 'The node type is unknown, so it cannot be added yet. Wait for it to advertise.');
+        case 'not_found':
+          return fail(res, 404, 'CONTACT_NOT_FOUND', 'Unknown node');
+        case 'unavailable':
+          return fail(res, 409, 'COMPANION_NOT_CONNECTED', 'Adding contacts needs a connected Companion radio');
+        default:
+          return fail(res, 502, 'ADD_CONTACT_FAILED', result.error);
+      }
+    } catch (error) {
+      logger.error('[API] Error adding contact to device:', error);
+      return fail(res, 500, 'ADD_CONTACT_FAILED', 'Failed to add contact to the radio');
+    }
+  },
+);
+
+/**
  * GET /api/sources/:id/meshcore/contacts/:publicKey/export
  *
  * Export a contact as a signed advert blob suitable for sharing via
@@ -697,9 +789,11 @@ router.post(
 /**
  * GET /api/sources/:id/meshcore/contacts/:publicKey/neighbours
  *
- * Query the neighbour list from a remote repeater node. Returns an array
- * of { publicKeyPrefix, heardSecondsAgo, snr } entries. Requires the
- * target to be a repeater running firmware v1.9.0+.
+ * Query ONE page of the neighbour list from a remote repeater node. Returns
+ * an array of { publicKeyPrefix, heardSecondsAgo, snr } entries. Requires
+ * the target to be a repeater running firmware v1.9.0+. A reply holds at
+ * most 10 entries whatever `count` says (#5413); the UI reads whole tables
+ * through the paged `/nodes/:publicKey/neighbours/fetch` job instead.
  *
  * Query params: count (default 10), offset (default 0),
  *   orderBy (0=newest, 1=oldest, 2=strongest, 3=weakest)
@@ -730,22 +824,15 @@ router.get(
           error: 'Get neighbours failed — source disconnected, not a Companion, or firmware too old',
         });
       }
-      const sourceId = (req.params as { id?: string }).id!;
-      const resolved = result.neighbours.map((n: { publicKeyPrefix: string; heardSecondsAgo: number; snr: number }) => {
-        const contact = manager.resolveContactByPrefix(n.publicKeyPrefix);
-        return { ...n, name: contact?.advName ?? contact?.name ?? null, fullPublicKey: contact?.publicKey ?? null };
-      });
+      const resolved = manager.resolveNeighbours(result.neighbours);
 
-      // Persist to meshcore_neighbor_info so the data survives page refreshes.
-      const toStore = resolved
-        .filter((n: { fullPublicKey: string | null }) => n.fullPublicKey != null)
-        .map((n: { fullPublicKey: string | null; snr: number; heardSecondsAgo: number }) => ({
-          neighborPublicKey: n.fullPublicKey!,
-          snr: n.snr,
-          lastHeardSecs: n.heardSecondsAgo,
-        }));
-      if (toStore.length > 0) {
-        databaseService.meshcore.insertNeighborsBatch(sourceId, publicKey, toStore)
+      // Persist so the data survives page refreshes. One reply holds at most
+      // 10 entries (#5413), so this is usually one page of a larger table:
+      // it replaces the stored set only when it covers the whole table, and
+      // otherwise merges so it cannot shrink a fuller set.
+      if (result.neighbours.length > 0) {
+        const complete = offset === 0 && result.neighbours.length >= result.total;
+        manager.storeNeighbours(publicKey, result.neighbours, result.total, complete)
           .catch((err: Error) => logger.warn('[API] Failed to persist neighbours:', err.message));
       }
 
@@ -1025,11 +1112,14 @@ router.get(
 /**
  * POST /api/sources/:id/meshcore/nodes/:publicKey/neighbours/poll
  *
- * Manually request this node's neighbour table immediately, outside the
- * scheduler's cadence (#4618). Honours the same per-source 60s mesh-TX gate
- * as the scheduler and the telemetry poll, so the button can't be spammed
- * onto the air. Gated by `nodes:read` (a manual poll is a user-initiated
- * read that happens to transmit) and rate-limited by `meshcoreDeviceLimiter`.
+ * Request ONE page of this node's neighbour table immediately, outside the
+ * scheduler's cadence (#4618), exactly as the scheduler does it (strongest
+ * first, merged into the stored set). Kept for API clients; the UI's "Poll
+ * Neighbours" button now runs the paged `/neighbours/fetch` job (#5413).
+ * Honours the same per-source 60s mesh-TX gate as the scheduler and the
+ * telemetry poll, so the button can't be spammed onto the air. Gated by
+ * `nodes:read` (a manual poll is a user-initiated read that happens to
+ * transmit) and rate-limited by `meshcoreDeviceLimiter`.
  */
 router.post(
   '/nodes/:publicKey/neighbours/poll',
@@ -1090,6 +1180,148 @@ router.post(
     }
   },
 );
+
+/** The caller's user id: session login or API token (both set `req.user`). */
+function requestUserId(req: Request): number | null {
+  const id = (req.user as { id?: unknown } | undefined)?.id ?? req.session?.userId;
+  return typeof id === 'number' ? id : null;
+}
+
+/**
+ * POST /api/sources/:id/meshcore/nodes/:publicKey/neighbours/fetch
+ * Body: { requestId: string }
+ *
+ * Start a paged read of this repeater's whole neighbour table (#5413): up to
+ * five pages of 10, each waiting the shared per-source 60 s mesh-TX floor, so
+ * it can run for about five minutes. Answers at once; the fetch runs in the
+ * background and the client polls GET `.../neighbours/fetch/:requestId` for
+ * progress, the neighbours gathered so far, and the outcome, and can stop it
+ * with POST `.../neighbours/fetch/:requestId/cancel`.
+ *
+ * One fetch per source at a time. When the caller already runs one on this
+ * source, the answer is 409 NEIGHBOURS_FETCH_IN_PROGRESS carrying that
+ * fetch's `requestId` (and `publicKey`) so the UI can re-attach to it; for
+ * another user's fetch it carries no id. Same permission and rate limit as
+ * the single-shot poll.
+ */
+router.post(
+  '/nodes/:publicKey/neighbours/fetch',
+  meshcoreDeviceLimiter,
+  requireAuth(),
+  requirePermission('nodes', 'read', { sourceIdFrom: 'params.id' }),
+  requireMeshcoreTx(),
+  async (req: Request, res: Response) => {
+    try {
+      const sourceId = (req.params as { id: string }).id;
+      const { publicKey } = req.params;
+      if (!isValidPublicKey(publicKey)) {
+        return fail(res, 400, 'INVALID_PUBLIC_KEY', 'Invalid public key format (expected 64-character hex string)');
+      }
+      const requestId = (req.body as { requestId?: unknown } | undefined)?.requestId;
+      if (!isValidNeighboursRequestId(requestId)) {
+        return fail(res, 400, 'INVALID_REQUEST_ID', 'requestId must be 8-64 characters of A-Z, a-z, 0-9, _ or -');
+      }
+      const userId = requestUserId(req);
+      if (userId === null) return fail(res, 401, 'UNAUTHORIZED', 'Authentication required');
+
+      const manager = managerFor(req, res);
+      if (!manager.isConnected()) {
+        return fail(res, 409, 'SOURCE_NOT_CONNECTED', 'MeshCore source is not connected');
+      }
+
+      const registry = getMeshCoreNeighboursFetchRegistry();
+      const started = registry.start(requestId, userId, sourceId, publicKey, MANUAL_NEIGHBOURS_MAX_PAGES);
+      if (!started.ok) {
+        if (started.reason === 'id-in-use') {
+          return fail(res, 409, 'NEIGHBOURS_REQUEST_ID_IN_USE', 'A neighbours fetch with this requestId is already tracked');
+        }
+        if (started.reason === 'busy') {
+          return fail(res, 409, 'NEIGHBOURS_FETCH_IN_PROGRESS', 'A neighbours fetch is already running on this source', {
+            activeRequestId: started.active?.mine ? started.active.requestId : null,
+            activePublicKey: started.active?.publicKey ?? null,
+          });
+        }
+        return fail(res, 409, 'TOO_MANY_NEIGHBOURS_FETCHES', 'Too many neighbours fetches tracked; try again shortly');
+      }
+      const { handle } = started;
+
+      // Advance the scheduler's clock for this node too, so autopoll does not
+      // re-ask a node we are reading in full right now.
+      await databaseService.meshcore.markNeighborsRequested(sourceId, publicKey, Date.now());
+
+      void manager
+        .fetchAndStoreNeighbours(publicKey, {
+          mode: 'manual',
+          signal: handle.signal,
+          onProgress: handle.onProgress,
+          minIntervalMs: NEIGHBOURS_MIN_INTERVAL_BETWEEN_REQUESTS_MS,
+        })
+        .then((summary) => handle.finish(summary))
+        .catch((err: unknown) => {
+          logger.error('[API] Neighbours fetch crashed:', err);
+          handle.finish({
+            outcome: 'failed',
+            total: null,
+            neighbours: [],
+            pagesFetched: 0,
+            written: 0,
+            stored: 'none',
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+
+      return ok(res, { requestId, maxPages: MANUAL_NEIGHBOURS_MAX_PAGES });
+    } catch (error) {
+      if (failIfTxDisabled(res, error)) return;
+      logger.error('[API] Error starting neighbours fetch:', error);
+      return fail(res, 500, 'NEIGHBOURS_FETCH_FAILED', 'Failed to start neighbours fetch');
+    }
+  },
+);
+
+/**
+ * GET /api/sources/:id/meshcore/nodes/:publicKey/neighbours/fetch/:requestId
+ *
+ * Progress of a paged neighbour fetch (#5413): phase, page n of m, table
+ * size, neighbours gathered so far, time left before the next page, and once
+ * done the outcome and what was stored. Only the user who started it, on the
+ * same source and node, can read it; anyone else gets 404 so ids cannot be
+ * probed. requireAuth() only, like the #5400 login progress: the start route
+ * checked `nodes:read`, and the registry matches user and source. Never
+ * touches the radio.
+ */
+router.get('/nodes/:publicKey/neighbours/fetch/:requestId', requireAuth(), (req: Request, res: Response) => {
+  const { requestId, publicKey } = req.params as { requestId: string; publicKey: string; id: string };
+  const userId = requestUserId(req);
+  if (!isValidNeighboursRequestId(requestId) || userId === null) {
+    return fail(res, 404, 'NEIGHBOURS_FETCH_NOT_FOUND', 'No such neighbours fetch');
+  }
+  const snapshot = getMeshCoreNeighboursFetchRegistry().get(requestId, userId, (req.params as { id: string }).id);
+  if (!snapshot || snapshot.publicKey.toLowerCase() !== String(publicKey).toLowerCase()) {
+    return fail(res, 404, 'NEIGHBOURS_FETCH_NOT_FOUND', 'No such neighbours fetch');
+  }
+  return ok(res, snapshot);
+});
+
+/**
+ * POST /api/sources/:id/meshcore/nodes/:publicKey/neighbours/fetch/:requestId/cancel
+ *
+ * Stop a paged neighbour fetch (#5413) after the page in flight: no further
+ * pages are sent. What was gathered stays visible and is merged into the
+ * stored set (never replacing it). Owner and source scoped like the progress
+ * endpoint.
+ */
+router.post('/nodes/:publicKey/neighbours/fetch/:requestId/cancel', requireAuth(), (req: Request, res: Response) => {
+  const { requestId } = req.params as { requestId: string };
+  const userId = requestUserId(req);
+  if (!isValidNeighboursRequestId(requestId) || userId === null) {
+    return fail(res, 404, 'NEIGHBOURS_FETCH_NOT_FOUND', 'No such neighbours fetch');
+  }
+  if (!getMeshCoreNeighboursFetchRegistry().cancel(requestId, userId, (req.params as { id: string }).id)) {
+    return fail(res, 404, 'NEIGHBOURS_FETCH_NOT_FOUND', 'No such neighbours fetch');
+  }
+  return ok(res);
+});
 
 /**
  * PATCH /api/sources/:id/meshcore/nodes/:publicKey/neighbours-config

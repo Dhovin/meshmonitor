@@ -23,9 +23,11 @@ import databaseService from '../../services/database.js';
 import { ALL_SOURCES } from '../../db/repositories/index.js';
 import { fallbackManager } from '../meshtasticManager.js';
 import { sourceManagerRegistry } from '../sourceManagerRegistry.js';
-import { resolveSourceManager } from '../utils/resolveSourceManager.js';
+import { resolveSourceManager, resolveOwnMeshtasticManager } from '../utils/resolveSourceManager.js';
+import { requireMeshtasticDeviceSource } from '../utils/requireMeshtasticDeviceSource.js';
 import { isMeshCoreManager, getPrimaryMeshtasticManager } from '../sourceManagerTypes.js';
 import { filterNodesByChannelPermission, enhanceNodeForClient, checkNodeChannelAccess, attachUptimeToNodes } from '../utils/nodeEnhancer.js';
+import { createSignFlipResolver, applySignFlipCorrection, rowSourceId } from '../services/signFlipCorrection.js';
 import { pivotPositionHistory } from '../utils/positionHistoryPivot.js';
 import { resolveRequestSourceId } from '../utils/sourceResolver.js';
 import { requireSourceId } from '../utils/requireSourceId.js';
@@ -40,6 +42,7 @@ import {
 } from '../services/positionEstimationService.js';
 import {
   encodeSharedContactUrl,
+  decodeSharedContactUrl,
   SharedContactValidationError,
 } from '../services/sharedContactService.js';
 import { detectIdentityChanges } from '../services/nodeIdentityChangeService.js';
@@ -81,12 +84,19 @@ router.get('/nodes', optionalAuth(), async (req, res) => {
     const mgr = getPrimaryMeshtasticManager(sourceManagerRegistry) ?? fallbackManager;
     const allNodes = await mgr.getAllNodesAsync(nodesSourceId);
     const estimatedPositions = await databaseService.getAllNodesEstimatedPositionsAsync();
+    const assets = await databaseService.getAssetNodesMapAsync();
 
     // Filter nodes based on channel read permissions — scope the permission
     // lookup to the requested source so a guest with channel access on one
     // source can't see another source's nodes (#3745).
     const filteredNodes = await filterNodesByChannelPermission(allNodes, (req as any).user, nodesSourceId);
-    const enhancedNodes = await Promise.all(filteredNodes.map(node => enhanceNodeForClient(node, (req as any).user, estimatedPositions)));
+    // #5363: display-only sign-flip correction. Only for a single-source list:
+    // an unscoped call returns rows merged across sources, which have no one
+    // reference point to correct against.
+    const signFlipFor = createSignFlipResolver();
+    const nodesSignFlipCtx = await signFlipFor(nodesSourceId);
+    const enhancedNodes = (await Promise.all(filteredNodes.map(node => enhanceNodeForClient(node, (req as any).user, estimatedPositions, undefined, assets))))
+      .map(node => applySignFlipCorrection(node, nodesSignFlipCtx));
 
     // Enrich each node with its latest uptime from telemetry (#4814). Uptime is
     // not a node column — it lives only in device-metrics telemetry — so the node
@@ -110,6 +120,7 @@ router.get('/nodes', optionalAuth(), async (req, res) => {
     const includeAllMeshcore = req.query.includeAllMeshcore === 'true';
     const meshcoreNodes: any[] = [];
     for (const mgr of meshcoreManagers) {
+      const mcSignFlipCtx = await signFlipFor(mgr.sourceId); // #5363
       for (const n of await mgr.getAllNodes()) {
         const hasPosition = n.latitude != null && n.longitude != null && !(n.latitude === 0 && n.longitude === 0);
         if (!hasPosition && !includeAllMeshcore) continue;
@@ -118,7 +129,7 @@ router.get('/nodes', optionalAuth(), async (req, res) => {
           : Math.floor(Date.now() / 1000);
         const pubKey = n.publicKey || '';
         const nodeId = `mc:${mgr.sourceId}:${pubKey.substring(0, 12)}`;
-        meshcoreNodes.push({
+        meshcoreNodes.push(applySignFlipCorrection({
           nodeId,
           nodeNum: 0,
           sourceId: mgr.sourceId,
@@ -138,7 +149,7 @@ router.get('/nodes', optionalAuth(), async (req, res) => {
           lastHeard,
           hopsAway: 0,
           role: 0,
-        });
+        }, mcSignFlipCtx));
       }
     }
 
@@ -160,7 +171,10 @@ router.get('/nodes/active', optionalAuth(), async (req, res) => {
     // Filter nodes based on channel read permissions (source-scoped, #3745)
     const dbNodes = await filterNodesByChannelPermission(allDbNodes, (req as any).user, activeNodesSourceId);
 
+    const assets = await databaseService.getAssetNodesMapAsync();
+
     // Map raw DB nodes to DeviceInfo format then enhance
+    const signFlipFor = createSignFlipResolver(); // #5363, per row's own source
     const maskedNodes = await Promise.all(dbNodes.map(async node => {
       // Map basic fields
       const deviceInfo: any = {
@@ -178,7 +192,8 @@ router.get('/nodes/active', optionalAuth(), async (req, res) => {
         deviceInfo.position = { latitude: node.latitude, longitude: node.longitude, altitude: node.altitude };
       }
 
-      return enhanceNodeForClient(deviceInfo, (req as any).user);
+      const enhanced = await enhanceNodeForClient(deviceInfo, (req as any).user, undefined, undefined, assets);
+      return applySignFlipCorrection(enhanced, await signFlipFor(rowSourceId(node)));
     }));
 
     res.json(maskedNodes);
@@ -428,6 +443,67 @@ router.get(
         'INTERNAL_ERROR',
         'Failed to generate contact URL',
       );
+    }
+  },
+);
+
+/**
+ * POST /api/nodes/import-contact-url
+ *
+ * Import a Meshtastic contact URL (#5317) — the decode side of the
+ * `contact-url` export above. Lets a user message a node that has never been
+ * heard on this source, which is otherwise impossible: with no packet there is
+ * no row, and with no row there is no conversation to open.
+ *
+ * Sends nothing over the mesh. It writes one row, source-scoped like every
+ * other node write.
+ *
+ * `importedAt` marks the row as "added from a link, never heard", which the UI
+ * badges until real traffic arrives. Re-importing a node that already exists
+ * updates its identity fields through the usual `upsertNode` merge rather than
+ * erroring, so a newer link can repair a stale name or key — but `importedAt`
+ * is only set when the row is genuinely new, so re-importing a node that HAS
+ * been heard does not re-badge it.
+ */
+router.post(
+  '/nodes/import-contact-url',
+  requirePermission('nodes', 'write', { sourceIdFrom: 'body', requireSourceId: true }),
+  async (req, res) => {
+    try {
+      const sourceId = req.body?.sourceId as string;
+      const url = req.body?.url;
+
+      if (typeof url !== 'string' || url.trim().length === 0) {
+        return fail(res, 400, 'INVALID_CONTACT_URL', 'A contact URL is required');
+      }
+
+      const identity = decodeSharedContactUrl(url);
+      const existing = await databaseService.nodes.getNode(identity.nodeNum, sourceId);
+
+      const now = Date.now();
+      await databaseService.nodes.upsertNode({
+        nodeNum: identity.nodeNum,
+        nodeId: identity.nodeId,
+        longName: identity.longName ?? undefined,
+        shortName: identity.shortName ?? undefined,
+        hwModel: identity.hwModel ?? undefined,
+        role: identity.role ?? undefined,
+        macaddr: identity.macaddr ?? undefined,
+        publicKey: identity.publicKey ?? undefined,
+        isLicensed: identity.isLicensed ?? undefined,
+        isUnmessagable: identity.isUnmessagable ?? undefined,
+        // Only on a genuinely new row — see the note above.
+        ...(existing ? {} : { importedAt: now }),
+      }, sourceId);
+
+      const node = await databaseService.nodes.getNode(identity.nodeNum, sourceId);
+      return ok(res, { node, alreadyKnown: Boolean(existing) });
+    } catch (error) {
+      if (error instanceof SharedContactValidationError) {
+        return fail(res, 400, 'INVALID_CONTACT_URL', error.message);
+      }
+      logger.error('Error importing SharedContact URL:', error);
+      return fail(res, 500, 'INTERNAL_ERROR', 'Failed to import contact URL');
     }
   },
 );
@@ -809,8 +885,11 @@ router.post('/nodes/:nodeId/favorite', requirePermission('nodes', 'write', { sou
     let deviceSyncStatus: 'success' | 'failed' | 'skipped' = 'skipped';
     let deviceSyncError: string | undefined;
 
-    if (syncToDevice) {
-      const favManager = resolveSourceManager(favSourceId);
+    // Device sync goes to THIS source's own radio only. An MQTT broker/bridge
+    // source has none, so the sync is skipped instead of favoriting the node on
+    // the primary TCP radio (#5375).
+    const favManager = syncToDevice ? resolveOwnMeshtasticManager(favSourceId) : null;
+    if (favManager) {
       try {
         if (isFavorite) {
           await favManager.sendFavoriteNode(nodeNum, destinationNodeNum);
@@ -936,7 +1015,14 @@ router.post('/nodes/:nodeId/favorite-lock', requirePermission('nodes', 'write', 
 router.get('/auto-favorite/status', requirePermission('nodes', 'read'), async (req, res) => {
   try {
     const afSourceId = req.query.sourceId as string | undefined;
-    const afManager = resolveSourceManager(afSourceId);
+    // THIS source's own radio only. A source with no live Meshtastic manager
+    // (MQTT broker/bridge, a disconnected TCP source) has no local node to
+    // auto-favorite for; report that instead of the primary's status (#5375).
+    const afManager = resolveOwnMeshtasticManager(afSourceId);
+    if (!afManager) {
+      res.json({ localNodeRole: null, firmwareVersion: null, supportsFavorites: false, autoFavoriteNodes: [] });
+      return;
+    }
     // Prefer the manager's in-memory local node (populated at connect time). This avoids
     // the legacy global 'localNodeNum' settings key, which is clobbered across sources.
     const localNodeNumInt = afManager.getLocalNodeInfo()?.nodeNum;
@@ -1054,8 +1140,10 @@ router.post('/nodes/:nodeId/ignored', requirePermission('nodes', 'write', { sour
     let deviceSyncStatus: 'success' | 'failed' | 'skipped' = 'skipped';
     let deviceSyncError: string | undefined;
 
-    if (syncToDevice) {
-      const ignoreManager = resolveSourceManager(ignoreSourceId);
+    // Device sync goes to THIS source's own radio only; skipped for a source
+    // with no local Meshtastic device (#5375).
+    const ignoreManager = syncToDevice ? resolveOwnMeshtasticManager(ignoreSourceId) : null;
+    if (ignoreManager) {
       try {
         if (isIgnored) {
           await ignoreManager.sendIgnoredNode(nodeNum, destinationNodeNum);
@@ -1532,7 +1620,7 @@ router.delete('/nodes/:nodeId/neighbors', requirePermission('nodes', 'write', { 
 });
 
 // Manually scan a node for remote admin capability
-router.post('/nodes/:nodeNum/scan-remote-admin', requirePermission('settings', 'write'), async (req, res) => {
+router.post('/nodes/:nodeNum/scan-remote-admin', requirePermission('settings', 'write'), requireMeshtasticDeviceSource('either', 'mesh requests'), async (req, res) => {
   try {
     const { nodeNum } = req.params;
     const parsedNodeNum = parseInt(nodeNum, 10);
@@ -1590,7 +1678,7 @@ router.post('/nodes/:nodeNum/scan-remote-admin', requirePermission('settings', '
 });
 
 // Send key security warning DM to a specific node
-router.post('/nodes/:nodeId/send-key-warning', requirePermission('messages', 'write'), async (req, res) => {
+router.post('/nodes/:nodeId/send-key-warning', requirePermission('messages', 'write'), requireMeshtasticDeviceSource('body', 'message sends'), async (req, res) => {
   try {
     const { nodeId } = req.params;
 
@@ -1755,7 +1843,7 @@ router.post('/nodes/scan-duplicate-keys', requirePermission('nodes', 'write'), a
 // Device configuration endpoint
 // ==========================================
 // Refresh nodes from device endpoint
-router.post('/nodes/refresh', requirePermission('nodes', 'write'), async (req, res) => {
+router.post('/nodes/refresh', requirePermission('nodes', 'write'), requireMeshtasticDeviceSource('body'), async (req, res) => {
   try {
     logger.debug('🔄 Manual node database refresh requested...');
 
@@ -1791,7 +1879,8 @@ router.post('/nodes/refresh', requirePermission('nodes', 'write'), async (req, r
 // Settings endpoints
 
 // Force-stop an active auto-ping session
-router.post('/auto-ping/stop/:nodeNum', requirePermission('settings', 'write'), (req, res) => {
+// Sessions live on the source's own manager; never stop the primary's (#5375).
+router.post('/auto-ping/stop/:nodeNum', requirePermission('settings', 'write'), requireMeshtasticDeviceSource('body', 'auto-ping controls'), (req, res) => {
   try {
     const nodeNum = parseInt(req.params.nodeNum, 10);
     if (isNaN(nodeNum)) {

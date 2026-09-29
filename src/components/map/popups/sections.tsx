@@ -25,6 +25,10 @@ import { useNodeListStyle } from '../../../contexts/SettingsContext';
 import { nodeColorStyle } from '../../../utils/nodeColor';
 import type { NodeCardModel, NodeSourceRef } from './nodeCardModel';
 import { UiIcon, type UiIconName } from '../../icons';
+import { formatAircraftSummary } from '../../../utils/aircraftClassification';
+import { SignFlipNotice } from '../../SignFlipNotice';
+import FlightMatchLine from '../../FlightMatchLine';
+import { useSource } from '../../../contexts/SourceContext';
 
 /* ------------------------------------------------------------------ */
 /* Header                                                              */
@@ -157,6 +161,7 @@ export const SignalItems: React.FC<SignalItemsProps> = ({
   const showPrecision = precisionBits != null && precisionBits > 0;
   const precisionUnit: 'km' | 'mi' = distanceUnit === 'mi' ? 'mi' : 'km';
   const locationSourceLabel = formatLocationSource(model.positionLocationSource);
+  const { sourceId: contextSourceId } = useSource();
 
   return (
     <>
@@ -192,6 +197,42 @@ export const SignalItems: React.FC<SignalItemsProps> = ({
           <span className="node-popup-icon"><UiIcon name="altitude" /></span>
           <span className="node-popup-value">{model.altitude}m</span>
         </div>
+      )}
+      {showAltitude && model.likelyAircraft && (
+        <div className="node-popup-item node-popup-item-full">
+          <span className="node-popup-icon"><UiIcon name="aircraft" /></span>
+          <span className="node-popup-value">{formatAircraftSummary(model, t)}</span>
+        </div>
+      )}
+      {/* #5374: ADS-B flight match, fetched only while this popup is open. */}
+      {showAltitude && model.likelyAircraft && (
+        <FlightMatchLine
+          sourceId={contextSourceId ?? model.sourceId ?? model.sources?.find((src) => src.protocol === 'Meshtastic')?.sourceId ?? null}
+          nodeNum={model.nodeNum}
+          likelyAircraft
+          variant="popup"
+        />
+      )}
+      {/* #5364/#5365 Phase 2: age-out and fixed marks, same gate as above. */}
+      {showAltitude && model.aircraftAgedOut && (
+        <div className="node-popup-item node-popup-item-full" data-testid="node-popup-aircraft-aged-out">
+          <span className="node-popup-icon"><UiIcon name="aircraft" /></span>
+          <span className="node-popup-value">{t('node_popup.aircraft_aged_out', 'Aged out (likely aircraft)')}</span>
+        </div>
+      )}
+      {showAltitude && model.aircraftFixed && (
+        <div className="node-popup-item node-popup-item-full" data-testid="node-popup-aircraft-fixed">
+          <span className="node-popup-icon"><UiIcon name="aircraft" /></span>
+          <span className="node-popup-value">{t('node_popup.aircraft_fixed', 'Reclassified as fixed')}</span>
+        </div>
+      )}
+      {/* #5363: not gated on showAltitude, every popup should say it. */}
+      {model.signFlipReported && (
+        <SignFlipNotice
+          variant="popup"
+          reportedLatitude={model.signFlipReported.latitude}
+          reportedLongitude={model.signFlipReported.longitude}
+        />
       )}
       {showPrecision && (
         <div className="node-popup-item">
@@ -259,6 +300,9 @@ export const PositionItem: React.FC<PositionItemProps> = ({
 export interface LastHeardFooterProps {
   /** Epoch SECONDS (matches `NodeCardModel.lastHeard`). */
   lastHeard?: number | null;
+  /** #5390: epoch SECONDS (matches `NodeCardModel.firstHeard`). Shown as a
+   *  second line under Last Heard when known. */
+  firstHeard?: number | null;
   /** 'absolute' = NodesTab/NodePopup's `formatDateTime`; 'relative' =
    *  Dashboard/MapAnalysis's `formatRelativeTime(..., showAbsolute=true)`. */
   mode: 'absolute' | 'relative';
@@ -269,19 +313,29 @@ export interface LastHeardFooterProps {
 /** `.node-popup-footer` last-heard/last-seen, shown by every consumer. */
 export const LastHeardFooter: React.FC<LastHeardFooterProps> = ({
   lastHeard,
+  firstHeard,
   mode,
   timeFormat,
   dateFormat,
 }) => {
+  const { t } = useTranslation();
   if (lastHeard == null) return null;
-  const text = mode === 'relative'
-    ? formatRelativeTime(lastHeard * 1000, timeFormat, dateFormat, true)
-    : formatDateTime(new Date(lastHeard * 1000), timeFormat, dateFormat);
+  const format = (secs: number) => mode === 'relative'
+    ? formatRelativeTime(secs * 1000, timeFormat, dateFormat, true)
+    : formatDateTime(new Date(secs * 1000), timeFormat, dateFormat);
   return (
-    <div className="node-popup-footer">
-      <span className="node-popup-icon"><UiIcon name="time" /></span>
-      {text}
-    </div>
+    <>
+      <div className="node-popup-footer">
+        <span className="node-popup-icon"><UiIcon name="time" /></span>
+        {format(lastHeard)}
+      </div>
+      {firstHeard != null && (
+        <div className="node-popup-footer" data-testid="popup-first-heard">
+          <span className="node-popup-icon"><UiIcon name="calendar" /></span>
+          {t('node_details.first_heard', 'First Heard')}: {format(firstHeard)}
+        </div>
+      )}
+    </>
   );
 };
 
@@ -379,6 +433,13 @@ export const MeshCoreDetails: React.FC<MeshCoreDetailsProps> = ({ model }) => {
           <span className="node-popup-icon"><UiIcon name="link" /></span>
           <span className="node-popup-value">{hopCountLabel(mc.pathLen)}</span>
         </div>
+      )}
+      {model.signFlipReported && (
+        <SignFlipNotice
+          variant="popup"
+          reportedLatitude={model.signFlipReported.latitude}
+          reportedLongitude={model.signFlipReported.longitude}
+        />
       )}
       {mc.outPath && (
         <div className="node-popup-item node-popup-item-full">

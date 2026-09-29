@@ -101,6 +101,12 @@ describe('toNodeCardModel — meshtastic', () => {
     expect(model.sources).toBe(sources);
   });
 
+  it("carries a per-source row's sourceId (#5374), and leaves it unset otherwise", () => {
+    expect(toNodeCardModel({ nodeNum: 1, sourceId: 'src-a' }, 'meshtastic').sourceId).toBe('src-a');
+    expect(toNodeCardModel({ nodeNum: 1 }, 'meshtastic').sourceId).toBeUndefined();
+    expect(toNodeCardModel({ nodeNum: 1, sourceId: '' }, 'meshtastic').sourceId).toBeUndefined();
+  });
+
   it('leaves hops/snr/battery/altitude/lastHeard null when absent (missing-data behavior)', () => {
     const model = toNodeCardModel({ nodeNum: 1, longName: 'Bare' }, 'meshtastic');
     expect(model.hops).toBeNull();
@@ -188,6 +194,13 @@ describe('toNodeCardModel — meshcore', () => {
     expect(model.meshcore?.snr).toBeUndefined();
     expect(model.meshcore?.pathLen).toBeNull();
     expect(model.meshcore?.outPath).toBeUndefined();
+  });
+
+  it('normalizes firstHeard (#5390) from epoch ms to seconds on both variants', () => {
+    expect(toNodeCardModel({ publicKey: 'k', firstHeard: 1_700_000_000_999 }, 'meshcore').firstHeard).toBe(1_700_000_000);
+    expect(toNodeCardModel({ publicKey: 'k' }, 'meshcore').firstHeard).toBeNull();
+    const mt = toNodeCardModel({ nodeNum: 1, user: { id: '!00000001' }, firstHeard: 1_700_000_000 }, 'meshtastic');
+    expect(mt.firstHeard).toBe(1_700_000_000);
   });
 
   it('has no meshtastic-only fields set', () => {

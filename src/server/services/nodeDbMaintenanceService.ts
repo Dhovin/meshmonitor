@@ -68,6 +68,9 @@ export function mapDbNodeToDeviceInfo(
       noiseFloor
     },
     lastHeard: node.lastHeard,
+    // #5390: Unix seconds, like lastHeard. Absent = never stamped (unknown).
+    // Keep in lock-step with the twin in utils/dbNodeMapper.ts.
+    firstHeard: node.firstHeard != null ? Number(node.firstHeard) : undefined,
     snr: node.snr,
     rssi: node.rssi
   };
@@ -135,6 +138,13 @@ export function mapDbNodeToDeviceInfo(
   }
   if (node.isLicensed !== null && node.isLicensed !== undefined) {
     deviceInfo.isLicensed = Boolean(node.isLicensed);
+  }
+
+  // #5317: imported from a contact URL and not yet heard. Carried through so
+  // the node list can badge it — an imported row is otherwise identical to a
+  // node that has simply gone quiet.
+  if (node.importedAt !== null && node.importedAt !== undefined) {
+    deviceInfo.importedAt = Number(node.importedAt);
   }
 
   // Add channel if it exists
@@ -210,6 +220,35 @@ export function mapDbNodeToDeviceInfo(
   if (node.remoteAdminMetadata) {
     deviceInfo.remoteAdminMetadata = node.remoteAdminMetadata;
     logger.debug(`🔍 Node ${node.nodeNum} has remoteAdminMetadata`);
+  }
+
+  // #5101 / #4240: the client's transport classifier reads these. Without
+  // them the per-source views fell back to viaMqtt alone (no UDP, no decay).
+  // Number() because PG may return BIGINT strings for these columns.
+  for (const key of ['transportMechanism', 'transportLastRf', 'transportLastMqtt', 'transportLastUdp'] as const) {
+    if (node[key] !== null && node[key] !== undefined) deviceInfo[key] = Number(node[key]);
+  }
+
+  // #5364/#5365: likely-aircraft classification. Absent = never classified /
+  // unknown / detection off for this source.
+  if (node.likelyAircraft !== null && node.likelyAircraft !== undefined) {
+    deviceInfo.likelyAircraft = Boolean(node.likelyAircraft);
+  }
+  if (node.aircraftBasis !== null && node.aircraftBasis !== undefined) {
+    deviceInfo.aircraftBasis = node.aircraftBasis;
+  }
+  if (node.groundElevation !== null && node.groundElevation !== undefined) {
+    deviceInfo.groundElevation = node.groundElevation;
+  }
+  if (node.heightAboveGround !== null && node.heightAboveGround !== undefined) {
+    deviceInfo.heightAboveGround = node.heightAboveGround;
+  }
+  // #5364/#5365 Phase 2: aged-out and "confirmed fixed" marks. Absent = not set.
+  if (node.aircraftAgedOutAt !== null && node.aircraftAgedOutAt !== undefined) {
+    deviceInfo.aircraftAgedOutAt = Number(node.aircraftAgedOutAt);
+  }
+  if (node.aircraftFixedAt !== null && node.aircraftFixedAt !== undefined) {
+    deviceInfo.aircraftFixedAt = Number(node.aircraftFixedAt);
   }
 
   return deviceInfo;

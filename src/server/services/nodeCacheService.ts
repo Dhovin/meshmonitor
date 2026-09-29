@@ -61,6 +61,7 @@ export class NodeCacheService {
       channelUtilization: node.channelUtilization ?? undefined,
       airUtilTx: node.airUtilTx ?? undefined,
       lastHeard: node.lastHeard ?? undefined,
+      firstHeard: node.firstHeard ?? undefined,
       snr: node.snr ?? undefined,
       rssi: node.rssi ?? undefined,
       lastTracerouteRequest: node.lastTracerouteRequest ?? undefined,
@@ -91,9 +92,24 @@ export class NodeCacheService {
       positionOverrideIsPrivate: node.positionOverrideIsPrivate ?? undefined,
       hideFromMap: node.hideFromMap ?? undefined,
       notes: node.notes ?? undefined,
+      // #3684: missing from this projection until now — a PG/MySQL install's
+      // sync-method cache never saw these, though the underlying row has them.
+      isUnmessagable: node.isUnmessagable ?? undefined,
+      isLicensed: node.isLicensed ?? undefined,
       hasRemoteAdmin: node.hasRemoteAdmin ?? undefined,
       lastRemoteAdminCheck: node.lastRemoteAdminCheck ?? undefined,
       remoteAdminMetadata: node.remoteAdminMetadata ?? undefined,
+      // #5364/#5365: likely-aircraft classification.
+      likelyAircraft: node.likelyAircraft ?? undefined,
+      aircraftBasis: node.aircraftBasis ?? undefined,
+      groundElevation: node.groundElevation ?? undefined,
+      heightAboveGround: node.heightAboveGround ?? undefined,
+      aircraftClassifiedAt: node.aircraftClassifiedAt ?? undefined,
+      // #5364/#5365 Phase 2: age-out + fixed mark.
+      aircraftAgedOutAt: node.aircraftAgedOutAt ?? undefined,
+      aircraftFixedAt: node.aircraftFixedAt ?? undefined,
+      aircraftFixedLatitude: node.aircraftFixedLatitude ?? undefined,
+      aircraftFixedLongitude: node.aircraftFixedLongitude ?? undefined,
       sourceId: node.sourceId ?? sourceId,
       createdAt: node.createdAt,
       updatedAt: node.updatedAt,

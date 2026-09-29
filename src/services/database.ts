@@ -19,8 +19,9 @@ import { validateThemeDefinition as validateTheme } from '../utils/themeValidati
 import { isSourceyResource } from '../types/permission.js';
 import { computeAveragingIntervalMinutes } from '../utils/telemetryAveraging.js';
 import { buildFavoriteRetentions } from '../utils/telemetryRetention.js';
-import type { TelemetryFavorite } from '../db/repositories/telemetry.js';
-import { getMaxNodeAgeHours } from '../server/services/nodeDisplaySettings.js';
+import type { TelemetryFavorite, AssetRetention } from '../db/repositories/telemetry.js';
+import { getTxTargetMaxAgeHours } from '../server/services/nodeDisplaySettings.js';
+import { classifyNodeTransport, type NodeTransportClass } from '../utils/nodeTransport.js';
 // Drizzle ORM imports for dual-database support
 import { drizzle as drizzleSqlite } from 'drizzle-orm/better-sqlite3';
 import * as drizzleSchema from '../db/schema/index.js';
@@ -33,6 +34,7 @@ import {
   SettingsRepository,
   ChannelsRepository,
   NodesRepository,
+  type AircraftAgeOutCandidate,
   MessagesRepository,
   TelemetryRepository,
   AuthRepository,
@@ -51,6 +53,7 @@ import {
   WaypointsRepository,
   WaypointNotificationsRepository,
   MeshCoreRepository,
+  MeshCoreChannelRemapRepository,
   MqttPacketLogRepository,
   MqttOkToMqttViolationsRepository,
   AtakContactsRepository,
@@ -64,6 +67,10 @@ import {
   MeshCoreObserverCredentialsRepository,
   MessageEventsRepository,
   MeshtasticHeardRepeatersRepository,
+  CoverageReceptionsRepository,
+  CoverageSurveysRepository,
+  AircraftFlightMatchesRepository,
+  MeshCoreFiltersRepository,
   MeshIssuesRepository,
   DeadDropRepository,
   AutomationsRepository,
@@ -72,6 +79,7 @@ import {
   SavedRegionsRepository,
   PrivacyDocumentsRepository,
   SolarNodeOverridesRepository,
+  AssetNodesRepository,
   SolarEstimatesRepository,
   NewsCacheRepository,
   BackupHistoryRepository,
@@ -98,11 +106,14 @@ import type {
   TelemetryCadenceAggregate,
 } from '../db/repositories/index.js';
 import type { MeshIssueFinding } from '../server/services/meshIssues/types.js';
-import type { ConversationReadStateMap } from '../db/repositories/index.js';
+import type { ConversationReadStateMap, AircraftFlightMatchRow, FlightMatchLookupWrite, AssetNode, AssetNodeSettings } from '../db/repositories/index.js';
+import type { MeshCoreIgnoredNodeRow, MeshCoreMessageFilterRow, MeshCoreMessageFilterInput, MeshCoreFilterMode } from '../db/repositories/index.js';
+import { assetRetentionCutoff } from '../utils/assetTracking.js';
 import type { ConversationKind } from '../db/schema/conversationReadState.js';
 import type { DatabaseType, DbPacketLog as DbTypesPacketLog, DbPacketCountByNode, DbPacketCountByPortnum, DbDistinctRelayNode } from '../db/types.js';
 import { updateNodeMobility } from '../server/services/nodeMobilityService.js';
 import { selectNodeNeedingTraceroute, parseTracerouteFilterMode, type TracerouteFilterMode } from '../server/services/autoTracerouteSelectionService.js';
+import type { PacketVisibility } from '../db/repositories/packetLog.js';
 import { NodeCacheService } from '../server/services/nodeCacheService.js';
 
 // Configuration constants for traceroute history
@@ -136,6 +147,8 @@ export interface DbNode {
   channelUtilization?: number;
   airUtilTx?: number;
   lastHeard?: number;
+  /** #5390: earliest reception on this source, Unix SECONDS. Set once. */
+  firstHeard?: number;
   snr?: number;
   rssi?: number;
   lastTracerouteRequest?: number;
@@ -171,7 +184,30 @@ export interface DbNode {
   hideFromMap?: boolean; // #3549: suppress this node's marker on maps only
   notes?: string; // #3921: free-text per-node MeshMonitor-local annotation
   isUnmessagable?: boolean; // #3684: User.is_unmessagable — node won't receive DMs
+  /** #5317: set when the row came from an imported contact URL and the node has not been heard yet. */
+  importedAt?: number | null;
   isLicensed?: boolean; // #3684: User.is_licensed — amateur-radio licensed operator
+  /**
+   * Likely-aircraft classification (#5364/#5365, migration 175). `true` =
+   * likely aircraft, `false` = classified as not, `null`/`undefined` = never
+   * classified / unknown / detection off for this source.
+   */
+  likelyAircraft?: boolean | null;
+  /** `'agl' | 'msl' | 'unknown'`, null when unclassified. */
+  aircraftBasis?: string | null;
+  /** DEM metres at the classified point; null if not sampled. */
+  groundElevation?: number | null;
+  /** `altitude − groundElevation`, signed; null unless basis is `'agl'`. */
+  heightAboveGround?: number | null;
+  /** Epoch ms of the last classification write; the backfill key. */
+  aircraftClassifiedAt?: number | null;
+  /** Epoch ms the age-out sweep ignored this node (#5364/#5365 Phase 2); null when not aged out. */
+  aircraftAgedOutAt?: number | null;
+  /** Epoch ms the "confirmed fixed" rule fired (Phase 2 D4); null when not marked. */
+  aircraftFixedAt?: number | null;
+  /** Anchor of the fixed mark; null when not marked. */
+  aircraftFixedLatitude?: number | null;
+  aircraftFixedLongitude?: number | null;
   // Remote admin discovery (Migration 055)
   hasRemoteAdmin?: boolean; // Has remote admin access
   lastRemoteAdminCheck?: number; // Unix timestamp ms of last check
@@ -201,6 +237,12 @@ export interface DbMessage {
   viaMqtt?: boolean;
   /** Broadcast carried a verified XEdDSA signature (firmware 2.8+). */
   xeddsaSigned?: boolean;
+  /**
+   * `meshtastic.MeshPacket.TransportMechanism` the message arrived on (#5101).
+   * NULL = pre-migration row -> classify by `viaMqtt`. Outbound sends store
+   * INTERNAL (0).
+   */
+  transportMechanism?: number | null;
   rxSnr?: number;
   rxRssi?: number;
   createdAt: number;
@@ -283,6 +325,12 @@ export interface DbRouteSegment {
   toNodeId: string;
   distanceKm: number;
   isRecordHolder: boolean;
+  /**
+   * Effective `meshtastic.MeshPacket.TransportMechanism` of this hop (#5101):
+   * the traceroute record's mechanism, or MQTT (5) when the hop's arrival SNR
+   * was the unknown-SNR sentinel. NULL = pre-migration row -> RF.
+   */
+  transportMechanism?: number | null;
   timestamp: number;
   createdAt: number;
 }
@@ -550,6 +598,7 @@ class DatabaseService {
   public waypointsRepo: WaypointsRepository | null = null;
   public waypointNotificationsRepo: WaypointNotificationsRepository | null = null;
   public meshcoreRepo: MeshCoreRepository | null = null;
+  public meshcoreChannelRemapRepo: MeshCoreChannelRemapRepository | null = null;
   public mqttPacketLogRepo: MqttPacketLogRepository | null = null;
   public mqttOkToMqttViolationsRepo: MqttOkToMqttViolationsRepository | null = null;
   public atakContactsRepo: AtakContactsRepository | null = null;
@@ -563,6 +612,10 @@ class DatabaseService {
   public meshcoreObserverCredentialsRepo: MeshCoreObserverCredentialsRepository | null = null;
   public messageEventsRepo: MessageEventsRepository | null = null;
   public meshtasticHeardRepeatersRepo: MeshtasticHeardRepeatersRepository | null = null;
+  public coverageReceptionsRepo: CoverageReceptionsRepository | null = null;
+  public coverageSurveysRepo: CoverageSurveysRepository | null = null;
+  public aircraftFlightMatchesRepo: AircraftFlightMatchesRepository | null = null;
+  public meshcoreFiltersRepo: MeshCoreFiltersRepository | null = null;
   public meshIssuesRepo: MeshIssuesRepository | null = null;
   public deadDropRepo: DeadDropRepository | null = null;
   public automationsRepo: AutomationsRepository | null = null;
@@ -571,6 +624,7 @@ class DatabaseService {
   public savedRegionsRepo: SavedRegionsRepository | null = null;
   public privacyDocumentsRepo: PrivacyDocumentsRepository | null = null;
   public solarNodeOverridesRepo: SolarNodeOverridesRepository | null = null;
+  public assetNodesRepo: AssetNodesRepository | null = null;
   public solarEstimatesRepo: SolarEstimatesRepository | null = null;
   public newsCacheRepo: NewsCacheRepository | null = null;
   public backupHistoryRepo: BackupHistoryRepository | null = null;
@@ -645,6 +699,26 @@ class DatabaseService {
     return this.meshtasticHeardRepeatersRepo;
   }
 
+  get coverageReceptions(): CoverageReceptionsRepository {
+    if (!this.coverageReceptionsRepo) throw new Error('Database not initialized');
+    return this.coverageReceptionsRepo;
+  }
+
+  get coverageSurveys(): CoverageSurveysRepository {
+    if (!this.coverageSurveysRepo) throw new Error('Database not initialized');
+    return this.coverageSurveysRepo;
+  }
+
+  get aircraftFlightMatches(): AircraftFlightMatchesRepository {
+    if (!this.aircraftFlightMatchesRepo) throw new Error('Database not initialized');
+    return this.aircraftFlightMatchesRepo;
+  }
+
+  get meshcoreFilters(): MeshCoreFiltersRepository {
+    if (!this.meshcoreFiltersRepo) throw new Error('Database not initialized');
+    return this.meshcoreFiltersRepo;
+  }
+
   get meshIssues(): MeshIssuesRepository {
     if (!this.meshIssuesRepo) throw new Error('Database not initialized');
     return this.meshIssuesRepo;
@@ -689,6 +763,12 @@ class DatabaseService {
   get solarNodeOverrides(): SolarNodeOverridesRepository {
     if (!this.solarNodeOverridesRepo) throw new Error('Database not initialized');
     return this.solarNodeOverridesRepo;
+  }
+
+  /** Tracked-asset flag + retention per physical node (#5354). Global — not source-scoped. */
+  get assetNodes(): AssetNodesRepository {
+    if (!this.assetNodesRepo) throw new Error('Database not initialized');
+    return this.assetNodesRepo;
   }
 
   get solarEstimates(): SolarEstimatesRepository {
@@ -799,6 +879,12 @@ class DatabaseService {
   get meshcore(): MeshCoreRepository {
     if (!this.meshcoreRepo) throw new Error('Database not initialized');
     return this.meshcoreRepo;
+  }
+
+  /** MeshCore on-device channel reorder remap (#5379). */
+  get meshcoreChannelRemap(): MeshCoreChannelRemapRepository {
+    if (!this.meshcoreChannelRemapRepo) throw new Error('Database not initialized');
+    return this.meshcoreChannelRemapRepo;
   }
 
   get mqttPacketLog(): MqttPacketLogRepository {
@@ -1073,6 +1159,7 @@ class DatabaseService {
       this.waypointsRepo = new WaypointsRepository(drizzleDb, this.drizzleDbType);
       this.waypointNotificationsRepo = new WaypointNotificationsRepository(drizzleDb, this.drizzleDbType);
       this.meshcoreRepo = new MeshCoreRepository(drizzleDb, this.drizzleDbType);
+      this.meshcoreChannelRemapRepo = new MeshCoreChannelRemapRepository(drizzleDb, this.drizzleDbType);
       this.mqttPacketLogRepo = new MqttPacketLogRepository(drizzleDb, this.drizzleDbType);
       this.mqttOkToMqttViolationsRepo = new MqttOkToMqttViolationsRepository(drizzleDb, this.drizzleDbType);
       this.atakContactsRepo = new AtakContactsRepository(drizzleDb, this.drizzleDbType);
@@ -1086,6 +1173,10 @@ class DatabaseService {
       this.meshcoreObserverCredentialsRepo = new MeshCoreObserverCredentialsRepository(drizzleDb, this.drizzleDbType);
       this.messageEventsRepo = new MessageEventsRepository(drizzleDb, this.drizzleDbType);
       this.meshtasticHeardRepeatersRepo = new MeshtasticHeardRepeatersRepository(drizzleDb, this.drizzleDbType);
+      this.coverageReceptionsRepo = new CoverageReceptionsRepository(drizzleDb, this.drizzleDbType);
+      this.coverageSurveysRepo = new CoverageSurveysRepository(drizzleDb, this.drizzleDbType);
+      this.aircraftFlightMatchesRepo = new AircraftFlightMatchesRepository(drizzleDb, this.drizzleDbType);
+      this.meshcoreFiltersRepo = new MeshCoreFiltersRepository(drizzleDb, this.drizzleDbType);
       this.meshIssuesRepo = new MeshIssuesRepository(drizzleDb, this.drizzleDbType);
       this.deadDropRepo = new DeadDropRepository(drizzleDb, this.drizzleDbType);
       this.automationsRepo = new AutomationsRepository(drizzleDb, this.drizzleDbType);
@@ -1094,6 +1185,7 @@ class DatabaseService {
       this.savedRegionsRepo = new SavedRegionsRepository(drizzleDb, this.drizzleDbType);
       this.privacyDocumentsRepo = new PrivacyDocumentsRepository(drizzleDb, this.drizzleDbType);
       this.solarNodeOverridesRepo = new SolarNodeOverridesRepository(drizzleDb, this.drizzleDbType);
+      this.assetNodesRepo = new AssetNodesRepository(drizzleDb, this.drizzleDbType);
       this.solarEstimatesRepo = new SolarEstimatesRepository(drizzleDb, this.drizzleDbType);
       this.newsCacheRepo = new NewsCacheRepository(drizzleDb, this.drizzleDbType);
       this.backupHistoryRepo = new BackupHistoryRepository(drizzleDb, this.drizzleDbType);
@@ -1266,7 +1358,7 @@ class DatabaseService {
     try {
       logger.debug('🔥 Warming up database caches...');
       // Pre-populate the telemetry types cache (SQLite bootstrap path).
-      const map = this.telemetry.getAllNodesTelemetryTypesSync();
+      const map = this.telemetry.getAllNodesTelemetryTypesSync(ALL_SOURCES);
       this.telemetryTypesCacheBySource.set(DatabaseService.TELEMETRY_TYPES_CACHE_GLOBAL_KEY, { map, time: Date.now() });
       logger.debug('✅ Cache warmup complete');
     } catch (error) {
@@ -1352,10 +1444,14 @@ class DatabaseService {
   }
 
   // SQLite-only record-holder update used by the runDataMigrations bootstrap.
+  // Bootstrap segments are written with a NULL transportMechanism, so they
+  // are RF (#5101) — pass the class explicitly rather than deriving it, since
+  // classifyNodeTransport({ transportMechanism: null }) already resolves to
+  // 'rf' but the explicit literal makes the bootstrap's assumption visible.
   private updateRecordHolderSegmentSqlite(newSegment: DbRouteSegment, sourceId?: string): void {
-    const currentRecord = this.traceroutesRepo!.getRecordHolderRouteSegmentSync(sourceId) as unknown as DbRouteSegment | null;
+    const currentRecord = this.traceroutesRepo!.getRecordHolderRouteSegmentSync(sourceId, 'rf') as unknown as DbRouteSegment | null;
     if (!currentRecord || newSegment.distanceKm > currentRecord.distanceKm) {
-      this.traceroutesRepo!.clearRecordHolderSegmentSync(sourceId);
+      this.traceroutesRepo!.clearRecordHolderSegmentSync(sourceId, 'rf');
       this.traceroutesRepo!.insertRouteSegmentSync({ ...newSegment, isRecordHolder: true }, sourceId);
     }
   }
@@ -1624,9 +1720,7 @@ class DatabaseService {
     const oneHourAgo = Date.now() - 3600000;
 
     // Get local node number (per-source if provided) to exclude internal traffic
-    const localNodeNumStr = sourceId
-      ? await this.settings.getSettingForSource(sourceId, 'localNodeNum')
-      : this.getSetting('localNodeNum');
+    const localNodeNumStr = await this.settings.getLocalNodeNumForSource(sourceId);
     const localNodeNum = localNodeNumStr ? parseInt(localNodeNumStr, 10) : null;
 
     return this.packetLogRepo!.getPacketCountsPerNodeSince({
@@ -1644,8 +1738,8 @@ class DatabaseService {
   async getTopBroadcastersAsync(limit: number = 5, sourceId?: string): Promise<Array<{ nodeNum: number; shortName: string | null; longName: string | null; packetCount: number }>> {
     const oneHourAgo = Date.now() - 3600000;
 
-    // Get local node number to exclude internal traffic
-    const localNodeNumStr = this.getSetting('localNodeNum');
+    // Get local node number (per-source if provided) to exclude internal traffic
+    const localNodeNumStr = await this.settings.getLocalNodeNumForSource(sourceId);
     const localNodeNum = localNodeNumStr ? parseInt(localNodeNumStr, 10) : null;
 
     return this.packetLogRepo!.getTopBroadcastersSince({
@@ -1859,6 +1953,19 @@ class DatabaseService {
       return this.messagesRepo.getMessagesByDay(days, sourceId);
     }
     return [];
+  }
+
+  /**
+   * Message counts for one source, grouped by channel and transport class
+   * (#5101). Pass-through to
+   * `MessagesRepository.getMessageCountsByChannelAndTransport` — see that
+   * method for the `classifyMessageTransport` merge and count-coercion rules.
+   */
+  async getMessageCountsByChannelAndTransportAsync(
+    sourceId: string,
+    excludePortnums?: number[],
+  ): Promise<Array<{ channel: number; transportClass: NodeTransportClass; count: number }>> {
+    return this.messages.getMessageCountsByChannelAndTransport(sourceId, excludePortnums);
   }
 
 
@@ -2300,8 +2407,9 @@ class DatabaseService {
     // filters honor the Source that the scheduler tick is running on.
     const filterCfg = await this.getTracerouteFilterSettingsAsync(sourceId);
 
-    // Get maxNodeAgeHours setting to filter only active nodes.
-    const maxNodeAgeHours = await getMaxNodeAgeHours(this.settings, sourceId ?? null);
+    // Active-node window for TX targets: maxNodeAgeHours, or the
+    // txTargetMaxAgeHoursWhenUnlimited bound when it is 0 (#5376).
+    const maxNodeAgeHours = await getTxTargetMaxAgeHours(this.settings, sourceId ?? null);
 
     return selectNodeNeedingTraceroute(localNodeNum, sourceId, {
       filterCfg,
@@ -2418,8 +2526,9 @@ class DatabaseService {
       const cfg = await this.getRemoteLocalStatsFilterSettingsAsync(sourceId);
 
       // Candidate base: active nodes for this source. maxNodeAgeHours bounds how
-      // far back "active" reaches so we never poll long-dead nodes.
-      const maxNodeAgeHours = await getMaxNodeAgeHours(this.settings, sourceId ?? null);
+      // far back "active" reaches so we never poll long-dead nodes. When it is
+      // 0 ("unlimited") the TX-target bound applies instead (#5376).
+      const maxNodeAgeHours = await getTxTargetMaxAgeHours(this.settings, sourceId ?? null);
       const sinceDays = Math.max(1, Math.ceil(maxNodeAgeHours / 24));
       let nodes = (await this.nodesRepo!.getActiveNodes(sinceDays, sourceId)) as unknown as DbNode[];
 
@@ -2480,8 +2589,9 @@ class DatabaseService {
   async getNodeNeedingRemoteAdminCheckAsync(localNodeNum: number, sourceId?: string): Promise<DbNode | null> {
     try {
       // Get maxNodeAgeHours setting to filter only active nodes
-      // lastHeard is stored in SECONDS (Unix timestamp)
-      const maxNodeAgeHours = await getMaxNodeAgeHours(this.settings, sourceId ?? null);
+      // lastHeard is stored in SECONDS (Unix timestamp). When maxNodeAgeHours
+      // is 0 ("unlimited") the TX-target bound applies instead (#5376).
+      const maxNodeAgeHours = await getTxTargetMaxAgeHours(this.settings, sourceId ?? null);
       const activeNodeCutoffSeconds = Math.floor(Date.now() / 1000) - (maxNodeAgeHours * 60 * 60);
 
       // Get expiration hours (default 168 = 1 week)
@@ -2609,6 +2719,23 @@ class DatabaseService {
   }
 
 
+
+  // Tracked assets (#5354) — global, keyed by physical nodeNum
+  async getAssetNodesMapAsync(): Promise<Map<number, AssetNodeSettings>> {
+    return this.assetNodes.getMapAsync();
+  }
+
+  async getAssetNodeAsync(nodeNum: number): Promise<AssetNode | null> {
+    return this.assetNodes.getAsync(nodeNum);
+  }
+
+  async setAssetNodeAsync(nodeNum: number, retentionDays: number, updatedBy?: number | null): Promise<AssetNode> {
+    return this.assetNodes.setAsync(nodeNum, retentionDays, updatedBy);
+  }
+
+  async clearAssetNodeAsync(nodeNum: number): Promise<void> {
+    return this.assetNodes.clearAsync(nodeNum);
+  }
 
   // Solar Estimates methods
   async upsertSolarEstimateAsync(timestamp: number, wattHours: number, fetchedAt: number): Promise<void> {
@@ -3308,8 +3435,9 @@ class DatabaseService {
       return map;
     }
 
-    // SQLite: query the database and update cache
-    const map = this.telemetry.getAllNodesTelemetryTypesSync();
+    // SQLite: query the database and update cache. Scoped like the PG/MySQL
+    // path above; this used to ignore sourceId and return every source's types.
+    const map = this.telemetry.getAllNodesTelemetryTypesSync(sourceId ?? ALL_SOURCES);
     this.telemetryTypesCacheBySource.set(cacheKey, { map, time: now });
     return map;
   }
@@ -3330,6 +3458,36 @@ class DatabaseService {
 
 
 
+
+  // ── Telemetry outlier purge (#5333) — thin facades over TelemetryRepository ──
+
+  async getMaxTelemetryIdForTypeAsync(sourceId: string, telemetryType: string, nodeId?: string): Promise<number | null> {
+    return this.telemetry.getMaxTelemetryIdForType(sourceId, telemetryType, nodeId);
+  }
+
+  async getTelemetryTypesForSourceAsync(sourceId: string): Promise<string[]> {
+    return this.telemetry.getTelemetryTypesForSource(sourceId);
+  }
+
+  async getTelemetryNodeIdsForTypeAsync(sourceId: string, telemetryType: string, maxId: number): Promise<string[]> {
+    return this.telemetry.getTelemetryNodeIdsForType(sourceId, telemetryType, maxId);
+  }
+
+  async getTelemetrySeriesForOutlierScanAsync(
+    sourceId: string,
+    telemetryType: string,
+    nodeId: string,
+    maxId: number,
+  ): Promise<Array<{ id: number; value: number; timestamp: number }>> {
+    return this.telemetry.getTelemetrySeriesForOutlierScan(sourceId, telemetryType, nodeId, maxId);
+  }
+
+  /** Delete telemetry rows by id within (sourceId, telemetryType); drops the source's types cache. */
+  async deleteTelemetryByIdsAsync(sourceId: string, telemetryType: string, ids: number[]): Promise<number> {
+    const deleted = await this.telemetry.deleteTelemetryByIds(sourceId, telemetryType, ids);
+    if (deleted > 0) this.invalidateTelemetryTypesCache(sourceId);
+    return deleted;
+  }
 
   /**
    * Purge all telemetry data (async version), optionally scoped to one source.
@@ -3368,15 +3526,27 @@ class DatabaseService {
   }
 
   /**
+   * Tracked assets' purge cutoffs (#5354): one entry per asset, `cutoff` =
+   * now − retentionDays. Retention lives in the database, so this is rebuilt
+   * on every run and a restart cannot change what is kept.
+   */
+  private async collectAssetRetentionsAsync(now: number): Promise<AssetRetention[]> {
+    const assets = await this.assetNodes.getMapAsync();
+    return [...assets].map(([nodeNum, a]) => ({ nodeNum, cutoff: assetRetentionCutoff(a.retentionDays, now) }));
+  }
+
+  /**
    * Purge old telemetry data (async version)
    */
   async purgeOldTelemetryAsync(hoursToKeep: number, favoriteDaysToKeep?: number): Promise<number> {
-    const regularCutoffTime = Date.now() - (hoursToKeep * 60 * 60 * 1000);
+    const now = Date.now();
+    const regularCutoffTime = now - (hoursToKeep * 60 * 60 * 1000);
     const isSql = this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql';
+    const assets = await this.collectAssetRetentionsAsync(now);
 
     // Caller explicitly opted out of favorites retention — purge everything past
-    // the regular window.
-    if (!favoriteDaysToKeep) {
+    // the regular window, except tracked assets, which keep their own window.
+    if (!favoriteDaysToKeep && assets.length === 0) {
       const deleted = isSql
         ? await this.telemetry.deleteOldTelemetry(regularCutoffTime)
         : this.telemetry.deleteOldTelemetrySync(regularCutoffTime);
@@ -3389,27 +3559,32 @@ class DatabaseService {
     // `favoriteTelemetryStorageDays` (falling back to global, then the caller's
     // value). `favoriteCutoffTime` below only covers entries with no explicit
     // cutoff, which today means none — it is the safety net, not the policy.
-    const favorites = await this.collectFavoriteRetentionsAsync(favoriteDaysToKeep);
-    const favoriteCutoffTime = Date.now() - (favoriteDaysToKeep * 24 * 60 * 60 * 1000);
+    const favorites = favoriteDaysToKeep ? await this.collectFavoriteRetentionsAsync(favoriteDaysToKeep) : [];
+    const favoriteCutoffTime = favoriteDaysToKeep
+      ? now - (favoriteDaysToKeep * 24 * 60 * 60 * 1000)
+      : regularCutoffTime;
 
-    const { nonFavoritesDeleted, favoritesDeleted } = isSql
+    const { nonFavoritesDeleted, favoritesDeleted, assetsDeleted } = isSql
       ? await this.telemetry.deleteOldTelemetryWithFavorites(
           regularCutoffTime,
           favoriteCutoffTime,
-          favorites
+          favorites,
+          assets
         )
       : this.telemetry.deleteOldTelemetryWithFavoritesSync(
           regularCutoffTime,
           favoriteCutoffTime,
-          favorites
+          favorites,
+          assets
         );
 
-    const totalDeleted = nonFavoritesDeleted + favoritesDeleted;
+    const totalDeleted = nonFavoritesDeleted + favoritesDeleted + (assetsDeleted ?? 0);
     logger.debug(
       `🧹 Purged ${totalDeleted} old telemetry records ` +
       `(${nonFavoritesDeleted} non-favorites older than ${hoursToKeep}h, ` +
       `${favoritesDeleted} of ${favorites.length} protected favorite series past their ` +
-      `per-source retention window)`
+      `per-source retention window, ${assetsDeleted ?? 0} from ${assets.length} tracked asset(s) ` +
+      `past their own window)`
     );
     if (!isSql && totalDeleted > 0) this.invalidateTelemetryTypesCache();
     return totalDeleted;
@@ -3505,6 +3680,22 @@ class DatabaseService {
    * The cache is PG/MySQL-only (see settingsCache) but evicting unconditionally
    * is harmless on SQLite, where the map is never populated.
    */
+  /**
+   * Re-read the given settings keys from the database into the PG/MySQL sync
+   * cache after a repository wrote them directly (e.g. inside a transaction,
+   * #5379). A key missing from the database is evicted. No-op on SQLite, whose
+   * sync path reads the database directly.
+   */
+  async refreshCachedSettingsAsync(keys: string[]): Promise<void> {
+    if (this.drizzleDbType !== 'postgres' && this.drizzleDbType !== 'mysql') return;
+    if (!this.settingsRepo) return;
+    for (const key of keys) {
+      const value = await this.settingsRepo.getSetting(key);
+      if (value === null) this.settingsCache.delete(key);
+      else this.settingsCache.set(key, value);
+    }
+  }
+
   async deleteSourceSettingsAsync(sourceId: string): Promise<void> {
     if (!this.settingsRepo) return;
     await this.settingsRepo.deleteSourceSettings(sourceId);
@@ -3569,6 +3760,15 @@ class DatabaseService {
           await this.packetLogRepo.deletePacketLogsForNode(nodeNum, sourceId);
         } catch (err) {
           logger.error(`Failed to delete packet logs for node ${nodeNum}@${sourceId}:`, err);
+        }
+      }
+
+      // ADS-B flight match (#5374) — per-node lookup state.
+      if (this.aircraftFlightMatchesRepo) {
+        try {
+          await this.aircraftFlightMatchesRepo.deleteForNode(sourceId, nodeNum);
+        } catch (err) {
+          logger.error(`Failed to delete flight match for node ${nodeNum}@${sourceId}:`, err);
         }
       }
 
@@ -3703,6 +3903,23 @@ class DatabaseService {
           await this.autoFavoriteTargetsRepo.clearAllForSource(sourceId);
         } catch (err) {
           logger.error('Failed to clear auto-favorite targets during purge:', err);
+        }
+      }
+
+      // Clear Coverage Report RF receptions for the same reason (#5277 amendment
+      // 5 / D7): the table is ephemeral, per-source received-packet history, so
+      // a purged/deleted source's rows must not linger with no UI path left to
+      // reach them. `sourceId` undefined = admin global purge across every
+      // source, matching every other branch above.
+      if (this.coverageReceptionsRepo) {
+        try {
+          if (sourceId) {
+            await this.coverageReceptionsRepo.deleteForSource(sourceId);
+          } else {
+            await this.coverageReceptionsRepo.deleteAll();
+          }
+        } catch (err) {
+          logger.error('Failed to purge coverage receptions during purge:', err);
         }
       }
 
@@ -4517,7 +4734,7 @@ class DatabaseService {
   async getPacketLogCountAsync(options: {
     portnum?: number; from_node?: number; to_node?: number; channel?: number;
     encrypted?: boolean; since?: number; relay_node?: number | 'unknown';
-    transport_mechanism?: number; sourceId?: string; search?: string;
+    transport_mechanism?: number; transportClass?: NodeTransportClass; sourceId?: string; search?: string;
   } = {}): Promise<number> {
     return this.packetLog.getPacketLogCount(options);
   }
@@ -4550,11 +4767,11 @@ class DatabaseService {
     return this.packetLogRepo.cleanupOldPacketLogs(maxAgeHours);
   }
 
-  async getPacketCountsByNodeAsync(options?: { since?: number; limit?: number; portnum?: number; sourceId?: string }): Promise<DbPacketCountByNode[]> {
+  async getPacketCountsByNodeAsync(options?: { since?: number; limit?: number; portnum?: number; sourceId?: string; transportClass?: NodeTransportClass; visibility?: PacketVisibility }): Promise<DbPacketCountByNode[]> {
     return this.packetLog.getPacketCountsByNode(options);
   }
 
-  async getPacketCountsByPortnumAsync(options?: { since?: number; from_node?: number; sourceId?: string }): Promise<DbPacketCountByPortnum[]> {
+  async getPacketCountsByPortnumAsync(options?: { since?: number; from_node?: number; sourceId?: string; transportClass?: NodeTransportClass; visibility?: PacketVisibility }): Promise<DbPacketCountByPortnum[]> {
     return this.packetLog.getPacketCountsByPortnum(options);
   }
 
@@ -5363,6 +5580,11 @@ class DatabaseService {
     positionHistoryPointsOnly?: boolean;
       unreadIndicatorEnabled?: boolean;
       spreadNodes?: boolean;
+      /** Likely-aircraft map display choice (#5364/#5365). Null clears to the 'mark' default. */
+      aircraftDisplayMode?: 'show' | 'mark' | 'hide' | null;
+      /** Flight trails (#5364/#5365 Phase 3). */
+      showAircraftTrails?: boolean;
+      aircraftTrailHours?: number;
   }): Promise<void> {
     return this.mapPreferences!.saveMapPreferences(userId, preferences);
   }
@@ -5596,6 +5818,124 @@ class DatabaseService {
   }
 
 
+  // ============ Aircraft age-out + fixed mark (#5364/#5365 Phase 2) ============
+
+  async markAircraftAgedOutAsync(nodeNum: number, sourceId: string, atMs: number): Promise<void> {
+    return this.nodes.markAircraftAgedOut(nodeNum, sourceId, atMs);
+  }
+
+  async clearAircraftAgedOutAsync(nodeNum: number, sourceId: string): Promise<void> {
+    return this.nodes.clearAircraftAgedOut(nodeNum, sourceId);
+  }
+
+  // ---- MeshCore Ignore / Block (#5408) ----
+
+  async getMeshCoreIgnoredNodesAsync(sourceId: string): Promise<MeshCoreIgnoredNodeRow[]> {
+    return this.meshcoreFilters.listIgnoredNodes(sourceId);
+  }
+
+  async upsertMeshCoreIgnoredNodeAsync(entry: {
+    sourceId: string;
+    publicKey: string;
+    name: string | null;
+    mode: MeshCoreFilterMode;
+    createdBy: number | null;
+  }): Promise<MeshCoreIgnoredNodeRow> {
+    return this.meshcoreFilters.upsertIgnoredNode(entry);
+  }
+
+  async removeMeshCoreIgnoredNodeAsync(sourceId: string, publicKey: string): Promise<number> {
+    return this.meshcoreFilters.removeIgnoredNode(sourceId, publicKey);
+  }
+
+  async updateMeshCoreIgnoredNodeNameAsync(sourceId: string, publicKey: string, name: string): Promise<void> {
+    return this.meshcoreFilters.updateIgnoredNodeName(sourceId, publicKey, name);
+  }
+
+  async addMeshCoreIgnoredNodeHitsAsync(sourceId: string, publicKey: string, count: number, lastHitAt: number): Promise<void> {
+    return this.meshcoreFilters.addIgnoredNodeHits(sourceId, publicKey, count, lastHitAt);
+  }
+
+  async getMeshCoreMessageFiltersAsync(sourceId: string): Promise<MeshCoreMessageFilterRow[]> {
+    return this.meshcoreFilters.listMessageFilters(sourceId);
+  }
+
+  async createMeshCoreMessageFilterAsync(
+    sourceId: string,
+    input: MeshCoreMessageFilterInput,
+    createdBy: number | null,
+  ): Promise<MeshCoreMessageFilterRow> {
+    return this.meshcoreFilters.createMessageFilter(sourceId, input, createdBy);
+  }
+
+  async updateMeshCoreMessageFilterAsync(
+    sourceId: string,
+    id: string,
+    patch: Partial<MeshCoreMessageFilterInput>,
+  ): Promise<MeshCoreMessageFilterRow | null> {
+    return this.meshcoreFilters.updateMessageFilter(sourceId, id, patch);
+  }
+
+  async deleteMeshCoreMessageFilterAsync(sourceId: string, id: string): Promise<number> {
+    return this.meshcoreFilters.deleteMessageFilter(sourceId, id);
+  }
+
+  async addMeshCoreMessageFilterHitsAsync(sourceId: string, id: string, count: number, lastHitAt: number): Promise<void> {
+    return this.meshcoreFilters.addMessageFilterHits(sourceId, id, count, lastHitAt);
+  }
+
+  // ---- ADS-B flight matching (#5374) ----
+
+  async getAircraftFlightMatchAsync(sourceId: string, nodeNum: number): Promise<AircraftFlightMatchRow | null> {
+    return this.aircraftFlightMatches.get(sourceId, nodeNum);
+  }
+
+  async startAircraftFlightMatchEpisodeAsync(sourceId: string, nodeNum: number, episodeStartedAt: number): Promise<void> {
+    return this.aircraftFlightMatches.startEpisode(sourceId, nodeNum, episodeStartedAt);
+  }
+
+  async recordAircraftFlightMatchLookupAsync(
+    sourceId: string,
+    nodeNum: number,
+    write: FlightMatchLookupWrite,
+  ): Promise<boolean> {
+    return this.aircraftFlightMatches.recordLookup(sourceId, nodeNum, write);
+  }
+
+  async deleteAircraftFlightMatchAsync(sourceId: string, nodeNum: number): Promise<number> {
+    return this.aircraftFlightMatches.deleteForNode(sourceId, nodeNum);
+  }
+
+  async setAircraftFixedAsync(
+    nodeNum: number,
+    sourceId: string,
+    fixed: { atMs: number; lat: number; lon: number } | null,
+  ): Promise<void> {
+    return this.nodes.setAircraftFixed(nodeNum, sourceId, fixed);
+  }
+
+  async listAircraftAgeOutCandidatesAsync(sourceId: string): Promise<AircraftAgeOutCandidate[]> {
+    return this.nodes.listAircraftAgeOutCandidates(sourceId);
+  }
+
+  async getAircraftAgedOutAtAsync(nodeNum: number, sourceId: string): Promise<number | null> {
+    return this.nodes.getAircraftAgedOutAt(nodeNum, sourceId);
+  }
+
+  async addAircraftIgnoreAsync(
+    nodeNum: number,
+    sourceId: string,
+    nodeId: string,
+    longName?: string,
+    shortName?: string,
+  ): Promise<boolean> {
+    return this.ignoredNodes.addAircraftIgnoreAsync(nodeNum, sourceId, nodeId, longName, shortName);
+  }
+
+  async liftAircraftIgnoreAsync(nodeNum: number, sourceId: string): Promise<boolean> {
+    return this.ignoredNodes.liftAircraftIgnoreAsync(nodeNum, sourceId);
+  }
+
   async setNodeIgnoredAsync(nodeNum: number, isIgnored: boolean, sourceId: string): Promise<void> {
     // Get the node info for the persistent ignore list
     const node = await this.nodes.getNode(nodeNum, sourceId) as unknown as DbNode | null;
@@ -5612,6 +5952,16 @@ class DatabaseService {
 
     // Update the node row (isIgnored flag) + in-memory cache for all dialects.
     await this.nodes.setNodeIgnored(nodeNum, isIgnored, sourceId);
+
+    // #5364/#5365 Phase 2: a hand un-ignore KEEPS the "aged out" mark. With
+    // isIgnored false the map no longer draws the node as aged out, and the
+    // sweep reads the mark as "already aged out during this silence", so it
+    // won't re-ignore the node an hour later. The mark stops counting once
+    // the node is heard again (lastHeard moves past it). A hand IGNORE drops
+    // the mark: the node is now a manual ignore, not an aged-out aircraft.
+    if (isIgnored) {
+      await this.nodes.clearAircraftAgedOutMark(nodeNum, sourceId);
+    }
 
     logger.debug(`${isIgnored ? '🚫' : '✅'} Node ${nodeNum}@${sourceId} ignored status set to: ${isIgnored}`);
   }
@@ -5855,25 +6205,33 @@ class DatabaseService {
     await this.recordTracerouteRequest(fromNodeNum, toNodeNum, sourceId);
   }
 
-  async clearRecordHolderSegmentAsync(sourceId?: string): Promise<void> {
-    if (this.drizzleDbType === 'postgres' || this.drizzleDbType === 'mysql') {
-      if (this.traceroutesRepo) {
-        await this.traceroutesRepo.clearRecordHolderBySource(sourceId);
-      }
-      logger.debug('🗑️ Cleared record holder route segment');
-      return;
+  /**
+   * Clear the record holder for one source (#5101: optionally narrowed to a
+   * single transport class; omitted = every class, the pre-#5101 behaviour).
+   * The SQLite `…Sync` branch was dropped (#5101 decision, §10.3): every
+   * backend now goes through `clearRecordHolderBySource`, which throws on a
+   * missing sourceId like PG/MySQL already did — the caller (route) guards
+   * this.
+   */
+  async clearRecordHolderSegmentAsync(sourceId?: string, transportClass?: NodeTransportClass): Promise<void> {
+    if (this.traceroutesRepo) {
+      await this.traceroutesRepo.clearRecordHolderBySource(sourceId, transportClass);
     }
-    this.traceroutesRepo!.clearRecordHolderSegmentSync(sourceId);
     logger.debug('🗑️ Cleared record holder route segment');
   }
 
+  /**
+   * Signature UNCHANGED from pre-#5101 (WP3 depends on this): delegates to
+   * `TraceroutesRepository.updateRecordHolderIfLonger`, which derives the
+   * transport class from the segment's own `transportMechanism` so records
+   * are now kept per (source, transport class) rather than one per source.
+   */
   async updateRecordHolderSegmentAsync(segment: DbRouteSegment, sourceId?: string): Promise<void> {
     if (!this.traceroutesRepo) return;
-    const currentRecord = await this.traceroutesRepo.getRecordHolderRouteSegment(sourceId);
-    if (!currentRecord || segment.distanceKm > currentRecord.distanceKm) {
-      await this.traceroutesRepo.clearRecordHolderBySource(sourceId);
-      await this.traceroutesRepo.insertRouteSegment({ ...segment, isRecordHolder: true }, sourceId);
-      logger.debug(`🏆 New record holder route segment: ${segment.distanceKm.toFixed(2)} km from ${segment.fromNodeId} to ${segment.toNodeId}`);
+    const isNewRecord = await this.traceroutesRepo.updateRecordHolderIfLonger(segment, sourceId);
+    if (isNewRecord) {
+      const cls = classifyNodeTransport({ transportMechanism: segment.transportMechanism });
+      logger.debug(`🏆 New ${cls} record holder route segment: ${segment.distanceKm.toFixed(2)} km from ${segment.fromNodeId} to ${segment.toNodeId}`);
     }
   }
 
